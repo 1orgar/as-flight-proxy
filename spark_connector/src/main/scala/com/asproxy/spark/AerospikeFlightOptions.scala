@@ -33,9 +33,10 @@ case class AerospikeFlightOptions(
     sendKey: Boolean,
     ignoreNulls: Boolean,
     useBatchWrite: Option[Boolean],
-    batchSize: Int,
-    writerThreads: Int,
-    queueCapacity: Int
+    validateOnly: Boolean = false,
+    batchSize: Int = 8192,
+    writerThreads: Int = 4,
+    queueCapacity: Int = 8
 ) extends Serializable {
 
   require(jobId.trim.nonEmpty, "'connector.jobId' cannot be empty")
@@ -74,6 +75,7 @@ case class AerospikeFlightOptions(
     payload.put("send_key", Boolean.box(sendKey))
     payload.put("ignore_nulls", Boolean.box(ignoreNulls))
     useBatchWrite.foreach(ub => payload.put("use_batch_write", Boolean.box(ub)))
+    payload.put("validate_only", Boolean.box(validateOnly))
     mapper.writeValueAsBytes(payload)
   }
 }
@@ -84,7 +86,10 @@ object AerospikeFlightOptions {
     "replace",
     "update_only",
     "replace_only",
-    "create_only"
+    "create_only",
+    "validate",
+    "dq",
+    "verify"
   )
 
   def fromSparkOptions(options: CaseInsensitiveStringMap): AerospikeFlightOptions = {
@@ -136,6 +141,11 @@ object AerospikeFlightOptions {
     // Default is false: null values in update mode send Value::Nil to delete the bin
     val ignoreNulls = getOrElse("aerospike.ignoreNulls", "false").toBoolean
     val useBatchWrite = get("aerospike.useBatchWrite").map(_.toBoolean)
+    val validateOnly = get("aerospike.dq")
+      .orElse(get("aerospike.validateOnly"))
+      .orElse(get("connector.dq"))
+      .map(_.toBoolean)
+      .getOrElse(writeMode == "validate" || writeMode == "dq" || writeMode == "verify")
 
     val batchSize = getOrElse("connector.batchSize", "8192").toInt
     val writerThreads = getOrElse("connector.writerThreads", "4").toInt
@@ -162,6 +172,7 @@ object AerospikeFlightOptions {
       sendKey = sendKey,
       ignoreNulls = ignoreNulls,
       useBatchWrite = useBatchWrite,
+      validateOnly = validateOnly,
       batchSize = batchSize,
       writerThreads = writerThreads,
       queueCapacity = queueCapacity

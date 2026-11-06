@@ -1,4 +1,5 @@
 use aerospike::{Bin, FloatValue, Key, Value};
+use std::collections::HashMap;
 use arrow_array::cast::AsArray;
 use arrow_array::types::{
     Date32Type, Date64Type, Float16Type, Float32Type, Float64Type, Int8Type, Int16Type, Int32Type,
@@ -80,11 +81,16 @@ pub fn convert_record_batch(
         bin_columns.push((bin_name.clone(), batch.column(idx).as_ref()));
     }
 
-    // Determine whether null column values should be emitted as Value::Nil (to delete bins in update mode)
-    // or omitted.
-    let emit_nil_for_nulls = match params.write_mode {
-        WriteMode::Update | WriteMode::UpdateOnly => !params.ignore_nulls,
-        WriteMode::Replace | WriteMode::ReplaceOnly | WriteMode::CreateOnly => false,
+    // Determine whether null column values should be emitted as Value::Nil (to delete bins in update mode
+    // or verify bin absence in DQ validate mode) or omitted.
+    let is_validate = params.is_validate_mode();
+    let emit_nil_for_nulls = if is_validate {
+        !params.ignore_nulls
+    } else {
+        match params.write_mode {
+            WriteMode::Update | WriteMode::UpdateOnly | WriteMode::Validate => !params.ignore_nulls,
+            WriteMode::Replace | WriteMode::ReplaceOnly | WriteMode::CreateOnly => false,
+        }
     };
 
     let mut records = Vec::with_capacity(num_rows);
@@ -109,16 +115,137 @@ pub fn convert_record_batch(
 
         // If all non-key columns were null in Replace mode (so `bins` is empty) and there is at least
         // one bin column in the schema, emit Nil for the first column so Aerospike receives a valid write op.
-        if bins.is_empty() && !bin_columns.is_empty() && !params.ignore_nulls {
+        if !is_validate && bins.is_empty() && !bin_columns.is_empty() && !params.ignore_nulls {
             bins.push(Bin::new(bin_columns[0].0.clone(), Value::Nil));
         }
 
-        if !bins.is_empty() {
+        if is_validate || !bins.is_empty() {
             records.push(PreparedRecord { key, bins });
         }
     }
 
     Ok(records)
+}
+
+/// Result of comparing a single `PreparedRecord` from Spark against the record stored in Aerospike.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RecordDqResult {
+    /// Key exists in Aerospike and all expected bins match (with `NaN == NaN` treated as `true`).
+    Matched,
+    /// Key was not found in Aerospike.
+    MissingKey,
+    /// Key exists in Aerospike, but at least one bin value or presence differed.
+    BinMismatch(String),
+}
+
+/// Compare an expected `PreparedRecord` against the actual bins fetched from Aerospike.
+pub fn validate_record_against_bins(
+    expected: &PreparedRecord,
+    actual_bins: Option<&HashMap<String, Value>>,
+) -> RecordDqResult {
+    let Some(actual_map) = actual_bins else {
+        return RecordDqResult::MissingKey;
+    };
+
+    for bin in &expected.bins {
+        let name = &bin.name;
+        let expected_val = &bin.value;
+
+        if *expected_val == Value::Nil {
+            // When `ignore_nulls = false`, a null column in Spark deletes the bin in Aerospike,
+            // so the bin must either be absent or Value::Nil.
+            if let Some(actual_val) = actual_map.get(name) {
+                if *actual_val != Value::Nil {
+                    return RecordDqResult::BinMismatch(format!(
+                        "bin '{name}': expected absent/Nil, actual {actual_val:?}"
+                    ));
+                }
+            }
+        } else {
+            match actual_map.get(name) {
+                None | Some(Value::Nil) => {
+                    return RecordDqResult::BinMismatch(format!(
+                        "bin '{name}': expected {expected_val:?}, actual missing/Nil"
+                    ));
+                }
+                Some(actual_val) => {
+                    if !values_equal_dq(expected_val, actual_val) {
+                        return RecordDqResult::BinMismatch(format!(
+                            "bin '{name}': expected {expected_val:?}, actual {actual_val:?}"
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    RecordDqResult::Matched
+}
+
+/// Recursive equality comparison for Aerospike `Value`s used in Data Quality (DQ) validation.
+/// Explicitly treats comparing two `NaN` floats (`f64::is_nan()`) as `true`, including inside
+/// nested `List`, `HashMap`, and `OrderedMap` structures.
+pub fn values_equal_dq(expected: &Value, actual: &Value) -> bool {
+    match (expected, actual) {
+        (Value::Nil, Value::Nil) => true,
+        (Value::Bool(a), Value::Bool(b)) => a == b,
+        // Some Aerospike setups return integer 0/1 for booleans if stored as int
+        (Value::Bool(a), Value::Int(b)) | (Value::Int(b), Value::Bool(a)) => {
+            (*a && *b == 1) || (!*a && *b == 0)
+        }
+        (Value::Int(a), Value::Int(b)) => a == b,
+        (Value::Float(a), Value::Float(b)) => {
+            let fa = f64::from(a.clone());
+            let fb = f64::from(b.clone());
+            (fa.is_nan() && fb.is_nan()) || (fa == fb)
+        }
+        (Value::String(a), Value::String(b)) => a == b,
+        (Value::Blob(a), Value::Blob(b)) | (Value::Hll(a), Value::Hll(b)) => a == b,
+        (Value::List(a), Value::List(b)) => {
+            a.len() == b.len()
+                && a.iter()
+                    .zip(b.iter())
+                    .all(|(x, y)| values_equal_dq(x, y))
+        }
+        (Value::OrderedMap(a), Value::OrderedMap(b)) => {
+            a.len() == b.len()
+                && a.iter().all(|(k_a, v_a)| {
+                    b.get(k_a)
+                        .or_else(|| {
+                            b.iter()
+                                .find(|(k_b, _)| values_equal_dq(k_a, k_b))
+                                .map(|(_, v_b)| v_b)
+                        })
+                        .is_some_and(|v_b| values_equal_dq(v_a, v_b))
+                })
+        }
+        (Value::HashMap(a), Value::HashMap(b)) => {
+            a.len() == b.len()
+                && a.iter().all(|(k_a, v_a)| {
+                    b.get(k_a)
+                        .or_else(|| {
+                            b.iter()
+                                .find(|(k_b, _)| values_equal_dq(k_a, k_b))
+                                .map(|(_, v_b)| v_b)
+                        })
+                        .is_some_and(|v_b| values_equal_dq(v_a, v_b))
+                })
+        }
+        (Value::OrderedMap(om), Value::HashMap(hm))
+        | (Value::HashMap(hm), Value::OrderedMap(om)) => {
+            om.len() == hm.len()
+                && om.iter().all(|(k_a, v_a)| {
+                    hm.get(k_a)
+                        .or_else(|| {
+                            hm.iter()
+                                .find(|(k_b, _)| values_equal_dq(k_a, k_b))
+                                .map(|(_, v_b)| v_b)
+                        })
+                        .is_some_and(|v_b| values_equal_dq(v_a, v_b))
+                })
+        }
+        (a, b) => a == b,
+    }
 }
 
 /// Extract a primary key `Value` (must be String, Int, or Blob in Aerospike).

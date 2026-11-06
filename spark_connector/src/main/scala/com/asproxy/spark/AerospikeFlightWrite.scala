@@ -130,7 +130,12 @@ case class AerospikeFlightCommitMessage(
     batchesSent: Long,
     overloadRetries: Long,
     otherRetries: Long,
-    elapsedMs: Long
+    elapsedMs: Long,
+    rowsValidated: Long = 0L,
+    matchedRows: Long = 0L,
+    mismatchedRows: Long = 0L,
+    missingKeys: Long = 0L,
+    binMismatchRows: Long = 0L
 ) extends WriterCommitMessage
 
 object AerospikeFlightCommitMessage {
@@ -141,6 +146,12 @@ object AerospikeFlightCommitMessage {
       elapsedMs: Long,
       raftClusterStatusJson: Option[String] = None
   ): LoadJobSummary = {
+    val totalValidated = messages.map(_.rowsValidated).sum
+    val totalMatched = messages.map(_.matchedRows).sum
+    val totalMismatched = messages.map(_.mismatchedRows).sum
+    val totalMissing = messages.map(_.missingKeys).sum
+    val totalBinMismatch = messages.map(_.binMismatchRows).sum
+
     LoadJobSummary(
       jobId = options.jobId,
       namespace = options.namespace,
@@ -152,7 +163,14 @@ object AerospikeFlightCommitMessage {
       otherRetries = messages.map(_.otherRetries).sum,
       partitionsCount = messages.size,
       elapsedMs = elapsedMs,
-      raftClusterStatusJson = raftClusterStatusJson
+      raftClusterStatusJson = raftClusterStatusJson,
+      validateOnly = options.validateOnly,
+      rowsValidated = totalValidated,
+      matchedRows = totalMatched,
+      mismatchedRows = totalMismatched,
+      missingKeys = totalMissing,
+      binMismatchRows = totalBinMismatch,
+      dqPassed = if (options.validateOnly) Some(totalMismatched == 0L) else None
     )
   }
 }

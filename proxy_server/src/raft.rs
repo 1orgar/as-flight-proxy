@@ -11,6 +11,7 @@ use tracing::{debug, info, warn};
 
 use crate::config::RaftConfig;
 use crate::error::{ProxyError, Result};
+use crate::writer::DqMismatchSample;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -45,11 +46,27 @@ pub struct JobLoadStatus {
     pub job_id: String,
     pub namespace: String,
     pub set_name: String,
+    #[serde(default)]
+    pub is_dq_validation: bool,
     pub state: JobState,
     pub total_rows_written: u64,
     pub total_batches_processed: u64,
     pub total_overload_retries: u64,
     pub total_other_retries: u64,
+    #[serde(default)]
+    pub total_rows_validated: u64,
+    #[serde(default)]
+    pub total_matched_rows: u64,
+    #[serde(default)]
+    pub total_mismatched_rows: u64,
+    #[serde(default)]
+    pub total_missing_keys: u64,
+    #[serde(default)]
+    pub total_bin_mismatch_rows: u64,
+    #[serde(default)]
+    pub dq_passed: Option<bool>,
+    #[serde(default)]
+    pub dq_mismatch_samples: Vec<DqMismatchSample>,
     pub per_node_rows: BTreeMap<u64, u64>,
     pub error_message: Option<String>,
     pub started_at_ms: u64,
@@ -73,9 +90,16 @@ impl ClusterMetadataState {
                 node_id,
                 namespace,
                 set_name,
+                is_dq_validation,
                 rows_written,
                 overload_retries,
                 other_retries,
+                rows_validated,
+                matched_rows,
+                mismatched_rows,
+                missing_keys,
+                bin_mismatch_rows,
+                mismatch_samples,
                 timestamp_ms,
             } => {
                 let entry = self
@@ -85,16 +109,27 @@ impl ClusterMetadataState {
                         job_id: job_id.clone(),
                         namespace: namespace.clone(),
                         set_name: set_name.clone(),
+                        is_dq_validation: *is_dq_validation,
                         state: JobState::Running,
                         total_rows_written: 0,
                         total_batches_processed: 0,
                         total_overload_retries: 0,
                         total_other_retries: 0,
+                        total_rows_validated: 0,
+                        total_matched_rows: 0,
+                        total_mismatched_rows: 0,
+                        total_missing_keys: 0,
+                        total_bin_mismatch_rows: 0,
+                        dq_passed: None,
+                        dq_mismatch_samples: Vec::new(),
                         per_node_rows: BTreeMap::new(),
                         error_message: None,
                         started_at_ms: *timestamp_ms,
                         updated_at_ms: *timestamp_ms,
                     });
+                if *is_dq_validation {
+                    entry.is_dq_validation = true;
+                }
                 entry.total_rows_written = entry.total_rows_written.saturating_add(*rows_written);
                 entry.total_batches_processed = entry.total_batches_processed.saturating_add(1);
                 entry.total_overload_retries = entry
@@ -102,8 +137,30 @@ impl ClusterMetadataState {
                     .saturating_add(*overload_retries);
                 entry.total_other_retries =
                     entry.total_other_retries.saturating_add(*other_retries);
+                entry.total_rows_validated =
+                    entry.total_rows_validated.saturating_add(*rows_validated);
+                entry.total_matched_rows = entry.total_matched_rows.saturating_add(*matched_rows);
+                entry.total_mismatched_rows =
+                    entry.total_mismatched_rows.saturating_add(*mismatched_rows);
+                entry.total_missing_keys = entry.total_missing_keys.saturating_add(*missing_keys);
+                entry.total_bin_mismatch_rows = entry
+                    .total_bin_mismatch_rows
+                    .saturating_add(*bin_mismatch_rows);
+                if entry.is_dq_validation {
+                    entry.dq_passed = Some(entry.total_mismatched_rows == 0);
+                }
+                for sample in mismatch_samples {
+                    if entry.dq_mismatch_samples.len() < 20 {
+                        entry.dq_mismatch_samples.push(sample.clone());
+                    }
+                }
+                let node_delta = if *is_dq_validation {
+                    *rows_validated
+                } else {
+                    *rows_written
+                };
                 let node_rows = entry.per_node_rows.entry(*node_id).or_insert(0);
-                *node_rows = node_rows.saturating_add(*rows_written);
+                *node_rows = node_rows.saturating_add(node_delta);
                 entry.updated_at_ms = (*timestamp_ms).max(entry.updated_at_ms);
             }
             MetadataCommand::SetJobState {
@@ -121,11 +178,19 @@ impl ClusterMetadataState {
                         job_id: job_id.clone(),
                         namespace: namespace.clone(),
                         set_name: set_name.clone(),
+                        is_dq_validation: false,
                         state: *state,
                         total_rows_written: 0,
                         total_batches_processed: 0,
                         total_overload_retries: 0,
                         total_other_retries: 0,
+                        total_rows_validated: 0,
+                        total_matched_rows: 0,
+                        total_mismatched_rows: 0,
+                        total_missing_keys: 0,
+                        total_bin_mismatch_rows: 0,
+                        dq_passed: None,
+                        dq_mismatch_samples: Vec::new(),
                         per_node_rows: BTreeMap::new(),
                         error_message: None,
                         started_at_ms: *timestamp_ms,
@@ -152,9 +217,23 @@ pub enum MetadataCommand {
         node_id: u64,
         namespace: String,
         set_name: String,
+        #[serde(default)]
+        is_dq_validation: bool,
         rows_written: u64,
         overload_retries: u64,
         other_retries: u64,
+        #[serde(default)]
+        rows_validated: u64,
+        #[serde(default)]
+        matched_rows: u64,
+        #[serde(default)]
+        mismatched_rows: u64,
+        #[serde(default)]
+        missing_keys: u64,
+        #[serde(default)]
+        bin_mismatch_rows: u64,
+        #[serde(default)]
+        mismatch_samples: Vec<DqMismatchSample>,
         timestamp_ms: u64,
     },
     SetJobState {

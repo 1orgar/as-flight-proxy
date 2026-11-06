@@ -22,7 +22,7 @@
   * **Умный по-ключевой ретрай**:
     * Ошибки перегрузки (`DEVICE_OVERLOAD`, `KEY_BUSY`, `NO_AVAILABLE_CONNECTIONS_TO_NODE`, `MAX_RETRIES_EXCEEDED`) ретраятся **«до талого» (бесконечно)** с экспоненциальным backoff и полным джиттером, причем из пачки переотправляются только не записавшиеся ключи.
     * Остальные ошибки ретраятся до `max_other_retries` раз, после чего стрим завершается с ошибкой.
-  * Режимы записи: `update` (обновление только переданных бинов, при `ignore_nulls = false` по умолчанию `null` отправляет `Value::Nil` и удаляет бин) и `replace` (полная перезапись записи).
+  * Режимы записи: `update` (обновление только переданных бинов, при `ignore_nulls = false` по умолчанию `null` отправляет `Value::Nil` и удаляет бин), `replace` (полная перезапись записи) и **`validate` / `dq`** (проверка качества данных без модификации базы: чтение батчами из Aerospike и побиновое сравнение со строками из Spark, при котором сравнение двух `NaN` всегда даёт `true`, в том числе внутри вложенных `List`/`Map`/`Struct`).
   * Автоконвертация `Date` и `Timestamp` в `int64` UTC миллисекунды (`Value::Int(i64)`), вложенных `Array`, `Map`, `Struct` — в Aerospike CDT `List` и `OrderedMap`.
   * Авторизация (`Basic` / `Bearer` HMAC-SHA256 токены через `Handshake`) и TLS 1.2/1.3 (включая mTLS).
   * HTTP-сервер мониторинга (`:9090`) только с `/metrics` (Prometheus) и `/healthz`.
@@ -53,7 +53,8 @@ job_id = "daily-profile-load-2026-11-06"
     .option("aerospike.namespace", "test")
     .option("aerospike.set", "users")
     .option("aerospike.keyColumn", "user_id")
-    .option("aerospike.writeMode", "update")      # "update" или "replace"
+    .option("aerospike.writeMode", "update")      # "update", "replace" или "validate" ("dq")
+    .option("aerospike.dq", "false")              # если "true" — режим проверки записи (DQ)
     .option("aerospike.ignoreNulls", "false")     # по умолчанию false: null в update удаляет бин
     .option("connector.batchSize", "8192")
     .option("connector.writerThreads", "4")
@@ -97,10 +98,14 @@ print("Статус выгрузки:", job_status)
 # {
 #   "job_id": "daily-profile-load-2026-11-06",
 #   "state": "completed",
-#   "total_rows_written": 1500000,
-#   "total_batches_processed": 184,
-#   "total_overload_retries": 12,
-#   "total_other_retries": 0,
+#   "is_dq_validation": true,
+#   "total_rows_validated": 1500000,
+#   "total_matched_rows": 1500000,
+#   "total_mismatched_rows": 0,
+#   "total_missing_keys": 0,
+#   "total_bin_mismatch_rows": 0,
+#   "dq_passed": true,
+#   "dq_mismatch_samples": [],
 #   "per_node_rows": {"1": 500000, "2": 500000, "3": 500000}, ...
 # }
 

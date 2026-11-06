@@ -28,11 +28,13 @@ use as_proxy_server::auth::Authenticator;
 use as_proxy_server::config::{
     AuthConfig, RaftConfig, RaftPeer, RetryConfig, WriteMode, WriteParameters, WriterConfig,
 };
-use as_proxy_server::converter::{PreparedRecord, convert_record_batch};
+use as_proxy_server::converter::{PreparedRecord, convert_record_batch, values_equal_dq};
 use as_proxy_server::flight_service::{ProxyFlightService, PutBatchAck};
 use as_proxy_server::metrics::ProxyMetrics;
 use as_proxy_server::raft::{JobLoadStatus, JobState, RaftNode, RaftRole};
-use as_proxy_server::writer::{AerospikeSink, MppWriteEngine, RecordWriteOutcome};
+use as_proxy_server::writer::{
+    AerospikeSink, MppWriteEngine, RecordReadOutcome, RecordWriteOutcome,
+};
 
 /// Mock Aerospike sink that records writes per key and allows injecting overload or fatal errors.
 struct MockAerospikeSink {
@@ -109,6 +111,32 @@ impl AerospikeSink for MockAerospikeSink {
             .execute_batch_write(std::slice::from_ref(record), params)
             .await;
         res.pop().unwrap_or(RecordWriteOutcome::Success)
+    }
+
+    async fn execute_batch_read(
+        &self,
+        records: &[PreparedRecord],
+        _params: &WriteParameters,
+    ) -> Vec<RecordReadOutcome> {
+        let stored_guard = self.stored.lock().unwrap();
+        let mut outcomes = Vec::with_capacity(records.len());
+
+        for rec in records {
+            match stored_guard.get(&rec.key) {
+                Some(bins) => {
+                    let mut map = HashMap::new();
+                    for b in bins {
+                        // In Aerospike, writing Value::Nil deletes the bin from the record
+                        if b.value != Value::Nil {
+                            map.insert(b.name.clone(), b.value.clone());
+                        }
+                    }
+                    outcomes.push(RecordReadOutcome::Found(map));
+                }
+                None => outcomes.push(RecordReadOutcome::NotFound),
+            }
+        }
+        outcomes
     }
 
     fn is_connected(&self) -> bool {
@@ -241,6 +269,7 @@ fn test_convert_all_types_and_null_modes() {
         send_key: true,
         ignore_nulls: false,
         use_batch_write: Some(true),
+        validate_only: false,
     };
 
     let records = convert_record_batch(&batch, &params_update_nil, 64).unwrap();
@@ -353,6 +382,7 @@ fn test_null_primary_key_and_bin_name_length_validation() {
         send_key: true,
         ignore_nulls: false,
         use_batch_write: None,
+        validate_only: false,
     };
 
     // Null key must fail immediately
@@ -450,6 +480,7 @@ async fn test_infinite_overload_retry_and_partial_batch_retry() {
         send_key: true,
         ignore_nulls: false,
         use_batch_write: Some(true),
+        validate_only: false,
     };
 
     let stats = engine.write_records(records, &params).await.unwrap();
@@ -502,6 +533,7 @@ async fn test_single_put_fallback_mode_with_overload_retry() {
         send_key: true,
         ignore_nulls: false,
         use_batch_write: Some(false),
+        validate_only: false,
     };
 
     let stats = engine.write_records(records, &params).await.unwrap();
@@ -546,6 +578,7 @@ async fn test_non_overload_error_terminates_after_n_retries() {
         send_key: true,
         ignore_nulls: false,
         use_batch_write: Some(true),
+        validate_only: false,
     };
 
     let err = engine.write_records(records, &params).await.unwrap_err();
@@ -657,6 +690,7 @@ async fn test_end_to_end_flight_handshake_and_do_put_stream() {
         send_key: true,
         ignore_nulls: false,
         use_batch_write: Some(true),
+        validate_only: false,
     };
     let descriptor = FlightDescriptor::new_cmd(serde_json::to_vec(&write_params).unwrap());
 
@@ -821,6 +855,7 @@ async fn test_three_node_raft_cluster_metadata_and_distributed_job_status() {
             send_key: true,
             ignore_nulls: false,
             use_batch_write: Some(true),
+            validate_only: false,
         };
         let desc = FlightDescriptor::new_cmd(serde_json::to_vec(&params).unwrap());
         let stream_data = FlightDataEncoderBuilder::new()
@@ -914,9 +949,16 @@ async fn test_raft_job_stats_ttl_expiration() {
             node_id: 1,
             namespace: "ns".to_string(),
             set_name: "set".to_string(),
+            is_dq_validation: false,
             rows_written: 125,
             overload_retries: 2,
             other_retries: 0,
+            rows_validated: 0,
+            matched_rows: 0,
+            mismatched_rows: 0,
+            missing_keys: 0,
+            bin_mismatch_rows: 0,
+            mismatch_samples: Vec::new(),
             timestamp_ms: as_proxy_server::raft::now_ms(),
         })
         .await
@@ -934,6 +976,228 @@ async fn test_raft_job_stats_ttl_expiration() {
     assert!(raft_node.get_job_status("ttl-job-1").await.is_none());
     let snap = raft_node.get_cluster_snapshot().await;
     assert!(!snap.state.jobs.contains_key("ttl-job-1"));
+
+    raft_node.shutdown();
+}
+
+#[tokio::test]
+async fn test_dq_validation_with_nan_equality_and_mismatch_detection() {
+    // 1. Unit check: two NaNs (including different IEEE-754 NaN payload/sign bits and nested NaNs) must be equal!
+    let nan1 = Value::Float(FloatValue::from(f64::NAN));
+    let nan2 = Value::Float(FloatValue::from(-f64::NAN));
+    let nan3 = Value::Float(FloatValue::from(f64::from_bits(0x7ff8_0000_0000_0042)));
+    assert!(values_equal_dq(&nan1, &nan2));
+    assert!(values_equal_dq(&nan1, &nan3));
+    assert!(values_equal_dq(
+        &Value::List(vec![nan1.clone(), Value::Int(10)]),
+        &Value::List(vec![nan3.clone(), Value::Int(10)])
+    ));
+    assert!(!values_equal_dq(&nan1, &Value::Float(FloatValue::from(1.0))));
+
+    // 2. End-to-end Flight DoPut + Raft job status check in DQ validation mode
+    let sink = Arc::new(MockAerospikeSink::new(HashMap::new(), HashMap::new()));
+    {
+        let mut stored = sink.stored.lock().unwrap();
+        // Key 1: score is NaN (with non-standard NaN bit pattern), age is 25
+        stored.insert(
+            Key::new("ns", "users", Value::Int(1)).unwrap(),
+            vec![
+                Bin::new("score", nan3.clone()),
+                Bin::new("age", Value::Int(25)),
+            ],
+        );
+        // Key 2: score is 42.5, age bin was deleted (Nil)
+        stored.insert(
+            Key::new("ns", "users", Value::Int(2)).unwrap(),
+            vec![
+                Bin::new("score", Value::Float(FloatValue::from(42.5))),
+                Bin::new("age", Value::Nil),
+            ],
+        );
+        // Key 3: score is 10.0, age is 30 (will mismatch against Spark's age = 99)
+        stored.insert(
+            Key::new("ns", "users", Value::Int(3)).unwrap(),
+            vec![
+                Bin::new("score", Value::Float(FloatValue::from(10.0))),
+                Bin::new("age", Value::Int(30)),
+            ],
+        );
+        // Key 4 is NOT in Aerospike at all (missing key)
+    }
+
+    let raft_node = RaftNode::new(RaftConfig {
+        enabled: true,
+        node_id: 1,
+        listen_addr: "127.0.0.1:0".to_string(),
+        ..RaftConfig::default()
+    });
+    raft_node.start().await.unwrap();
+
+    let metrics = ProxyMetrics::new();
+    let engine = Arc::new(MppWriteEngine::new(
+        sink.clone(),
+        WriterConfig::default(),
+        RetryConfig::default(),
+        Arc::clone(&metrics),
+    ));
+    let auth = Arc::new(Authenticator::new(AuthConfig {
+        enabled: false,
+        ..AuthConfig::default()
+    }));
+    let svc = ProxyFlightService::new(auth, engine, metrics, 64)
+        .with_raft_node(Arc::clone(&raft_node));
+
+    let fl = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let f_addr = fl.local_addr().unwrap();
+    tokio::spawn(async move {
+        Server::builder()
+            .add_service(FlightServiceServer::new(svc))
+            .serve_with_incoming(TcpListenerStream::new(fl))
+            .await
+            .unwrap();
+    });
+
+    let ch = tonic::transport::Endpoint::new(format!("http://{f_addr}"))
+        .unwrap()
+        .connect()
+        .await
+        .unwrap();
+    let mut client = FlightServiceClient::new(ch);
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("score", DataType::Float64, true),
+        Field::new("age", DataType::Int64, true),
+    ]));
+
+    // First DQ job: 4 rows (Row 1 matches with NaN==NaN, Row 2 matches with null/deleted bin,
+    // Row 3 has bin mismatch, Row 4 is missing key)
+    let mut id_b = Int64Builder::new();
+    let mut score_b = Float64Builder::new();
+    let mut age_b = Int64Builder::new();
+
+    // Row 1: score = NaN, age = 25 -> Match!
+    id_b.append_value(1);
+    score_b.append_value(f64::NAN);
+    age_b.append_value(25);
+
+    // Row 2: score = 42.5, age = null -> Match!
+    id_b.append_value(2);
+    score_b.append_value(42.5);
+    age_b.append_null();
+
+    // Row 3: score = 10.0, age = 99 (Aerospike has 30) -> BinMismatch!
+    id_b.append_value(3);
+    score_b.append_value(10.0);
+    age_b.append_value(99);
+
+    // Row 4: missing in Aerospike -> MissingKey!
+    id_b.append_value(4);
+    score_b.append_value(0.0);
+    age_b.append_value(1);
+
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(id_b.finish()),
+            Arc::new(score_b.finish()),
+            Arc::new(age_b.finish()),
+        ],
+    )
+    .unwrap();
+
+    let dq_params = WriteParameters {
+        job_id: Some("dq-job-failed".to_string()),
+        namespace: "ns".to_string(),
+        set_name: "users".to_string(),
+        key_column: "id".to_string(),
+        write_mode: WriteMode::Validate,
+        ttl_seconds: None,
+        send_key: true,
+        ignore_nulls: false,
+        use_batch_write: Some(true),
+        validate_only: true,
+    };
+    let desc = FlightDescriptor::new_cmd(serde_json::to_vec(&dq_params).unwrap());
+    let stream_data = FlightDataEncoderBuilder::new()
+        .with_schema(Arc::clone(&schema))
+        .with_flight_descriptor(Some(desc))
+        .build(stream::iter(vec![Ok(batch.clone())]))
+        .map(|r| r.unwrap());
+
+    let mut put_resp = client
+        .do_put(Request::new(stream_data))
+        .await
+        .unwrap()
+        .into_inner();
+    let ack_msg = put_resp.try_next().await.unwrap().unwrap();
+    let ack: PutBatchAck = serde_json::from_slice(&ack_msg.app_metadata).unwrap();
+    assert_eq!(ack.rows_validated, 4);
+    assert_eq!(ack.matched_rows, 2);
+    assert_eq!(ack.mismatched_rows, 2);
+    assert_eq!(ack.missing_keys, 1);
+    assert_eq!(ack.bin_mismatch_rows, 1);
+
+    // Query Raft job status via DoAction
+    let status_res = client
+        .do_action(Request::new(Action {
+            r#type: "get_job_status".to_string(),
+            body: Bytes::from("dq-job-failed"),
+        }))
+        .await
+        .unwrap()
+        .into_inner()
+        .try_next()
+        .await
+        .unwrap()
+        .unwrap();
+    let status: JobLoadStatus = serde_json::from_slice(&status_res.body).unwrap();
+    assert!(status.is_dq_validation);
+    assert_eq!(status.total_rows_validated, 4);
+    assert_eq!(status.total_matched_rows, 2);
+    assert_eq!(status.total_mismatched_rows, 2);
+    assert_eq!(status.total_missing_keys, 1);
+    assert_eq!(status.total_bin_mismatch_rows, 1);
+    assert_eq!(status.dq_passed, Some(false));
+    assert_eq!(status.dq_mismatch_samples.len(), 2);
+
+    // Second DQ job: validate only the first 2 rows (which include NaN == NaN and null bin) -> dq_passed must be Some(true)!
+    let valid_batch = batch.slice(0, 2);
+    let mut dq_params_ok = dq_params.clone();
+    dq_params_ok.job_id = Some("dq-job-passed".to_string());
+    let desc_ok = FlightDescriptor::new_cmd(serde_json::to_vec(&dq_params_ok).unwrap());
+    let stream_ok = FlightDataEncoderBuilder::new()
+        .with_schema(schema)
+        .with_flight_descriptor(Some(desc_ok))
+        .build(stream::iter(vec![Ok(valid_batch)]))
+        .map(|r| r.unwrap());
+
+    let mut resp_ok = client
+        .do_put(Request::new(stream_ok))
+        .await
+        .unwrap()
+        .into_inner();
+    while (resp_ok.try_next().await.unwrap()).is_some() {}
+
+    let status_ok_res = client
+        .do_action(Request::new(Action {
+            r#type: "get_job_status".to_string(),
+            body: Bytes::from("dq-job-passed"),
+        }))
+        .await
+        .unwrap()
+        .into_inner()
+        .try_next()
+        .await
+        .unwrap()
+        .unwrap();
+    let status_ok: JobLoadStatus = serde_json::from_slice(&status_ok_res.body).unwrap();
+    assert!(status_ok.is_dq_validation);
+    assert_eq!(status_ok.total_rows_validated, 2);
+    assert_eq!(status_ok.total_matched_rows, 2);
+    assert_eq!(status_ok.total_mismatched_rows, 0);
+    assert_eq!(status_ok.dq_passed, Some(true));
+    assert!(status_ok.dq_mismatch_samples.is_empty());
 
     raft_node.shutdown();
 }

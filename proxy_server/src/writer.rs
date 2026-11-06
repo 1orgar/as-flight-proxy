@@ -1,17 +1,19 @@
 use aerospike::operations;
 use aerospike::{
-    BatchOperation, BatchPolicy, BatchWritePolicy, Client, ClientResultCode, Concurrency,
-    ErrorKind, ResultCode, WritePolicy,
+    BatchOperation, BatchPolicy, BatchReadPolicy, BatchWritePolicy, Bins, Client,
+    ClientResultCode, Concurrency, ErrorKind, ResultCode, Value, WritePolicy,
 };
 use futures::stream::{FuturesUnordered, StreamExt};
 use rand::Rng;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Semaphore;
 use tracing::{debug, warn};
 
 use crate::config::{RetryConfig, WriteParameters, WriterConfig};
-use crate::converter::PreparedRecord;
+use crate::converter::{PreparedRecord, RecordDqResult, validate_record_against_bins};
 use crate::error::{ProxyError, Result};
 use crate::metrics::ProxyMetrics;
 
@@ -28,15 +30,41 @@ pub enum RecordWriteOutcome {
     OtherError(String),
 }
 
-/// Statistics returned after writing an Arrow `RecordBatch`.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+/// Outcome of attempting to read a single record from Aerospike during Data Quality (DQ) validation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RecordReadOutcome {
+    /// Record was found in Aerospike with its bins.
+    Found(HashMap<String, Value>),
+    /// Record does not exist in Aerospike (`ResultCode::KeyNotFoundError`).
+    NotFound,
+    /// Overload / resource exhaustion error: retried indefinitely ("до талого") with exponential backoff.
+    OverloadError(String),
+    /// Any other error: retried at most `max_other_retries` times.
+    OtherError(String),
+}
+
+/// Sample of a Data Quality (DQ) validation mismatch for a specific key.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DqMismatchSample {
+    pub key: String,
+    pub reason: String,
+}
+
+/// Statistics returned after writing or validating an Arrow `RecordBatch`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct BatchWriteStats {
     pub rows_written: usize,
     pub overload_retries: u64,
     pub other_retries: u64,
+    pub rows_validated: usize,
+    pub matched_rows: usize,
+    pub mismatched_rows: usize,
+    pub missing_keys: usize,
+    pub bin_mismatch_rows: usize,
+    pub mismatch_samples: Vec<DqMismatchSample>,
 }
 
-/// Abstraction over the Aerospike client for executing batch and single-key writes.
+/// Abstraction over the Aerospike client for executing batch/single-key writes and DQ batch reads.
 #[tonic::async_trait]
 pub trait AerospikeSink: Send + Sync + 'static {
     async fn execute_batch_write(
@@ -50,6 +78,12 @@ pub trait AerospikeSink: Send + Sync + 'static {
         record: &PreparedRecord,
         params: &WriteParameters,
     ) -> RecordWriteOutcome;
+
+    async fn execute_batch_read(
+        &self,
+        records: &[PreparedRecord],
+        params: &WriteParameters,
+    ) -> Vec<RecordReadOutcome>;
 
     fn is_connected(&self) -> bool;
 }
@@ -148,8 +182,82 @@ impl AerospikeSink for RealAerospikeSink {
         }
     }
 
+    async fn execute_batch_read(
+        &self,
+        records: &[PreparedRecord],
+        _params: &WriteParameters,
+    ) -> Vec<RecordReadOutcome> {
+        if records.is_empty() {
+            return Vec::new();
+        }
+
+        let mut batch_policy = BatchPolicy::default();
+        batch_policy.concurrency = Concurrency::Parallel;
+        batch_policy.respond_all_keys = true;
+        batch_policy.base_policy.socket_timeout = self.timeout_ms;
+        batch_policy.base_policy.total_timeout = self.timeout_ms;
+        batch_policy.base_policy.max_retries = 0;
+
+        let read_policy = BatchReadPolicy::default();
+        let mut batch_ops: Vec<BatchOperation> = records
+            .iter()
+            .map(|rec| BatchOperation::read(&read_policy, rec.key.clone(), Bins::All))
+            .collect();
+
+        match self.client.batch(&batch_policy, &mut batch_ops).await {
+            Ok(()) => batch_ops
+                .iter()
+                .map(classify_batch_read_op)
+                .collect(),
+            Err(call_err) => {
+                let fallback_write = classify_aerospike_failure(Some(&call_err), None);
+                let fallback_read = match fallback_write {
+                    RecordWriteOutcome::OverloadError(m) => RecordReadOutcome::OverloadError(m),
+                    RecordWriteOutcome::OtherError(_) | RecordWriteOutcome::Success => {
+                        RecordReadOutcome::OtherError(call_err.to_string())
+                    }
+                };
+                batch_ops
+                    .iter()
+                    .map(|op| {
+                        if op.result_code().is_some() || op.error().is_some() {
+                            classify_batch_read_op(op)
+                        } else {
+                            fallback_read.clone()
+                        }
+                    })
+                    .collect()
+            }
+        }
+    }
+
     fn is_connected(&self) -> bool {
         self.client.is_connected()
+    }
+}
+
+fn classify_batch_read_op(op: &BatchOperation) -> RecordReadOutcome {
+    match op.result_code() {
+        Some(ResultCode::Ok) => {
+            let bins: HashMap<String, Value> = op
+                .record()
+                .map(|r| {
+                    r.bins
+                        .iter()
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect()
+                })
+                .unwrap_or_default();
+            RecordReadOutcome::Found(bins)
+        }
+        Some(ResultCode::KeyNotFoundError) => RecordReadOutcome::NotFound,
+        rc => match classify_aerospike_failure(op.error(), rc) {
+            RecordWriteOutcome::OverloadError(m) => RecordReadOutcome::OverloadError(m),
+            RecordWriteOutcome::OtherError(m) => RecordReadOutcome::OtherError(m),
+            RecordWriteOutcome::Success => {
+                RecordReadOutcome::OtherError("Unexpected non-Ok batch read status".to_string())
+            }
+        },
     }
 }
 
@@ -253,12 +361,16 @@ impl MppWriteEngine {
         self.sink.is_connected()
     }
 
-    /// Write a vector of `PreparedRecord`s concurrently in MPP sub-batches.
+    /// Write or validate a vector of `PreparedRecord`s concurrently in MPP sub-batches.
     pub async fn write_records(
         &self,
         records: Vec<PreparedRecord>,
         params: &WriteParameters,
     ) -> Result<BatchWriteStats> {
+        if params.is_validate_mode() {
+            return self.validate_records(records, params).await;
+        }
+
         let total_rows = records.len();
         if total_rows == 0 {
             return Ok(BatchWriteStats::default());
@@ -281,8 +393,7 @@ impl MppWriteEngine {
         let mut in_flight_futures = FuturesUnordered::new();
         let mut stats = BatchWriteStats {
             rows_written: total_rows,
-            overload_retries: 0,
-            other_retries: 0,
+            ..BatchWriteStats::default()
         };
 
         for chunk in chunks {
@@ -305,6 +416,219 @@ impl MppWriteEngine {
 
         self.metrics.inc_records_written(total_rows as u64);
         self.metrics.inc_batches_processed();
+
+        Ok(stats)
+    }
+
+    /// Data Quality (DQ) validation: read records in parallel sub-batches from Aerospike
+    /// and compare each record's bins against the incoming `PreparedRecord` (with `NaN == NaN` as `true`).
+    pub async fn validate_records(
+        &self,
+        records: Vec<PreparedRecord>,
+        params: &WriteParameters,
+    ) -> Result<BatchWriteStats> {
+        let total_rows = records.len();
+        if total_rows == 0 {
+            return Ok(BatchWriteStats::default());
+        }
+
+        let chunk_size = self.writer_config.batch_write_size.max(1);
+        let max_concurrency = self
+            .writer_config
+            .max_concurrent_subbatches_per_stream
+            .max(1);
+
+        let chunks: Vec<Vec<PreparedRecord>> = records
+            .chunks(chunk_size)
+            .map(|c| c.to_vec())
+            .collect();
+
+        let mut in_flight_futures = FuturesUnordered::new();
+        let mut stats = BatchWriteStats {
+            rows_validated: total_rows,
+            ..BatchWriteStats::default()
+        };
+
+        for chunk in chunks {
+            while in_flight_futures.len() >= max_concurrency {
+                let sub_stats: Result<BatchWriteStats> = in_flight_futures.next().await.unwrap();
+                let sub = sub_stats?;
+                Self::merge_validation_stats(&mut stats, sub);
+            }
+
+            let fut = self.validate_subbatch(chunk, params.clone());
+            in_flight_futures.push(fut);
+        }
+
+        while let Some(res) = in_flight_futures.next().await {
+            let sub = res?;
+            Self::merge_validation_stats(&mut stats, sub);
+        }
+
+        self.metrics.inc_batches_processed();
+        Ok(stats)
+    }
+
+    fn merge_validation_stats(acc: &mut BatchWriteStats, sub: BatchWriteStats) {
+        acc.overload_retries += sub.overload_retries;
+        acc.other_retries += sub.other_retries;
+        acc.matched_rows += sub.matched_rows;
+        acc.mismatched_rows += sub.mismatched_rows;
+        acc.missing_keys += sub.missing_keys;
+        acc.bin_mismatch_rows += sub.bin_mismatch_rows;
+        for sample in sub.mismatch_samples {
+            if acc.mismatch_samples.len() < 20 {
+                acc.mismatch_samples.push(sample);
+            }
+        }
+    }
+
+    async fn validate_subbatch(
+        &self,
+        chunk: Vec<PreparedRecord>,
+        params: WriteParameters,
+    ) -> Result<BatchWriteStats> {
+        let num_records = chunk.len();
+        let permit_count = num_records.min(self.writer_config.max_in_flight_records.max(1)) as u32;
+
+        let _permit = self
+            .in_flight_semaphore
+            .acquire_many(permit_count)
+            .await
+            .map_err(|_| ProxyError::Internal("Backpressure semaphore closed".to_string()))?;
+
+        self.metrics.add_in_flight(num_records as i64);
+        let start = Instant::now();
+
+        let res = self.execute_batch_read_with_retry(chunk, &params).await;
+
+        let elapsed_micros = start.elapsed().as_micros() as u64;
+        self.metrics.observe_write_latency_micros(elapsed_micros);
+        self.metrics.add_in_flight(-(num_records as i64));
+
+        res
+    }
+
+    async fn execute_batch_read_with_retry(
+        &self,
+        initial_records: Vec<PreparedRecord>,
+        params: &WriteParameters,
+    ) -> Result<BatchWriteStats> {
+        #[derive(Clone)]
+        struct PendingReadItem {
+            record: PreparedRecord,
+            overload_attempts: u32,
+            other_attempts: u32,
+        }
+
+        let mut pending: Vec<PendingReadItem> = initial_records
+            .into_iter()
+            .map(|record| PendingReadItem {
+                record,
+                overload_attempts: 0,
+                other_attempts: 0,
+            })
+            .collect();
+
+        let mut stats = BatchWriteStats {
+            rows_validated: pending.len(),
+            ..BatchWriteStats::default()
+        };
+        let mut backoff_step: u32 = 0;
+
+        while !pending.is_empty() {
+            let batch_slice: Vec<PreparedRecord> =
+                pending.iter().map(|p| p.record.clone()).collect();
+            let outcomes = self.sink.execute_batch_read(&batch_slice, params).await;
+
+            let mut next_pending = Vec::new();
+            let mut batch_overload_count: u64 = 0;
+            let mut batch_other_count: u64 = 0;
+
+            for (mut item, outcome) in pending.into_iter().zip(outcomes.into_iter()) {
+                match outcome {
+                    RecordReadOutcome::Found(actual_bins) => {
+                        match validate_record_against_bins(&item.record, Some(&actual_bins)) {
+                            RecordDqResult::Matched => {
+                                stats.matched_rows += 1;
+                            }
+                            RecordDqResult::MissingKey => {
+                                stats.missing_keys += 1;
+                                stats.mismatched_rows += 1;
+                                if stats.mismatch_samples.len() < 20 {
+                                    stats.mismatch_samples.push(DqMismatchSample {
+                                        key: format!("{:?}", item.record.key),
+                                        reason: "key_not_found".to_string(),
+                                    });
+                                }
+                            }
+                            RecordDqResult::BinMismatch(reason) => {
+                                stats.bin_mismatch_rows += 1;
+                                stats.mismatched_rows += 1;
+                                if stats.mismatch_samples.len() < 20 {
+                                    stats.mismatch_samples.push(DqMismatchSample {
+                                        key: format!("{:?}", item.record.key),
+                                        reason,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                    RecordReadOutcome::NotFound => {
+                        stats.missing_keys += 1;
+                        stats.mismatched_rows += 1;
+                        if stats.mismatch_samples.len() < 20 {
+                            stats.mismatch_samples.push(DqMismatchSample {
+                                key: format!("{:?}", item.record.key),
+                                reason: "key_not_found".to_string(),
+                            });
+                        }
+                    }
+                    RecordReadOutcome::OverloadError(err_msg) => {
+                        item.overload_attempts = item.overload_attempts.saturating_add(1);
+                        batch_overload_count += 1;
+                        debug!(
+                            key = ?item.record.key,
+                            overload_attempt = item.overload_attempts,
+                            error = %err_msg,
+                            "Overload error on DQ batch read; scheduling infinite backoff retry"
+                        );
+                        next_pending.push(item);
+                    }
+                    RecordReadOutcome::OtherError(err_msg) => {
+                        item.other_attempts = item.other_attempts.saturating_add(1);
+                        if item.other_attempts > self.retry_config.max_other_retries {
+                            self.metrics.inc_failed_records(1);
+                            return Err(ProxyError::WriteFailed {
+                                attempts: item.other_attempts,
+                                message: err_msg,
+                            });
+                        }
+                        batch_other_count += 1;
+                        next_pending.push(item);
+                    }
+                }
+            }
+
+            if next_pending.is_empty() {
+                break;
+            }
+
+            if batch_overload_count > 0 {
+                stats.overload_retries += batch_overload_count;
+                self.metrics.inc_overload_retries(batch_overload_count);
+            }
+            if batch_other_count > 0 {
+                stats.other_retries += batch_other_count;
+                self.metrics.inc_other_retries(batch_other_count);
+            }
+
+            let sleep_dur = compute_backoff_with_jitter(&self.retry_config, backoff_step);
+            backoff_step = backoff_step.saturating_add(1);
+            tokio::time::sleep(sleep_dur).await;
+
+            pending = next_pending;
+        }
 
         Ok(stats)
     }

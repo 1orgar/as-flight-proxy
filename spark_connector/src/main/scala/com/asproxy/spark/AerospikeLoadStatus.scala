@@ -27,7 +27,14 @@ case class LoadJobSummary(
     otherRetries: Long,
     partitionsCount: Int,
     elapsedMs: Long,
-    raftClusterStatusJson: Option[String] = None
+    raftClusterStatusJson: Option[String] = None,
+    validateOnly: Boolean = false,
+    rowsValidated: Long = 0L,
+    matchedRows: Long = 0L,
+    mismatchedRows: Long = 0L,
+    missingKeys: Long = 0L,
+    binMismatchRows: Long = 0L,
+    dqPassed: Option[Boolean] = None
 ) extends Serializable {
 
   def toJson: String = {
@@ -37,10 +44,17 @@ case class LoadJobSummary(
     map.put("namespace", namespace)
     map.put("set_name", setName)
     map.put("status", status)
+    map.put("is_dq_validation", Boolean.box(validateOnly))
     map.put("rows_written", Long.box(rowsWritten))
     map.put("batches_sent", Long.box(batchesSent))
     map.put("overload_retries", Long.box(overloadRetries))
     map.put("other_retries", Long.box(otherRetries))
+    map.put("rows_validated", Long.box(rowsValidated))
+    map.put("matched_rows", Long.box(matchedRows))
+    map.put("mismatched_rows", Long.box(mismatchedRows))
+    map.put("missing_keys", Long.box(missingKeys))
+    map.put("bin_mismatch_rows", Long.box(binMismatchRows))
+    dqPassed.foreach(passed => map.put("dq_passed", Boolean.box(passed)))
     map.put("partitions_count", Int.box(partitionsCount))
     map.put("elapsed_ms", Long.box(elapsedMs))
     raftClusterStatusJson.foreach(raw => map.put("raft_cluster_status", mapper.readTree(raw)))
@@ -296,11 +310,29 @@ class AerospikeOtherRetriesMetric extends CustomSumMetric {
   override def description(): String = "Aerospike non-overload retries"
 }
 
+class AerospikeRowsValidatedMetric extends CustomSumMetric {
+  override def name(): String = "as_rows_validated"
+  override def description(): String = "Aerospike DQ rows validated"
+}
+
+class AerospikeMatchedRowsMetric extends CustomSumMetric {
+  override def name(): String = "as_matched_rows"
+  override def description(): String = "Aerospike DQ matched rows"
+}
+
+class AerospikeMismatchedRowsMetric extends CustomSumMetric {
+  override def name(): String = "as_mismatched_rows"
+  override def description(): String = "Aerospike DQ mismatched rows"
+}
+
 object AerospikeCustomMetrics {
   def supportedMetrics: Array[CustomMetric] = Array(
     new AerospikeRowsWrittenMetric(),
     new AerospikeBatchesSentMetric(),
     new AerospikeOverloadRetriesMetric(),
-    new AerospikeOtherRetriesMetric()
+    new AerospikeOtherRetriesMetric(),
+    new AerospikeRowsValidatedMetric(),
+    new AerospikeMatchedRowsMetric(),
+    new AerospikeMismatchedRowsMetric()
   )
 }

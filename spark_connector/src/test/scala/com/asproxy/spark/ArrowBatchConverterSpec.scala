@@ -40,6 +40,19 @@ class ArrowBatchConverterSpec extends AnyFunSuite {
     assert(jsonStr.contains("\"key_column\":\"user_id\""))
     assert(jsonStr.contains("\"write_mode\":\"update\""))
     assert(jsonStr.contains("\"ignore_nulls\":false"))
+    assert(jsonStr.contains("\"validate_only\":false"))
+
+    val dqOpts = AerospikeFlightOptions.fromMap(
+      Map(
+        "connector.jobId" -> "job-dq-001",
+        "aerospike.namespace" -> "profile_ns",
+        "aerospike.set" -> "features",
+        "aerospike.keyColumn" -> "user_id",
+        "aerospike.dq" -> "true"
+      )
+    )
+    assert(dqOpts.validateOnly)
+    assert(new String(dqOpts.toFlightDescriptorJsonBytes, "UTF-8").contains("\"validate_only\":true"))
   }
 
   test("AerospikeLoadStatus aggregates partition commit messages and stores summary by jobId") {

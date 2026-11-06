@@ -253,12 +253,15 @@ pub enum WriteMode {
     ReplaceOnly,
     /// Create new record only; fail if record already exists.
     CreateOnly,
+    /// Data Quality (DQ) validation mode: read records from Aerospike and compare against incoming Spark batch.
+    #[serde(alias = "dq", alias = "verify")]
+    Validate,
 }
 
 impl WriteMode {
     pub fn to_record_exists_action(self) -> RecordExistsAction {
         match self {
-            WriteMode::Update => RecordExistsAction::Update,
+            WriteMode::Update | WriteMode::Validate => RecordExistsAction::Update,
             WriteMode::Replace => RecordExistsAction::Replace,
             WriteMode::UpdateOnly => RecordExistsAction::UpdateOnly,
             WriteMode::ReplaceOnly => RecordExistsAction::ReplaceOnly,
@@ -273,8 +276,9 @@ impl WriteMode {
             "update_only" | "updateonly" => Ok(WriteMode::UpdateOnly),
             "replace_only" | "replaceonly" => Ok(WriteMode::ReplaceOnly),
             "create_only" | "createonly" => Ok(WriteMode::CreateOnly),
+            "validate" | "dq" | "verify" => Ok(WriteMode::Validate),
             other => Err(ProxyError::InvalidArgument(format!(
-                "Unsupported write_mode '{other}'. Expected 'update', 'replace', 'update_only', 'replace_only', or 'create_only'"
+                "Unsupported write_mode '{other}'. Expected 'update', 'replace', 'update_only', 'replace_only', 'create_only', or 'validate' ('dq')"
             ))),
         }
     }
@@ -302,9 +306,16 @@ pub struct WriteParameters {
     pub ignore_nulls: bool,
     #[serde(default)]
     pub use_batch_write: Option<bool>,
+    /// Data Quality (DQ) validation mode: instead of writing to Aerospike, read the records from
+    /// Aerospike and compare them with the incoming Spark batch (treating `NaN == NaN` as `true`).
+    #[serde(default, alias = "dq")]
+    pub validate_only: bool,
 }
 
 impl WriteParameters {
+    pub fn is_validate_mode(&self) -> bool {
+        self.validate_only || self.write_mode == WriteMode::Validate
+    }
     pub fn from_descriptor_or_headers(
         descriptor_cmd: Option<&[u8]>,
         headers: &MetadataMap,
@@ -358,6 +369,10 @@ impl WriteParameters {
             .unwrap_or(false);
         let use_batch_write = get_str("x-as-use-batch-write")
             .map(|s| s.eq_ignore_ascii_case("true") || s == "1");
+        let validate_only = get_str("x-as-validate-only")
+            .or_else(|| get_str("x-as-dq"))
+            .map(|s| s.eq_ignore_ascii_case("true") || s == "1")
+            .unwrap_or(write_mode == WriteMode::Validate);
 
         let params = Self {
             job_id,
@@ -369,6 +384,7 @@ impl WriteParameters {
             send_key,
             ignore_nulls,
             use_batch_write,
+            validate_only,
         };
         params.validate()?;
         Ok(params)

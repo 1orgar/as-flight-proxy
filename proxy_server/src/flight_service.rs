@@ -23,7 +23,7 @@ use crate::metrics::ProxyMetrics;
 use crate::raft::{JobState, MetadataCommand, RaftNode, now_ms};
 use crate::writer::MppWriteEngine;
 
-/// JSON payload returned in `PutResult.app_metadata` after each `RecordBatch` is committed to Aerospike.
+/// JSON payload returned in `PutResult.app_metadata` after each `RecordBatch` is committed or validated.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PutBatchAck {
     pub batch_index: usize,
@@ -32,6 +32,16 @@ pub struct PutBatchAck {
     pub other_retries: u64,
     #[serde(default)]
     pub node_id: u64,
+    #[serde(default)]
+    pub rows_validated: usize,
+    #[serde(default)]
+    pub matched_rows: usize,
+    #[serde(default)]
+    pub mismatched_rows: usize,
+    #[serde(default)]
+    pub missing_keys: usize,
+    #[serde(default)]
+    pub bin_mismatch_rows: usize,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -282,21 +292,33 @@ impl FlightService for ProxyFlightService {
                                     node_id,
                                     namespace: params.namespace.clone(),
                                     set_name: params.set_name.clone(),
+                                    is_dq_validation: params.is_validate_mode(),
                                     rows_written: stats.rows_written as u64,
                                     overload_retries: stats.overload_retries,
                                     other_retries: stats.other_retries,
+                                    rows_validated: stats.rows_validated as u64,
+                                    matched_rows: stats.matched_rows as u64,
+                                    mismatched_rows: stats.mismatched_rows as u64,
+                                    missing_keys: stats.missing_keys as u64,
+                                    bin_mismatch_rows: stats.bin_mismatch_rows as u64,
+                                    mismatch_samples: stats.mismatch_samples,
                                     timestamp_ms: now_ms(),
                                 })
                                 .await;
                         }
 
-                        total_stream_rows += stats.rows_written;
+                        total_stream_rows += stats.rows_written + stats.rows_validated;
                         let ack = PutBatchAck {
                             batch_index,
                             rows_written: stats.rows_written,
                             overload_retries: stats.overload_retries,
                             other_retries: stats.other_retries,
                             node_id,
+                            rows_validated: stats.rows_validated,
+                            matched_rows: stats.matched_rows,
+                            mismatched_rows: stats.mismatched_rows,
+                            missing_keys: stats.missing_keys,
+                            bin_mismatch_rows: stats.bin_mismatch_rows,
                         };
                         batch_index += 1;
 

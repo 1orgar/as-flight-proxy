@@ -36,6 +36,11 @@ class AerospikeFlightDataWriter(
   private val batchesSentCounter = new AtomicLong(0L)
   private val overloadRetriesCounter = new AtomicLong(0L)
   private val otherRetriesCounter = new AtomicLong(0L)
+  private val rowsValidatedCounter = new AtomicLong(0L)
+  private val matchedRowsCounter = new AtomicLong(0L)
+  private val mismatchedRowsCounter = new AtomicLong(0L)
+  private val missingKeysCounter = new AtomicLong(0L)
+  private val binMismatchRowsCounter = new AtomicLong(0L)
 
   private val executor: ExecutorService = Executors.newFixedThreadPool(
     options.writerThreads,
@@ -97,7 +102,12 @@ class AerospikeFlightDataWriter(
         batchesSent = batchesSentCounter.get(),
         overloadRetries = overloadRetriesCounter.get(),
         otherRetries = otherRetriesCounter.get(),
-        elapsedMs = math.max(0L, System.currentTimeMillis() - startTimeMs)
+        elapsedMs = math.max(0L, System.currentTimeMillis() - startTimeMs),
+        rowsValidated = rowsValidatedCounter.get(),
+        matchedRows = matchedRowsCounter.get(),
+        mismatchedRows = mismatchedRowsCounter.get(),
+        missingKeys = missingKeysCounter.get(),
+        binMismatchRows = binMismatchRowsCounter.get()
       )
     } finally {
       closeResources()
@@ -122,7 +132,10 @@ class AerospikeFlightDataWriter(
       createTaskMetric("as_rows_written", rowsWrittenCounter.get()),
       createTaskMetric("as_batches_sent", batchesSentCounter.get()),
       createTaskMetric("as_overload_retries", overloadRetriesCounter.get()),
-      createTaskMetric("as_other_retries", otherRetriesCounter.get())
+      createTaskMetric("as_other_retries", otherRetriesCounter.get()),
+      createTaskMetric("as_rows_validated", rowsValidatedCounter.get()),
+      createTaskMetric("as_matched_rows", matchedRowsCounter.get()),
+      createTaskMetric("as_mismatched_rows", mismatchedRowsCounter.get())
     )
   }
 
@@ -139,7 +152,9 @@ class AerospikeFlightDataWriter(
       val unloader = new VectorUnloader(stagingRoot)
       val recordBatch = unloader.getRecordBatch
       enqueueWithFailureCheck(Some(recordBatch))
-      rowsWrittenCounter.addAndGet(count.toLong)
+      if (!options.validateOnly) {
+        rowsWrittenCounter.addAndGet(count.toLong)
+      }
     }
     batchConverter.reset()
   }
@@ -217,6 +232,21 @@ class AerospikeFlightDataWriter(
                         }
                         if (jsonNode.has("other_retries")) {
                           otherRetriesCounter.addAndGet(jsonNode.get("other_retries").asLong(0L))
+                        }
+                        if (jsonNode.has("rows_validated")) {
+                          rowsValidatedCounter.addAndGet(jsonNode.get("rows_validated").asLong(0L))
+                        }
+                        if (jsonNode.has("matched_rows")) {
+                          matchedRowsCounter.addAndGet(jsonNode.get("matched_rows").asLong(0L))
+                        }
+                        if (jsonNode.has("mismatched_rows")) {
+                          mismatchedRowsCounter.addAndGet(jsonNode.get("mismatched_rows").asLong(0L))
+                        }
+                        if (jsonNode.has("missing_keys")) {
+                          missingKeysCounter.addAndGet(jsonNode.get("missing_keys").asLong(0L))
+                        }
+                        if (jsonNode.has("bin_mismatch_rows")) {
+                          binMismatchRowsCounter.addAndGet(jsonNode.get("bin_mismatch_rows").asLong(0L))
                         }
                       }
                     }
