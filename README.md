@@ -1,4 +1,11 @@
-# Spark → Arrow Flight → Rust MPP Proxy → Aerospike 8+ CE
+# as-flight-proxy: Spark → Arrow Flight → Rust MPP Proxy → Aerospike 8+ CE
+
+[![CI & Build Artifacts](https://github.com/1orgar/as-flight-proxy/actions/workflows/ci.yml/badge.svg)](https://github.com/1orgar/as-flight-proxy/actions/workflows/ci.yml)
+[![Rust](https://img.shields.io/badge/Rust-1.88%2B-orange?logo=rust)](https://www.rust-lang.org/)
+[![Spark](https://img.shields.io/badge/Apache%20Spark-3.5-E25A1C?logo=apachespark)](https://spark.apache.org/)
+[![Scala](https://img.shields.io/badge/Scala-2.12-DC322F?logo=scala)](https://www.scala-lang.org/)
+[![Arrow Flight](https://img.shields.io/badge/Apache%20Arrow%20Flight-gRPC%20%2F%20TLS-00A8E8?logo=apache)](https://arrow.apache.org/)
+[![Aerospike](https://img.shields.io/badge/Aerospike%20CE-8.0%2B-C2185B)](https://aerospike.com/)
 
 Высокопроизводительная система пакетной и потоковой выгрузки данных из **Apache Spark (3.5 / Scala 2.12)** в **Aerospike 8+ Community Edition** через промежуточный **MPP-прокси на Rust** по протоколу **Apache Arrow Flight (gRPC / HTTP2 + TLS)**.
 
@@ -19,6 +26,15 @@
   * Автоконвертация всех типов Spark `InternalRow` → `Arrow VectorSchemaRoot`.
   * Многопоточная отправка внутри каждого экзекьютор-таска (`connector.writerThreads`) с балансировкой по списку `flight.hosts`.
   * Сборка в единый fat-JAR (`sbt assembly`) с shading для `io.grpc` и `com.google.protobuf`.
+
+---
+
+## Артефакты CI (GitHub Actions)
+
+При каждом пуше и PR workflow [CI & Build Artifacts](https://github.com/1orgar/as-flight-proxy/actions/workflows/ci.yml) автоматически прогоняет тесты (Rust + Scala) и собирает готовые к деплою артефакты:
+1. `as_proxy_server-linux-x86_64` — релизный бинарник прокси-сервера для архитектуры **x86_64** (`x86_64-unknown-linux-gnu`).
+2. `as_proxy_server-linux-arm64` — релизный бинарник прокси-сервера для архитектуры **ARM64** (`aarch64-unknown-linux-gnu`).
+3. `spark-aerospike-flight-connector-jar` — собранный с shading Fat-JAR коннектора (`spark-aerospike-flight-connector-assembly-0.1.0.jar`).
 
 ---
 

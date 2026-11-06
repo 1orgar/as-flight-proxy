@@ -71,9 +71,9 @@ class ArrowBatchConverterSpec extends AnyFunSuite {
         19723, // days since epoch
         1700000000123456L, // micros since epoch
         new GenericArrayData(Array[Any](UTF8String.fromString("gold"), UTF8String.fromString("ml"))),
-        ArrayBasedMapData(
-          Array[Any](UTF8String.fromString("views")),
-          Array[Any](150L)
+        new ArrayBasedMapData(
+          new GenericArrayData(Array[Any](UTF8String.fromString("views"))),
+          new GenericArrayData(Array[Any](150L))
         ),
         InternalRow(UTF8String.fromString("Amsterdam"), 1012)
       )
