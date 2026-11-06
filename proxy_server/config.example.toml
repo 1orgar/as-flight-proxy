@@ -1,0 +1,44 @@
+[server]
+listen_addr = "0.0.0.0:8815"
+metrics_addr = "0.0.0.0:9090"
+max_decoding_message_size_mb = 64
+tcp_nodelay = true
+http2_stream_window_size_mb = 16
+http2_connection_window_size_mb = 32
+
+[tls]
+enabled = false
+# cert_path = "certs/server.crt"
+# key_path = "certs/server.key"
+# client_ca_path = "certs/ca.crt"
+
+[auth]
+enabled = true
+username = "spark_writer"
+password = "change_me_in_prod"
+token_secret = "super_secret_hmac_key_for_flight_bearer_tokens"
+token_ttl_secs = 86400
+
+[aerospike]
+hosts = "127.0.0.1:3000"
+connect_timeout_ms = 5000
+timeout_ms = 2000
+min_conns_per_node = 16
+max_conns_per_node = 512
+conn_pools_per_node = 4
+max_bin_name_len = 64
+
+[writer]
+use_batch_write = true
+batch_write_size = 512
+max_in_flight_records = 16384
+max_concurrent_subbatches_per_stream = 16
+
+[retry]
+# Overload errors (DEVICE_OVERLOAD, KEY_BUSY, NO_AVAILABLE_CONNECTIONS_TO_NODE, MAX_RETRIES_EXCEEDED)
+# are retried indefinitely ("до талого") with exponential backoff + full jitter.
+# All other errors are retried up to `max_other_retries` times before terminating the stream.
+max_other_retries = 5
+initial_backoff_ms = 10
+max_backoff_ms = 2000
+backoff_multiplier = 2.0

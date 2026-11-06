@@ -1,0 +1,173 @@
+package com.asproxy.spark
+
+import com.fasterxml.jackson.databind.ObjectMapper
+import org.apache.spark.sql.util.CaseInsensitiveStringMap
+
+import java.util
+import scala.collection.JavaConverters._
+
+/**
+ * Configuration options for the Spark -> Arrow Flight -> Aerospike Proxy connector.
+ */
+case class HostEndpoint(host: String, port: Int) extends Serializable {
+  override def toString: String = s"$host:$port"
+}
+
+case class AerospikeFlightOptions(
+    hosts: Seq[HostEndpoint],
+    username: String,
+    password: String,
+    tlsEnabled: Boolean,
+    tlsCaCertPath: Option[String],
+    tlsClientCertPath: Option[String],
+    tlsClientKeyPath: Option[String],
+    tlsVerifyServer: Boolean,
+    timeoutMs: Long,
+    namespace: String,
+    setName: String,
+    keyColumn: String,
+    writeMode: String,
+    ttlSeconds: Option[Long],
+    sendKey: Boolean,
+    ignoreNulls: Boolean,
+    useBatchWrite: Option[Boolean],
+    batchSize: Int,
+    writerThreads: Int,
+    queueCapacity: Int
+) extends Serializable {
+
+  require(hosts.nonEmpty, "'flight.hosts' must contain at least one host:port endpoint")
+  require(namespace.trim.nonEmpty, "'aerospike.namespace' cannot be empty")
+  require(keyColumn.trim.nonEmpty, "'aerospike.keyColumn' cannot be empty")
+  require(batchSize > 0, s"'connector.batchSize' must be > 0 (got $batchSize)")
+  require(writerThreads > 0, s"'connector.writerThreads' must be > 0 (got $writerThreads)")
+  require(queueCapacity > 0, s"'connector.queueCapacity' must be > 0 (got $queueCapacity)")
+
+  /**
+   * Select a proxy endpoint for a given Spark partition and worker thread index
+   * to distribute load evenly across all proxy instances.
+   */
+  def endpointFor(partitionId: Int, threadIndex: Int): HostEndpoint = {
+    val idx = math.abs(partitionId + threadIndex) % hosts.size
+    hosts(idx)
+  }
+
+  /**
+   * Serialize per-stream write parameters into the JSON payload expected in `FlightDescriptor.cmd`
+   * by the Rust `proxy_server`.
+   */
+  def toFlightDescriptorJsonBytes: Array[Byte] = {
+    val mapper = new ObjectMapper()
+    val payload = new util.LinkedHashMap[String, Any]()
+    payload.put("namespace", namespace)
+    payload.put("set_name", setName)
+    payload.put("key_column", keyColumn)
+    payload.put("write_mode", writeMode.toLowerCase)
+    ttlSeconds.foreach(ttl => payload.put("ttl_seconds", Long.box(ttl)))
+    payload.put("send_key", Boolean.box(sendKey))
+    payload.put("ignore_nulls", Boolean.box(ignoreNulls))
+    useBatchWrite.foreach(ub => payload.put("use_batch_write", Boolean.box(ub)))
+    mapper.writeValueAsBytes(payload)
+  }
+}
+
+object AerospikeFlightOptions {
+  private val AllowedWriteModes = Set(
+    "update",
+    "replace",
+    "update_only",
+    "replace_only",
+    "create_only"
+  )
+
+  def fromSparkOptions(options: CaseInsensitiveStringMap): AerospikeFlightOptions = {
+    fromMap(options.asCaseSensitiveMap().asScala.toMap)
+  }
+
+  def fromMap(raw: Map[String, String]): AerospikeFlightOptions = {
+    val ci = raw.map { case (k, v) => k.toLowerCase -> v }
+
+    def get(key: String): Option[String] = ci.get(key.toLowerCase).map(_.trim).filter(_.nonEmpty)
+    def getOrElse(key: String, default: String): String = get(key).getOrElse(default)
+    def getRequired(key: String): String =
+      get(key).getOrElse(throw new IllegalArgumentException(s"Missing required option '$key'"))
+
+    val rawHosts = getOrElse("flight.hosts", "127.0.0.1:8815")
+    val hosts = parseHosts(rawHosts)
+
+    val username = getOrElse("flight.username", "")
+    val password = getOrElse("flight.password", "")
+
+    val tlsEnabled = getOrElse("flight.tls.enabled", "false").toBoolean
+    val tlsCaCertPath = get("flight.tls.caCertPath")
+    val tlsClientCertPath = get("flight.tls.clientCertPath")
+    val tlsClientKeyPath = get("flight.tls.clientKeyPath")
+    val tlsVerifyServer = getOrElse("flight.tls.verifyServer", "true").toBoolean
+    val timeoutMs = getOrElse("flight.timeoutMs", "60000").toLong
+
+    val namespace = getRequired("aerospike.namespace")
+    val setName = getOrElse("aerospike.set", "")
+    val keyColumn = getRequired("aerospike.keyColumn")
+
+    val writeMode = getOrElse("aerospike.writeMode", "update").toLowerCase
+    if (!AllowedWriteModes.contains(writeMode)) {
+      throw new IllegalArgumentException(
+        s"Unsupported 'aerospike.writeMode' = '$writeMode'. Allowed: ${AllowedWriteModes.mkString(", ")}"
+      )
+    }
+
+    val ttlSeconds = get("aerospike.ttl").map(_.toLong)
+    val sendKey = getOrElse("aerospike.sendKey", "true").toBoolean
+    // Default is false: null values in update mode send Value::Nil to delete the bin
+    val ignoreNulls = getOrElse("aerospike.ignoreNulls", "false").toBoolean
+    val useBatchWrite = get("aerospike.useBatchWrite").map(_.toBoolean)
+
+    val batchSize = getOrElse("connector.batchSize", "8192").toInt
+    val writerThreads = getOrElse("connector.writerThreads", "4").toInt
+    val queueCapacity = get("connector.queueCapacity")
+      .map(_.toInt)
+      .getOrElse(math.max(writerThreads * 2, 4))
+
+    AerospikeFlightOptions(
+      hosts = hosts,
+      username = username,
+      password = password,
+      tlsEnabled = tlsEnabled,
+      tlsCaCertPath = tlsCaCertPath,
+      tlsClientCertPath = tlsClientCertPath,
+      tlsClientKeyPath = tlsClientKeyPath,
+      tlsVerifyServer = tlsVerifyServer,
+      timeoutMs = timeoutMs,
+      namespace = namespace,
+      setName = setName,
+      keyColumn = keyColumn,
+      writeMode = writeMode,
+      ttlSeconds = ttlSeconds,
+      sendKey = sendKey,
+      ignoreNulls = ignoreNulls,
+      useBatchWrite = useBatchWrite,
+      batchSize = batchSize,
+      writerThreads = writerThreads,
+      queueCapacity = queueCapacity
+    )
+  }
+
+  private def parseHosts(hostsStr: String): Seq[HostEndpoint] = {
+    hostsStr
+      .split(",")
+      .map(_.trim)
+      .filter(_.nonEmpty)
+      .map { entry =>
+        val lastColon = entry.lastIndexOf(':')
+        if (lastColon <= 0 || lastColon == entry.length - 1) {
+          throw new IllegalArgumentException(
+            s"Invalid host endpoint '$entry' in 'flight.hosts'. Expected format 'host:port'"
+          )
+        }
+        val host = entry.substring(0, lastColon).trim
+        val port = entry.substring(lastColon + 1).trim.toInt
+        HostEndpoint(host, port)
+      }
+      .toSeq
+  }
+}

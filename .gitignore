@@ -1,0 +1,27 @@
+# Rust
+/proxy_server/target/
+**/target/
+
+# Scala / SBT
+/spark_connector/target/
+/spark_connector/project/target/
+/spark_connector/project/project/
+.bsp/
+.metals/
+.bloop/
+*.class
+*.log
+
+# TLS / local certs
+/certs/
+*.pem
+*.key
+*.crt
+*.csr
+*.srl
+
+# OS / IDE
+.DS_Store
+.idea/
+.vscode/
+*.iml
