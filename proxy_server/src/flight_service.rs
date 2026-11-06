@@ -110,23 +110,35 @@ impl FlightService for ProxyFlightService {
         let metadata = request.metadata().clone();
         let mut inbound = request.into_inner();
 
-        let first_msg = inbound.message().await?;
-        let payload = first_msg
-            .as_ref()
-            .map(|m| m.payload.as_ref())
-            .unwrap_or(&[]);
+        let has_auth_header =
+            metadata.contains_key("authorization") || metadata.contains_key("Authorization");
 
-        let token = self
-            .authenticator
-            .authenticate_handshake(&metadata, payload)
-            .map_err(Status::from)?;
+        let (protocol_version, token) = if has_auth_header {
+            let token = self
+                .authenticator
+                .authenticate_handshake(&metadata, &[])
+                .map_err(Status::from)?;
+            (0, token)
+        } else {
+            let first_msg = inbound.message().await?;
+            let proto_ver = first_msg.as_ref().map(|m| m.protocol_version).unwrap_or(0);
+            let payload = first_msg
+                .as_ref()
+                .map(|m| m.payload.as_ref())
+                .unwrap_or(&[]);
+            let token = self
+                .authenticator
+                .authenticate_handshake(&metadata, payload)
+                .map_err(Status::from)?;
+            (proto_ver, token)
+        };
 
         let bearer_header = format!("Bearer {token}");
         let header_val = MetadataValue::try_from(bearer_header.as_str())
             .map_err(|e| Status::internal(format!("Failed to encode Bearer header: {e}")))?;
 
         let response_msg = HandshakeResponse {
-            protocol_version: first_msg.map(|m| m.protocol_version).unwrap_or(0),
+            protocol_version,
             payload: Bytes::from(token.into_bytes()),
         };
 

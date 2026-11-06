@@ -29,14 +29,14 @@
 * [`spark_connector/`](spark_connector/) — коннектор Spark 3.5 DataSource V2 (`format("aerospike-flight")`):
   * Автоконвертация всех типов Spark `InternalRow` → `Arrow VectorSchemaRoot`.
   * Многопоточная отправка внутри каждого экзекьютор-таска (`connector.writerThreads`) с балансировкой по списку `flight.hosts`.
-  * Чтение статуса загрузки в PySpark/Scala как нативного Spark DataFrame (`spark.read.format("aerospike-flight")...load()`), через `spark._jvm` (`AerospikeLoadStatus`) и через Spark SQL UI (`CustomSumMetric`).
+  * Отслеживание статуса загрузки через `pyarrow.flight` (`DoAction`), `spark._jvm` (`AerospikeLoadStatus`) и Spark SQL UI (`CustomSumMetric`).
   * Сборка в единый fat-JAR (`sbt assembly`) с shading для `io.grpc` и `com.google.protobuf`.
 
 ---
 
 ## Работа из PySpark: выгрузка и получение статистики
 
-### 1. Выгрузка DataFrame из PySpark в Aerospike
+### 1. Выгрузка DataFrame из PySpark в Aerospike (с TLS и авторизацией)
 
 ```python
 job_id = "daily-profile-load-2026-11-06"
@@ -48,6 +48,8 @@ job_id = "daily-profile-load-2026-11-06"
     .option("flight.hosts", "proxy-1:8815,proxy-2:8815,proxy-3:8815")
     .option("flight.username", "spark_writer")
     .option("flight.password", "change_me_in_prod")
+    .option("flight.tls.enabled", "true")
+    .option("flight.tls.caCertPath", "/etc/certs/ca.crt")
     .option("aerospike.namespace", "test")
     .option("aerospike.set", "users")
     .option("aerospike.keyColumn", "user_id")
@@ -60,56 +62,56 @@ job_id = "daily-profile-load-2026-11-06"
 )
 ```
 
-### 2. Получение статуса загрузки в PySpark
+### 2. Получение статуса загрузки из Python / PySpark через `pyarrow.flight` (с TLS и авторизацией)
 
-Доступны **3 удобных способа** без использования HTTP-порта метрик:
-
-#### Способ А. Нативное чтение статуса как Spark DataFrame (`spark.read.format("aerospike-flight")`)
-Коннектор реализует `SupportsRead`, который опрашивает Raft-кластер прокси по Arrow Flight `DoAction` (и локальный реестр драйвера) и возвращает DataFrame со статистикой:
-
-```python
-# Статус конкретного job_id (или без connector.jobId — список всех джобов в Raft с учетом TTL):
-status_df = (
-    spark.read.format("aerospike-flight")
-    .option("flight.hosts", "proxy-1:8815,proxy-2:8815,proxy-3:8815")
-    .option("flight.username", "spark_writer")
-    .option("flight.password", "change_me_in_prod")
-    .option("connector.jobId", job_id)
-    .load()
-)
-
-status_df.show(truncate=False)
-# Схема: job_id, state, namespace, set_name, rows_written, batches_processed,
-#        overload_retries, other_retries, elapsed_ms, raw_json (включая per_node_rows из Raft)
-```
-
-#### Способ Б. Получение JSON-сводки в Python-словарь через `spark._jvm`
-Сразу после `.save()` или во время работы джоба можно вызвать статические методы `AerospikeLoadStatus` через Py4J:
+Для опроса статуса из Raft-кластера прокси используется стандартный `pyarrow.flight.FlightClient`:
 
 ```python
 import json
+import pyarrow.flight as fl
 
-status_api = spark._jvm.com.asproxy.spark.AerospikeLoadStatus
+# 1. Подключение с TLS (или "grpc://proxy-1:8815" без TLS)
+with open("/etc/certs/ca.crt", "rb") as f:
+    root_certs = f.read()
 
-# 1. Итоговая сводка драйвера по завершённому джобу (включая слепок Raft):
-summary = json.loads(status_api.getSummaryJson(job_id))
-print(summary["status"], summary["rows_written"], summary["overload_retries"])
-
-# 2. Запрос живого Raft-статуса напрямую с кластера прокси по Arrow Flight DoAction:
-live_raft_job = json.loads(
-    status_api.fetchRemoteJobStatusJson(
-        "proxy-1:8815,proxy-2:8815", job_id, "spark_writer", "change_me_in_prod", False
-    )
+# Если используется mTLS (взаимная аутентификация), передаются также cert_chain и private_key:
+client = fl.FlightClient(
+    location="grpc+tls://proxy-1:8815",
+    tls_root_certs=root_certs,
+    # cert_chain=open("/etc/certs/client.crt", "rb").read(),
+    # private_key=open("/etc/certs/client.key", "rb").read(),
+    # disable_server_verification=False,  # True для тестовых самоподписанных сертификатов без CA
 )
-print(live_raft_job["per_node_rows"])
-```
 
-#### Способ В. В веб-интерфейсе Spark UI (вкладка SQL / DataFrame)
-Коннектор регистрирует нативные метрики Spark DataSource V2 (`CustomSumMetric`), которые отображаются прямо в графе выполнения запроса в **Spark UI**:
-* `as_rows_written` — количество записанных строк;
-* `as_batches_sent` — количество отправленных Arrow `RecordBatch`;
-* `as_overload_retries` — количество ретраев перегрузки (`DEVICE_OVERLOAD` / `KEY_BUSY`);
-* `as_other_retries` — количество прочих ретраев.
+# 2. Авторизация (Handshake -> возвращает кортеж заголовка ('authorization', 'Bearer <token>'))
+auth_token_tuple = client.authenticate_basic_token("spark_writer", "change_me_in_prod")
+call_options = fl.FlightCallOptions(headers=[auth_token_tuple], timeout=10.0)
+
+# 3. Запрос статуса конкретного job_id из Raft (работает на любой ноде прокси)
+results = client.do_action(
+    fl.Action("get_job_status", job_id.encode("utf-8")),
+    options=call_options,
+)
+job_status = json.loads(next(results).body.to_pybytes())
+print("Статус выгрузки:", job_status)
+# {
+#   "job_id": "daily-profile-load-2026-11-06",
+#   "state": "completed",
+#   "total_rows_written": 1500000,
+#   "total_batches_processed": 184,
+#   "total_overload_retries": 12,
+#   "total_other_retries": 0,
+#   "per_node_rows": {"1": 500000, "2": 500000, "3": 500000}, ...
+# }
+
+# 4. Запрос статуса всего Raft-кластера прокси и всех активных джобов (в рамках TTL)
+cluster_results = client.do_action(
+    fl.Action("get_cluster_status", b""),
+    options=call_options,
+)
+cluster_status = json.loads(next(cluster_results).body.to_pybytes())
+print("Raft leader:", cluster_status["leader_id"], "Ноды:", cluster_status["state"]["nodes"])
+```
 
 ---
 

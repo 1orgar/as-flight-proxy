@@ -93,25 +93,6 @@ class ArrowBatchConverterSpec extends AnyFunSuite {
     assert(summary.toJson.contains("\"rows_written\" : 2500"))
     assert(AerospikeLoadStatus.getSummaryJson("job-agg-777").contains("\"rows_written\" : 2500"))
     assert(AerospikeLoadStatus.getLastSummaryJson().contains("\"job_id\" : \"job-agg-777\""))
-
-    // Verify DataSource V2 status reader (used by `spark.read.format("aerospike-flight")...load()` in PySpark)
-    val queryOpts = AerospikeFlightOptions.forStatusQuery(
-      Map("connector.jobId" -> "job-agg-777", "flight.hosts" -> "127.0.0.1:19999")
-    )
-    val rows = AerospikeFlightStatusScanBuilder.collectStatusRows(queryOpts, hasExplicitJobId = true)
-    assert(rows.size == 1)
-    assert(rows.head.jobId == "job-agg-777")
-    assert(rows.head.rowsWritten == 2500L)
-    assert(rows.head.overloadRetries == 7L)
-
-    val reader = new AerospikeStatusReaderFactory()
-      .createReader(AerospikeStatusInputPartition(rows))
-    assert(reader.next())
-    val internalRow = reader.get()
-    assert(internalRow.getUTF8String(0).toString == "job-agg-777")
-    assert(internalRow.getLong(4) == 2500L)
-    assert(!reader.next())
-    reader.close()
   }
 
   test("ArrowBatchConverter converts primitives, Date, Timestamp, Array, Map, and Struct") {
