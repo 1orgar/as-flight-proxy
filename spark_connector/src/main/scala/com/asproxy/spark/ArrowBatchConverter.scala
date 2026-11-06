@@ -133,10 +133,9 @@ class ArrowBatchConverter(
         if (arrayData == null) {
           listVector.setNull(targetIndex)
         } else {
-          listVector.startNewValue(targetIndex)
+          val baseOffset: Int = listVector.startNewValue(targetIndex)
           val dataVector = listVector.getDataVector
           val numElements = arrayData.numElements()
-          val baseOffset = listVector.getOffsetBuffer.getInt(targetIndex.toLong * ListVector.OFFSET_WIDTH)
           var i = 0
           while (i < numElements) {
             writeValue(arrayData, i, elementType, dataVector, baseOffset + i)
@@ -151,14 +150,13 @@ class ArrowBatchConverter(
         if (mapData == null) {
           mapVector.setNull(targetIndex)
         } else {
-          mapVector.startNewValue(targetIndex)
+          val baseOffset: Int = mapVector.startNewValue(targetIndex)
           val entriesStruct = mapVector.getDataVector.asInstanceOf[StructVector]
           val keyVector = entriesStruct.getChild(MapVector.KEY_NAME)
           val valVector = entriesStruct.getChild(MapVector.VALUE_NAME)
           val keyArray = mapData.keyArray()
           val valArray = mapData.valueArray()
           val numEntries = mapData.numElements()
-          val baseOffset = mapVector.getOffsetBuffer.getInt(targetIndex.toLong * ListVector.OFFSET_WIDTH)
           var i = 0
           while (i < numEntries) {
             if (keyArray.isNullAt(i)) {
@@ -182,7 +180,7 @@ class ArrowBatchConverter(
           var fIdx = 0
           while (fIdx < structFields.length) {
             val sf = structFields(fIdx)
-            val childVec = structVector.getChildByOrdinal(fIdx)
+            val childVec = structVector.getChildByOrdinal(fIdx).asInstanceOf[FieldVector]
             writeValue(nestedRow, fIdx, sf.dataType, childVec, targetIndex)
             fIdx += 1
           }
@@ -199,7 +197,7 @@ class ArrowBatchConverter(
       case v: BaseVariableWidthVector => v.setNull(targetIndex)
       case v: ListVector              => v.setNull(targetIndex)
       case v: StructVector            => v.setNull(targetIndex)
-      case _                          => // fallback no-op; Arrow validity bit defaults to 0 (null)
+      case _                          =>
     }
   }
 }

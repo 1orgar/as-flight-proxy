@@ -1,15 +1,15 @@
 package com.asproxy.spark
 
+import com.fasterxml.jackson.databind.ObjectMapper
 import org.apache.arrow.flight._
-import org.apache.arrow.flight.grpc.CredentialCallOption
 import org.apache.arrow.memory.{BufferAllocator, RootAllocator}
 import org.apache.arrow.vector.{VectorLoader, VectorSchemaRoot, VectorUnloader}
 import org.apache.arrow.vector.ipc.message.ArrowRecordBatch
 import org.apache.spark.sql.catalyst.InternalRow
+import org.apache.spark.sql.connector.metric.CustomTaskMetric
 import org.apache.spark.sql.connector.write.{DataWriter, WriterCommitMessage}
 import org.apache.spark.sql.types.StructType
 
-import java.io.FileInputStream
 import java.util.concurrent._
 import java.util.concurrent.atomic.{AtomicLong, AtomicReference}
 
@@ -24,6 +24,7 @@ class AerospikeFlightDataWriter(
     options: AerospikeFlightOptions
 ) extends DataWriter[InternalRow] {
 
+  private val startTimeMs: Long = System.currentTimeMillis()
   private val rootAllocator: BufferAllocator = new RootAllocator(Long.MaxValue)
   private val arrowSchema = ArrowSchemaConverter.toArrowSchema(sparkSchema)
   private val stagingRoot: VectorSchemaRoot = VectorSchemaRoot.create(arrowSchema, rootAllocator)
@@ -33,6 +34,8 @@ class AerospikeFlightDataWriter(
   private val workerError = new AtomicReference[Throwable](null)
   private val rowsWrittenCounter = new AtomicLong(0L)
   private val batchesSentCounter = new AtomicLong(0L)
+  private val overloadRetriesCounter = new AtomicLong(0L)
+  private val otherRetriesCounter = new AtomicLong(0L)
 
   private val executor: ExecutorService = Executors.newFixedThreadPool(
     options.writerThreads,
@@ -91,7 +94,10 @@ class AerospikeFlightDataWriter(
         partitionId = partitionId,
         taskId = taskId,
         rowsWritten = rowsWrittenCounter.get(),
-        batchesSent = batchesSentCounter.get()
+        batchesSent = batchesSentCounter.get(),
+        overloadRetries = overloadRetriesCounter.get(),
+        otherRetries = otherRetriesCounter.get(),
+        elapsedMs = math.max(0L, System.currentTimeMillis() - startTimeMs)
       )
     } finally {
       closeResources()
@@ -109,6 +115,22 @@ class AerospikeFlightDataWriter(
 
   override def close(): Unit = {
     closeResources()
+  }
+
+  override def currentMetricsValues(): Array[CustomTaskMetric] = {
+    Array(
+      createTaskMetric("as_rows_written", rowsWrittenCounter.get()),
+      createTaskMetric("as_batches_sent", batchesSentCounter.get()),
+      createTaskMetric("as_overload_retries", overloadRetriesCounter.get()),
+      createTaskMetric("as_other_retries", otherRetriesCounter.get())
+    )
+  }
+
+  private def createTaskMetric(metricName: String, metricValue: Long): CustomTaskMetric = {
+    new CustomTaskMetric {
+      override def name(): String = metricName
+      override def value(): Long = metricValue
+    }
   }
 
   private def flushCurrentBatch(): Unit = {
@@ -141,6 +163,7 @@ class AerospikeFlightDataWriter(
   }
 
   private def runSenderLoop(threadIdx: Int): Unit = {
+    val mapper = new ObjectMapper()
     val workerAllocator = rootAllocator.newChildAllocator(
       s"worker-$threadIdx",
       0L,
@@ -153,9 +176,9 @@ class AerospikeFlightDataWriter(
       workerRoot = VectorSchemaRoot.create(arrowSchema, workerAllocator)
       val loader = new VectorLoader(workerRoot)
       val endpoint = options.endpointFor(partitionId, threadIdx)
-      flightClient = createFlightClient(workerAllocator, endpoint)
+      flightClient = AerospikeLoadStatus.createFlightClient(workerAllocator, endpoint, options)
 
-      val callOptions = buildCallOptions(flightClient)
+      val callOptions = AerospikeLoadStatus.buildCallOptions(flightClient, options)
       val descriptor = FlightDescriptor.command(options.toFlightDescriptorJsonBytes)
 
       val putListener = new SyncPutListener()
@@ -182,7 +205,24 @@ class AerospikeFlightDataWriter(
                 // Read PutResult ack from proxy_server to confirm batch persistence in Aerospike
                 val ack = putListener.read()
                 if (ack != null) {
-                  ack.close()
+                  try {
+                    val metaBuf = ack.getApplicationMetadata
+                    if (metaBuf != null && metaBuf.readableBytes() > 0) {
+                      val bytes = new Array[Byte](metaBuf.readableBytes())
+                      metaBuf.getBytes(metaBuf.readerIndex(), bytes)
+                      val jsonNode = mapper.readTree(bytes)
+                      if (jsonNode != null) {
+                        if (jsonNode.has("overload_retries")) {
+                          overloadRetriesCounter.addAndGet(jsonNode.get("overload_retries").asLong(0L))
+                        }
+                        if (jsonNode.has("other_retries")) {
+                          otherRetriesCounter.addAndGet(jsonNode.get("other_retries").asLong(0L))
+                        }
+                      }
+                    }
+                  } finally {
+                    ack.close()
+                  }
                 }
                 batchesSentCounter.incrementAndGet()
 
@@ -210,65 +250,6 @@ class AerospikeFlightDataWriter(
       }
       try { workerAllocator.close() } catch { case _: Throwable => }
     }
-  }
-
-  private def createFlightClient(
-      allocator: BufferAllocator,
-      endpoint: HostEndpoint
-  ): FlightClient = {
-    val location = if (options.tlsEnabled) {
-      Location.forGrpcTls(endpoint.host, endpoint.port)
-    } else {
-      Location.forGrpcInsecure(endpoint.host, endpoint.port)
-    }
-
-    val builder = FlightClient.builder(allocator, location)
-    if (options.tlsEnabled) {
-      builder.useTls()
-      if (!options.tlsVerifyServer) {
-        builder.verifyServer(false)
-      }
-      options.tlsCaCertPath.foreach { caPath =>
-        val in = new FileInputStream(caPath)
-        try {
-          builder.trustedCertificates(in)
-        } finally {
-          in.close()
-        }
-      }
-      for {
-        certPath <- options.tlsClientCertPath
-        keyPath  <- options.tlsClientKeyPath
-      } {
-        val certIn = new FileInputStream(certPath)
-        val keyIn = new FileInputStream(keyPath)
-        try {
-          builder.clientCertificate(certIn, keyIn)
-        } finally {
-          certIn.close()
-          keyIn.close()
-        }
-      }
-    }
-
-    builder.build()
-  }
-
-  private def buildCallOptions(client: FlightClient): Seq[CallOption] = {
-    val opts = scala.collection.mutable.ArrayBuffer.empty[CallOption]
-    if (options.username.nonEmpty) {
-      val credOpt: CredentialCallOption = client
-        .authenticateBasicToken(options.username, options.password)
-        .orElseThrow(new java.util.function.Supplier[RuntimeException] {
-          override def get(): RuntimeException =
-            new RuntimeException("Arrow Flight authentication did not return a Bearer token")
-        })
-      opts += credOpt
-    }
-    if (options.timeoutMs > 0) {
-      opts += CallOptions.timeout(options.timeoutMs, TimeUnit.MILLISECONDS)
-    }
-    opts.toSeq
   }
 
   private def drainQueue(): Unit = {

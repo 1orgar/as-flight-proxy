@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.ObjectMapper
 import org.apache.spark.sql.util.CaseInsensitiveStringMap
 
 import java.util
+import java.util.UUID
 import scala.collection.JavaConverters._
 
 /**
@@ -14,6 +15,7 @@ case class HostEndpoint(host: String, port: Int) extends Serializable {
 }
 
 case class AerospikeFlightOptions(
+    jobId: String,
     hosts: Seq[HostEndpoint],
     username: String,
     password: String,
@@ -36,6 +38,7 @@ case class AerospikeFlightOptions(
     queueCapacity: Int
 ) extends Serializable {
 
+  require(jobId.trim.nonEmpty, "'connector.jobId' cannot be empty")
   require(hosts.nonEmpty, "'flight.hosts' must contain at least one host:port endpoint")
   require(namespace.trim.nonEmpty, "'aerospike.namespace' cannot be empty")
   require(keyColumn.trim.nonEmpty, "'aerospike.keyColumn' cannot be empty")
@@ -59,6 +62,7 @@ case class AerospikeFlightOptions(
   def toFlightDescriptorJsonBytes: Array[Byte] = {
     val mapper = new ObjectMapper()
     val payload = new util.LinkedHashMap[String, Any]()
+    payload.put("job_id", jobId)
     payload.put("namespace", namespace)
     payload.put("set_name", setName)
     payload.put("key_column", keyColumn)
@@ -91,6 +95,10 @@ object AerospikeFlightOptions {
     def getOrElse(key: String, default: String): String = get(key).getOrElse(default)
     def getRequired(key: String): String =
       get(key).getOrElse(throw new IllegalArgumentException(s"Missing required option '$key'"))
+
+    val jobId = get("connector.jobId")
+      .orElse(get("job.id"))
+      .getOrElse(s"as-load-${UUID.randomUUID().toString}")
 
     val rawHosts = getOrElse("flight.hosts", "127.0.0.1:8815")
     val hosts = parseHosts(rawHosts)
@@ -129,6 +137,7 @@ object AerospikeFlightOptions {
       .getOrElse(math.max(writerThreads * 2, 4))
 
     AerospikeFlightOptions(
+      jobId = jobId,
       hosts = hosts,
       username = username,
       password = password,

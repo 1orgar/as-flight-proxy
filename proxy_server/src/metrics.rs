@@ -4,6 +4,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tracing::{error, info};
 
+use crate::raft::{RaftNode, RaftRole};
+
 #[derive(Debug, Default)]
 pub struct ProxyMetrics {
     pub records_written_total: AtomicU64,
@@ -56,7 +58,11 @@ impl ProxyMetrics {
         self.write_latency_count.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub fn render_prometheus(&self, aerospike_connected: bool) -> String {
+    pub fn render_prometheus(
+        &self,
+        aerospike_connected: bool,
+        raft_info: Option<(u64, bool, u64)>,
+    ) -> String {
         let records = self.records_written_total.load(Ordering::Relaxed);
         let batches = self.batches_processed_total.load(Ordering::Relaxed);
         let overload_retries = self.overload_retries_total.load(Ordering::Relaxed);
@@ -68,6 +74,8 @@ impl ProxyMetrics {
             self.write_latency_micros_sum.load(Ordering::Relaxed) as f64 / 1_000_000.0;
         let lat_count = self.write_latency_count.load(Ordering::Relaxed);
         let connected_val = u8::from(aerospike_connected);
+        let (raft_term, raft_is_leader, raft_commit_idx) = raft_info.unwrap_or((0, false, 0));
+        let leader_val = u8::from(raft_is_leader);
 
         format!(
             "# HELP as_proxy_records_written_total Total number of records written to Aerospike\n\
@@ -99,22 +107,34 @@ impl ProxyMetrics {
              as_proxy_write_duration_seconds_count {lat_count}\n\
              # HELP as_proxy_aerospike_connected Whether the Aerospike client is connected to the cluster\n\
              # TYPE as_proxy_aerospike_connected gauge\n\
-             as_proxy_aerospike_connected {connected_val}\n"
+             as_proxy_aerospike_connected {connected_val}\n\
+             # HELP as_proxy_raft_term Current Raft term of this proxy node\n\
+             # TYPE as_proxy_raft_term gauge\n\
+             as_proxy_raft_term {raft_term}\n\
+             # HELP as_proxy_raft_is_leader Whether this proxy node is currently the Raft leader\n\
+             # TYPE as_proxy_raft_is_leader gauge\n\
+             as_proxy_raft_is_leader {leader_val}\n\
+             # HELP as_proxy_raft_commit_index Highest Raft log index known to be committed\n\
+             # TYPE as_proxy_raft_commit_index gauge\n\
+             as_proxy_raft_commit_index {raft_commit_idx}\n"
         )
     }
 }
 
-/// Spawn a lightweight HTTP observability server for `/metrics` and `/healthz`.
+/// Spawn a lightweight HTTP observability server for `/metrics`, `/healthz`, `/cluster/status`, and `/jobs`.
 pub async fn serve_observability<F>(
     listen_addr: &str,
     metrics: Arc<ProxyMetrics>,
+    raft_node: Option<Arc<RaftNode>>,
     health_check: F,
 ) -> std::io::Result<()>
 where
     F: Fn() -> bool + Send + Sync + 'static,
 {
     let listener = TcpListener::bind(listen_addr).await?;
-    info!("Observability HTTP server listening on http://{listen_addr} (/metrics, /healthz)");
+    info!(
+        "Observability HTTP server listening on http://{listen_addr} (/metrics, /healthz, /cluster/status, /jobs)"
+    );
     let health_check = Arc::new(health_check);
 
     loop {
@@ -127,6 +147,7 @@ where
         };
 
         let metrics = Arc::clone(&metrics);
+        let raft_node = raft_node.clone();
         let health_check = Arc::clone(&health_check);
 
         tokio::spawn(async move {
@@ -148,7 +169,11 @@ where
             let (status_line, content_type, body) = match path {
                 "/healthz" | "/health" | "/readyz" => {
                     if is_healthy {
-                        ("HTTP/1.1 200 OK", "application/json", "{\"status\":\"ok\"}\n".to_string())
+                        (
+                            "HTTP/1.1 200 OK",
+                            "application/json",
+                            "{\"status\":\"ok\"}\n".to_string(),
+                        )
                     } else {
                         (
                             "HTTP/1.1 503 Service Unavailable",
@@ -157,15 +182,76 @@ where
                         )
                     }
                 }
-                "/metrics" => (
-                    "HTTP/1.1 200 OK",
-                    "text/plain; version=0.0.4; charset=utf-8",
-                    metrics.render_prometheus(is_healthy),
-                ),
+                "/metrics" => {
+                    let raft_info = if let Some(ref r) = raft_node {
+                        let snap = r.get_cluster_snapshot().await;
+                        Some((
+                            snap.current_term,
+                            snap.role == RaftRole::Leader,
+                            snap.commit_index,
+                        ))
+                    } else {
+                        None
+                    };
+                    (
+                        "HTTP/1.1 200 OK",
+                        "text/plain; version=0.0.4; charset=utf-8",
+                        metrics.render_prometheus(is_healthy, raft_info),
+                    )
+                }
+                "/cluster/status" => {
+                    if let Some(ref r) = raft_node {
+                        let snap = r.get_cluster_snapshot().await;
+                        let json = serde_json::to_string_pretty(&snap).unwrap_or_default();
+                        ("HTTP/1.1 200 OK", "application/json", format!("{json}\n"))
+                    } else {
+                        (
+                            "HTTP/1.1 503 Service Unavailable",
+                            "application/json",
+                            "{\"error\":\"raft_disabled\"}\n".to_string(),
+                        )
+                    }
+                }
+                "/jobs" | "/jobs/" => {
+                    if let Some(ref r) = raft_node {
+                        let snap = r.get_cluster_snapshot().await;
+                        let json =
+                            serde_json::to_string_pretty(&snap.state.jobs).unwrap_or_default();
+                        ("HTTP/1.1 200 OK", "application/json", format!("{json}\n"))
+                    } else {
+                        (
+                            "HTTP/1.1 503 Service Unavailable",
+                            "application/json",
+                            "{\"error\":\"raft_disabled\"}\n".to_string(),
+                        )
+                    }
+                }
+                p if p.starts_with("/jobs/") => {
+                    let job_id = p.trim_start_matches("/jobs/").trim();
+                    if let Some(ref r) = raft_node {
+                        match r.get_job_status(job_id).await {
+                            Some(job) => {
+                                let json = serde_json::to_string_pretty(&job).unwrap_or_default();
+                                ("HTTP/1.1 200 OK", "application/json", format!("{json}\n"))
+                            }
+                            None => (
+                                "HTTP/1.1 404 Not Found",
+                                "application/json",
+                                format!("{{\"error\":\"job '{job_id}' not found\"}}\n"),
+                            ),
+                        }
+                    } else {
+                        (
+                            "HTTP/1.1 503 Service Unavailable",
+                            "application/json",
+                            "{\"error\":\"raft_disabled\"}\n".to_string(),
+                        )
+                    }
+                }
                 _ => (
                     "HTTP/1.1 404 Not Found",
                     "text/plain; charset=utf-8",
-                    "Not Found. Available endpoints: /metrics, /healthz\n".to_string(),
+                    "Not Found. Available endpoints: /metrics, /healthz, /cluster/status, /jobs, /jobs/<job_id>\n".to_string(),
                 ),
             };
 

@@ -11,6 +11,8 @@ pub struct AppConfig {
     #[serde(default)]
     pub server: ServerConfig,
     #[serde(default)]
+    pub raft: RaftConfig,
+    #[serde(default)]
     pub tls: TlsConfig,
     #[serde(default)]
     pub auth: AuthConfig,
@@ -26,6 +28,7 @@ impl Default for AppConfig {
     fn default() -> Self {
         Self {
             server: ServerConfig::default(),
+            raft: RaftConfig::default(),
             tls: TlsConfig::default(),
             auth: AuthConfig::default(),
             aerospike: AerospikeConfig::default(),
@@ -73,6 +76,46 @@ impl Default for ServerConfig {
             tcp_nodelay: true,
             http2_stream_window_size_mb: default_stream_win_mb(),
             http2_connection_window_size_mb: default_conn_win_mb(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct RaftPeer {
+    pub node_id: u64,
+    pub raft_addr: String,
+    #[serde(default)]
+    pub flight_addr: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct RaftConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_node_id")]
+    pub node_id: u64,
+    #[serde(default = "default_raft_addr")]
+    pub listen_addr: String,
+    #[serde(default = "default_election_min_ms")]
+    pub election_timeout_min_ms: u64,
+    #[serde(default = "default_election_max_ms")]
+    pub election_timeout_max_ms: u64,
+    #[serde(default = "default_heartbeat_ms")]
+    pub heartbeat_interval_ms: u64,
+    #[serde(default)]
+    pub peers: Vec<RaftPeer>,
+}
+
+impl Default for RaftConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            node_id: default_node_id(),
+            listen_addr: default_raft_addr(),
+            election_timeout_min_ms: default_election_min_ms(),
+            election_timeout_max_ms: default_election_max_ms(),
+            heartbeat_interval_ms: default_heartbeat_ms(),
+            peers: Vec::new(),
         }
     }
 }
@@ -236,6 +279,8 @@ impl WriteMode {
 /// or gRPC request metadata headers.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct WriteParameters {
+    #[serde(default)]
+    pub job_id: Option<String>,
     pub namespace: String,
     #[serde(default)]
     pub set_name: String,
@@ -279,6 +324,7 @@ impl WriteParameters {
                 .map(|s| s.to_string())
         };
 
+        let job_id = get_str("x-as-job-id");
         let namespace = get_str("x-as-namespace").ok_or_else(|| {
             ProxyError::InvalidArgument(
                 "Missing WriteParameters: provide FlightDescriptor.cmd JSON or 'x-as-namespace' header"
@@ -309,6 +355,7 @@ impl WriteParameters {
             .map(|s| s.eq_ignore_ascii_case("true") || s == "1");
 
         let params = Self {
+            job_id,
             namespace,
             set_name,
             key_column,
@@ -352,6 +399,21 @@ fn default_listen_addr() -> String {
 }
 fn default_metrics_addr() -> String {
     "0.0.0.0:9090".to_string()
+}
+fn default_node_id() -> u64 {
+    1
+}
+fn default_raft_addr() -> String {
+    "0.0.0.0:8816".to_string()
+}
+fn default_election_min_ms() -> u64 {
+    150
+}
+fn default_election_max_ms() -> u64 {
+    300
+}
+fn default_heartbeat_ms() -> u64 {
+    50
 }
 fn default_max_msg_mb() -> usize {
     64

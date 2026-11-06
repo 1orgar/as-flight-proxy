@@ -11,9 +11,10 @@ import org.scalatest.funsuite.AnyFunSuite
 
 class ArrowBatchConverterSpec extends AnyFunSuite {
 
-  test("AerospikeFlightOptions defaults ignoreNulls to false and serializes descriptor JSON") {
+  test("AerospikeFlightOptions defaults ignoreNulls to false, includes jobId, and serializes descriptor JSON") {
     val opts = AerospikeFlightOptions.fromMap(
       Map(
+        "connector.jobId" -> "job-test-001",
         "flight.hosts" -> "proxy1:8815,proxy2:8815",
         "flight.username" -> "spark_user",
         "flight.password" -> "spark_pass",
@@ -25,6 +26,7 @@ class ArrowBatchConverterSpec extends AnyFunSuite {
       )
     )
 
+    assert(opts.jobId == "job-test-001")
     assert(!opts.ignoreNulls, "ignoreNulls must default to false")
     assert(opts.sendKey)
     assert(opts.hosts.size == 2)
@@ -32,11 +34,63 @@ class ArrowBatchConverterSpec extends AnyFunSuite {
     assert(opts.endpointFor(0, 1) == HostEndpoint("proxy2", 8815))
 
     val jsonStr = new String(opts.toFlightDescriptorJsonBytes, "UTF-8")
+    assert(jsonStr.contains("\"job_id\":\"job-test-001\""))
     assert(jsonStr.contains("\"namespace\":\"profile_ns\""))
     assert(jsonStr.contains("\"set_name\":\"features\""))
     assert(jsonStr.contains("\"key_column\":\"user_id\""))
     assert(jsonStr.contains("\"write_mode\":\"update\""))
     assert(jsonStr.contains("\"ignore_nulls\":false"))
+  }
+
+  test("AerospikeLoadStatus aggregates partition commit messages and stores summary by jobId") {
+    AerospikeLoadStatus.clear()
+    val opts = AerospikeFlightOptions.fromMap(
+      Map(
+        "connector.jobId" -> "job-agg-777",
+        "aerospike.namespace" -> "ns",
+        "aerospike.set" -> "set",
+        "aerospike.keyColumn" -> "id"
+      )
+    )
+
+    val msgs = Seq(
+      AerospikeFlightCommitMessage(
+        partitionId = 0,
+        taskId = 10L,
+        rowsWritten = 1000L,
+        batchesSent = 2L,
+        overloadRetries = 5L,
+        otherRetries = 0L,
+        elapsedMs = 120L
+      ),
+      AerospikeFlightCommitMessage(
+        partitionId = 1,
+        taskId = 11L,
+        rowsWritten = 1500L,
+        batchesSent = 3L,
+        overloadRetries = 2L,
+        otherRetries = 1L,
+        elapsedMs = 150L
+      )
+    )
+
+    val summary = AerospikeFlightCommitMessage.aggregate(
+      options = opts,
+      status = "COMPLETED",
+      messages = msgs,
+      elapsedMs = 180L,
+      raftClusterStatusJson = Some("{\"state\":\"completed\",\"total_rows_written\":2500}")
+    )
+    AerospikeLoadStatus.recordSummary(summary)
+
+    assert(AerospikeLoadStatus.lastSummary.contains(summary))
+    assert(AerospikeLoadStatus.getSummary("job-agg-777").contains(summary))
+    assert(summary.rowsWritten == 2500L)
+    assert(summary.batchesSent == 5L)
+    assert(summary.overloadRetries == 7L)
+    assert(summary.otherRetries == 1L)
+    assert(summary.partitionsCount == 2)
+    assert(summary.toJson.contains("\"rows_written\" : 2500"))
   }
 
   test("ArrowBatchConverter converts primitives, Date, Timestamp, Array, Map, and Struct") {
@@ -124,6 +178,30 @@ class ArrowBatchConverterSpec extends AnyFunSuite {
       val addrVec = root.getVector("address").asInstanceOf[StructVector]
       assert(!addrVec.isNull(0))
       assert(addrVec.isNull(1))
+    } finally {
+      root.close()
+      allocator.close()
+    }
+  }
+
+  test("ArrowBatchConverter throws IllegalArgumentException when primary key is null") {
+    val sparkSchema = new StructType()
+      .add("user_id", StringType, nullable = true)
+      .add("age", IntegerType, nullable = true)
+
+    val allocator = new RootAllocator(Long.MaxValue)
+    val arrowSchema = ArrowSchemaConverter.toArrowSchema(sparkSchema)
+    val root = VectorSchemaRoot.create(arrowSchema, allocator)
+
+    try {
+      val converter = new ArrowBatchConverter(sparkSchema, "user_id", root)
+      converter.reset()
+
+      val nullKeyRow = InternalRow(null, 25)
+      val ex = intercept[IllegalArgumentException] {
+        converter.appendRow(nullKeyRow)
+      }
+      assert(ex.getMessage.contains("Null value encountered in primary key column 'user_id'"))
     } finally {
       root.close()
       allocator.close()

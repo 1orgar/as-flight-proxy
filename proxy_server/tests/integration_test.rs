@@ -8,7 +8,7 @@ use arrow_array::{Array, RecordBatch};
 use arrow_flight::encode::FlightDataEncoderBuilder;
 use arrow_flight::flight_service_client::FlightServiceClient;
 use arrow_flight::flight_service_server::FlightServiceServer;
-use arrow_flight::{BasicAuth, FlightDescriptor, HandshakeRequest};
+use arrow_flight::{Action, BasicAuth, FlightDescriptor, HandshakeRequest};
 use arrow_schema::{DataType, Field, Fields, Schema, TimeUnit};
 use bytes::Bytes;
 use futures::stream::{self, StreamExt, TryStreamExt};
@@ -17,19 +17,21 @@ use prost::Message;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio_stream::wrappers::TcpListenerStream;
-use tonic::metadata::MetadataValue;
+use tonic::metadata::{MetadataMap, MetadataValue};
 use tonic::transport::Server;
 use tonic::Request;
 
 use as_proxy_server::auth::Authenticator;
 use as_proxy_server::config::{
-    AuthConfig, RetryConfig, WriteMode, WriteParameters, WriterConfig,
+    AuthConfig, RaftConfig, RaftPeer, RetryConfig, WriteMode, WriteParameters, WriterConfig,
 };
 use as_proxy_server::converter::{PreparedRecord, convert_record_batch};
 use as_proxy_server::flight_service::{ProxyFlightService, PutBatchAck};
 use as_proxy_server::metrics::ProxyMetrics;
+use as_proxy_server::raft::{JobLoadStatus, JobState, RaftNode, RaftRole};
 use as_proxy_server::writer::{AerospikeSink, MppWriteEngine, RecordWriteOutcome};
 
 /// Mock Aerospike sink that records writes per key and allows injecting overload or fatal errors.
@@ -116,18 +118,6 @@ impl AerospikeSink for MockAerospikeSink {
 
 #[test]
 fn test_convert_all_types_and_null_modes() {
-    // Build a schema with:
-    // - user_id (String, key)
-    // - age (Int32)
-    // - score (Float64)
-    // - active (Boolean)
-    // - amount (Decimal128(10, 2))
-    // - birth_date (Date32 -> UTC ms)
-    // - event_ts (Timestamp(Microsecond, UTC) -> UTC ms)
-    // - raw_bytes (Binary)
-    // - tags (List<Utf8>)
-    // - props (Map<Utf8, Int64>)
-    // - profile (Struct<city: Utf8, zip: Int32>)
     let struct_fields = Fields::from(vec![
         Field::new("city", DataType::Utf8, true),
         Field::new("zip", DataType::Int32, true),
@@ -242,6 +232,7 @@ fn test_convert_all_types_and_null_modes() {
 
     // 1. Default Update mode with ignore_nulls = false
     let params_update_nil = WriteParameters {
+        job_id: Some("job_1".to_string()),
         namespace: "test".to_string(),
         set_name: "users".to_string(),
         key_column: "user_id".to_string(),
@@ -267,12 +258,10 @@ fn test_convert_all_types_and_null_modes() {
         r0.bins[3],
         Bin::new("amount", Value::String("123.45".to_string()))
     );
-    // Date32: 20_000 * 86_400_000 = 1_728_000_000_000 ms
     assert_eq!(
         r0.bins[4],
         Bin::new("birth_date", Value::Int(1_728_000_000_000))
     );
-    // Timestamp(Microsecond): 1_700_000_000_123_456 / 1000 = 1_700_000_000_123 ms
     assert_eq!(
         r0.bins[5],
         Bin::new("event_ts", Value::Int(1_700_000_000_123))
@@ -326,6 +315,81 @@ fn test_convert_all_types_and_null_modes() {
         records_replace[1].bins[0],
         Bin::new("score", Value::Float(FloatValue::from(50.0)))
     );
+
+    // 3. Update mode with ignore_nulls = true also omits null bins!
+    let mut params_ignore_nulls = params_update_nil.clone();
+    params_ignore_nulls.ignore_nulls = true;
+    let records_ignore = convert_record_batch(&batch, &params_ignore_nulls, 64).unwrap();
+    assert_eq!(records_ignore[1].bins.len(), 1);
+}
+
+#[test]
+fn test_null_primary_key_and_bin_name_length_validation() {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Utf8, true),
+        Field::new("very_long_bin_name_exceeding_limit", DataType::Int32, true),
+    ]));
+
+    let mut id_b = StringBuilder::new();
+    let mut val_b = Int32Builder::new();
+    id_b.append_value("k1");
+    val_b.append_value(1);
+    id_b.append_null(); // Row 1 has NULL primary key!
+    val_b.append_value(2);
+
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![Arc::new(id_b.finish()), Arc::new(val_b.finish())],
+    )
+    .unwrap();
+
+    let params = WriteParameters {
+        job_id: None,
+        namespace: "ns".to_string(),
+        set_name: "set".to_string(),
+        key_column: "id".to_string(),
+        write_mode: WriteMode::Update,
+        ttl_seconds: None,
+        send_key: true,
+        ignore_nulls: false,
+        use_batch_write: None,
+    };
+
+    // Null key must fail immediately
+    let err = convert_record_batch(&batch, &params, 64).unwrap_err();
+    assert!(err.to_string().contains("Null value encountered in primary key"));
+
+    // Bin name exceeding max_bin_name_len = 15 must fail immediately
+    let batch_valid_key = batch.slice(0, 1);
+    let err_len = convert_record_batch(&batch_valid_key, &params, 15).unwrap_err();
+    assert!(err_len.to_string().contains("exceeds configured max_bin_name_len"));
+}
+
+#[test]
+fn test_authenticator_rejects_bad_credentials_and_tokens() {
+    let auth = Authenticator::new(AuthConfig {
+        enabled: true,
+        username: "admin".to_string(),
+        password: "correct_password".to_string(),
+        token_secret: "secret_123".to_string(),
+        token_ttl_secs: 3600,
+    });
+
+    assert!(auth.verify_credentials("admin", "correct_password").is_ok());
+    assert!(auth.verify_credentials("admin", "wrong_password").is_err());
+    assert!(auth.verify_credentials("wrong_user", "correct_password").is_err());
+
+    let token = auth.issue_token("admin").unwrap();
+    assert_eq!(auth.verify_token(&token).unwrap(), "admin");
+    assert!(auth.verify_token(&format!("{token}tampered")).is_err());
+
+    let mut headers = MetadataMap::new();
+    assert!(auth.verify_metadata(&headers).is_err());
+    headers.insert(
+        "authorization",
+        MetadataValue::try_from(format!("Bearer {token}")).unwrap(),
+    );
+    assert!(auth.verify_metadata(&headers).is_ok());
 }
 
 #[tokio::test]
@@ -335,8 +399,6 @@ async fn test_infinite_overload_retry_and_partial_batch_retry() {
     let k3 = Key::new("ns", "set", Value::Int(3)).unwrap();
 
     // k2 fails with DEVICE_OVERLOAD / KEY_BUSY 7 times in a row, while max_other_retries is only 2!
-    // Because overload errors retry "до талого", k2 must succeed on attempt 8,
-    // while k1 and k3 are written only on attempt 1!
     let mut overload_map = HashMap::new();
     overload_map.insert(k2.clone(), 7);
 
@@ -350,7 +412,7 @@ async fn test_infinite_overload_retry_and_partial_batch_retry() {
         max_concurrent_subbatches_per_stream: 4,
     };
     let retry_cfg = RetryConfig {
-        max_other_retries: 2, // Overload retry must ignore this cap and keep retrying!
+        max_other_retries: 2,
         initial_backoff_ms: 1,
         max_backoff_ms: 4,
         backoff_multiplier: 1.5,
@@ -379,6 +441,7 @@ async fn test_infinite_overload_retry_and_partial_batch_retry() {
     ];
 
     let params = WriteParameters {
+        job_id: None,
         namespace: "ns".to_string(),
         set_name: "set".to_string(),
         key_column: "id".to_string(),
@@ -399,6 +462,51 @@ async fn test_infinite_overload_retry_and_partial_batch_retry() {
     assert_eq!(attempts.get(&k1), Some(&1));
     assert_eq!(attempts.get(&k2), Some(&8));
     assert_eq!(attempts.get(&k3), Some(&1));
+}
+
+#[tokio::test]
+async fn test_single_put_fallback_mode_with_overload_retry() {
+    let k1 = Key::new("ns", "set", Value::Int(10)).unwrap();
+    let mut overload_map = HashMap::new();
+    overload_map.insert(k1.clone(), 4);
+
+    let sink = Arc::new(MockAerospikeSink::new(overload_map, HashMap::new()));
+    let metrics = ProxyMetrics::new();
+
+    let writer_cfg = WriterConfig {
+        use_batch_write: false,
+        batch_write_size: 10,
+        max_in_flight_records: 50,
+        max_concurrent_subbatches_per_stream: 2,
+    };
+    let retry_cfg = RetryConfig {
+        max_other_retries: 1,
+        initial_backoff_ms: 1,
+        max_backoff_ms: 3,
+        backoff_multiplier: 1.5,
+    };
+
+    let engine = MppWriteEngine::new(sink.clone(), writer_cfg, retry_cfg, metrics);
+    let records = vec![PreparedRecord {
+        key: k1.clone(),
+        bins: vec![Bin::new("b", Value::Int(99))],
+    }];
+
+    let params = WriteParameters {
+        job_id: None,
+        namespace: "ns".to_string(),
+        set_name: "set".to_string(),
+        key_column: "id".to_string(),
+        write_mode: WriteMode::Update,
+        ttl_seconds: None,
+        send_key: true,
+        ignore_nulls: false,
+        use_batch_write: Some(false),
+    };
+
+    let stats = engine.write_records(records, &params).await.unwrap();
+    assert_eq!(stats.rows_written, 1);
+    assert_eq!(stats.overload_retries, 4);
 }
 
 #[tokio::test]
@@ -429,6 +537,7 @@ async fn test_non_overload_error_terminates_after_n_retries() {
     }];
 
     let params = WriteParameters {
+        job_id: None,
         namespace: "ns".to_string(),
         set_name: "set".to_string(),
         key_column: "id".to_string(),
@@ -441,7 +550,6 @@ async fn test_non_overload_error_terminates_after_n_retries() {
 
     let err = engine.write_records(records, &params).await.unwrap_err();
     let attempts = sink.write_attempts.lock().unwrap();
-    // 1 initial + 3 retries = 4 attempts total
     assert_eq!(attempts.get(&k1), Some(&4));
     assert!(err.to_string().contains("after 4 attempts"));
 }
@@ -540,6 +648,7 @@ async fn test_end_to_end_flight_handshake_and_do_put_stream() {
     .unwrap();
 
     let write_params = WriteParameters {
+        job_id: Some("job_e2e_1".to_string()),
         namespace: "prod_ns".to_string(),
         set_name: "features".to_string(),
         key_column: "key_col".to_string(),
@@ -573,7 +682,6 @@ async fn test_end_to_end_flight_handshake_and_do_put_stream() {
     assert_eq!(acks.len(), 1);
     assert_eq!(acks[0].rows_written, 50);
 
-    // Verify all 50 keys were written to the mock sink and key 10 has Value::Nil for bin_val
     let stored = sink.stored.lock().unwrap();
     assert_eq!(stored.len(), 50);
     let key_10 = Key::new("prod_ns", "features", Value::Int(10)).unwrap();
@@ -585,4 +693,201 @@ async fn test_end_to_end_flight_handshake_and_do_put_stream() {
             Bin::new("bin_val", Value::Nil),
         ]
     );
+}
+
+#[tokio::test]
+async fn test_three_node_raft_cluster_metadata_and_distributed_job_status() {
+    // Reserve 3 ephemeral ports for Raft and 3 ephemeral ports for Arrow Flight
+    let mut raft_addrs = Vec::new();
+    let mut flight_listeners = Vec::new();
+    let mut flight_addrs = Vec::new();
+
+    for _ in 0..3 {
+        let rl = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let r_addr = rl.local_addr().unwrap().to_string();
+        drop(rl);
+        raft_addrs.push(r_addr);
+
+        let fl = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        flight_addrs.push(fl.local_addr().unwrap().to_string());
+        flight_listeners.push(fl);
+    }
+
+    let peers: Vec<RaftPeer> = (0..3)
+        .map(|i| RaftPeer {
+            node_id: (i + 1) as u64,
+            raft_addr: raft_addrs[i].clone(),
+            flight_addr: flight_addrs[i].clone(),
+        })
+        .collect();
+
+    let shared_sink = Arc::new(MockAerospikeSink::new(HashMap::new(), HashMap::new()));
+    let mut raft_nodes = Vec::new();
+
+    for i in 0..3 {
+        let node_id = (i + 1) as u64;
+        let raft_cfg = RaftConfig {
+            enabled: true,
+            node_id,
+            listen_addr: raft_addrs[i].clone(),
+            election_timeout_min_ms: 100,
+            election_timeout_max_ms: 200,
+            heartbeat_interval_ms: 35,
+            peers: peers.clone(),
+        };
+        let raft_node = RaftNode::new(raft_cfg);
+        raft_node.start().await.unwrap();
+        raft_nodes.push(Arc::clone(&raft_node));
+
+        let metrics = ProxyMetrics::new();
+        let engine = Arc::new(MppWriteEngine::new(
+            shared_sink.clone(),
+            WriterConfig::default(),
+            RetryConfig::default(),
+            Arc::clone(&metrics),
+        ));
+        let auth = Arc::new(Authenticator::new(AuthConfig {
+            enabled: false,
+            ..AuthConfig::default()
+        }));
+        let svc = ProxyFlightService::new(auth, engine, metrics, 64).with_raft_node(raft_node);
+        let fl = flight_listeners.remove(0);
+
+        tokio::spawn(async move {
+            Server::builder()
+                .add_service(FlightServiceServer::new(svc))
+                .serve_with_incoming(TcpListenerStream::new(fl))
+                .await
+                .unwrap();
+        });
+    }
+
+    // Wait up to 2 seconds for Raft leader election to converge
+    let mut leader_elected = false;
+    for _ in 0..40 {
+        for r in &raft_nodes {
+            let snap = r.get_cluster_snapshot().await;
+            if snap.role == RaftRole::Leader {
+                leader_elected = true;
+                break;
+            }
+        }
+        if leader_elected {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(leader_elected, "3-node Raft cluster must elect a leader");
+
+    // Stream batches concurrently to ALL 3 equal proxy nodes for the same Spark job_id
+    let job_id = "spark-job-distributed-42";
+    let counts_per_node = [20usize, 30usize, 40usize];
+    let mut start_key = 1i64;
+
+    for (idx, &row_count) in counts_per_node.iter().enumerate() {
+        let channel = tonic::transport::Endpoint::new(format!("http://{}", flight_addrs[idx]))
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
+        let mut client = FlightServiceClient::new(channel);
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("v", DataType::Int64, true),
+        ]));
+        let mut k_b = Int64Builder::new();
+        let mut v_b = Int64Builder::new();
+        for k in start_key..(start_key + row_count as i64) {
+            k_b.append_value(k);
+            v_b.append_value(k * 10);
+        }
+        start_key += row_count as i64;
+
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(k_b.finish()), Arc::new(v_b.finish())],
+        )
+        .unwrap();
+
+        let params = WriteParameters {
+            job_id: Some(job_id.to_string()),
+            namespace: "ns".to_string(),
+            set_name: "set".to_string(),
+            key_column: "id".to_string(),
+            write_mode: WriteMode::Update,
+            ttl_seconds: None,
+            send_key: true,
+            ignore_nulls: false,
+            use_batch_write: Some(true),
+        };
+        let desc = FlightDescriptor::new_cmd(serde_json::to_vec(&params).unwrap());
+        let stream_data = FlightDataEncoderBuilder::new()
+            .with_schema(schema)
+            .with_flight_descriptor(Some(desc))
+            .build(stream::iter(vec![Ok(batch)]))
+            .map(|r| r.unwrap());
+
+        let mut resp = client
+            .do_put(Request::new(stream_data))
+            .await
+            .unwrap()
+            .into_inner();
+        while (resp.try_next().await.unwrap()).is_some() {}
+    }
+
+    // Send `complete_job` action to Node 2 (even if Node 2 is a Follower, it forwards to the Raft Leader!)
+    let channel_n2 = tonic::transport::Endpoint::new(format!("http://{}", flight_addrs[1]))
+        .unwrap()
+        .connect()
+        .await
+        .unwrap();
+    let mut client_n2 = FlightServiceClient::new(channel_n2);
+    let _ = client_n2
+        .do_action(Request::new(Action {
+            r#type: "complete_job".to_string(),
+            body: Bytes::from(job_id),
+        }))
+        .await
+        .unwrap()
+        .into_inner()
+        .try_next()
+        .await
+        .unwrap();
+
+    // Wait briefly for Raft heartbeat commit propagation to all followers
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    // Query `get_job_status` via Arrow Flight DoAction on ALL 3 nodes and verify identical replicated totals!
+    for f_addr in &flight_addrs {
+        let ch = tonic::transport::Endpoint::new(format!("http://{f_addr}"))
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
+        let mut client = FlightServiceClient::new(ch);
+        let mut action_stream = client
+            .do_action(Request::new(Action {
+                r#type: "get_job_status".to_string(),
+                body: Bytes::from(job_id),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        let res = action_stream.try_next().await.unwrap().unwrap();
+        let status: JobLoadStatus = serde_json::from_slice(&res.body).unwrap();
+
+        assert_eq!(status.job_id, job_id);
+        assert_eq!(status.state, JobState::Completed);
+        assert_eq!(status.total_rows_written, 90);
+        assert_eq!(status.total_batches_processed, 3);
+        assert_eq!(status.per_node_rows.get(&1), Some(&20));
+        assert_eq!(status.per_node_rows.get(&2), Some(&30));
+        assert_eq!(status.per_node_rows.get(&3), Some(&40));
+    }
+
+    for r in raft_nodes {
+        r.shutdown();
+    }
 }

@@ -6,6 +6,27 @@ tcp_nodelay = true
 http2_stream_window_size_mb = 16
 http2_connection_window_size_mb = 32
 
+[raft]
+enabled = true
+node_id = 1
+listen_addr = "0.0.0.0:8816"
+election_timeout_min_ms = 150
+election_timeout_max_ms = 300
+heartbeat_interval_ms = 50
+# Example 3-node cluster of equal proxy peers:
+# [[raft.peers]]
+# node_id = 1
+# raft_addr = "10.0.0.1:8816"
+# flight_addr = "10.0.0.1:8815"
+# [[raft.peers]]
+# node_id = 2
+# raft_addr = "10.0.0.2:8816"
+# flight_addr = "10.0.0.2:8815"
+# [[raft.peers]]
+# node_id = 3
+# raft_addr = "10.0.0.3:8816"
+# flight_addr = "10.0.0.3:8815"
+
 [tls]
 enabled = false
 # cert_path = "certs/server.crt"
