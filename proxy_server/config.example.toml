@@ -13,6 +13,8 @@ listen_addr = "0.0.0.0:8816"
 election_timeout_min_ms = 150
 election_timeout_max_ms = 300
 heartbeat_interval_ms = 50
+# TTL (in seconds) for storing Spark job statistics in Raft state before automatic eviction
+job_stats_ttl_secs = 3600
 # Example 3-node cluster of equal proxy peers:
 # [[raft.peers]]
 # node_id = 1

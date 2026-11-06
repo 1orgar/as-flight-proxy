@@ -14,9 +14,10 @@
 ## Состав репозитория
 
 * [`proxy_server/`](proxy_server/) — MPP-сервер на Rust (`tokio`, `tonic`, `arrow-flight 60`, `aerospike 3.0 async`):
-  * **Кластер равноправных нод с Raft (`:8816`)**:
+  * **Кластер равноправных нод с Raft (`:8816`) и TTL статистики**:
     * На отдельном порту (`raft.listen_addr`) работает Raft-консенсус для репликации метаданных кластера (живые ноды, нагрузка, глобальный прогресс и статус каждой выгрузки Spark `job_id` в разрезе всех нод прокси).
-    * Любая нода прокси принимает предложения (`propose`), автоматически пересылая их текущему Raft-лидеру, и отдаёт консистентный статус по любому `job_id`.
+    * Любая нода прокси принимает предложения (`propose`), автоматически пересылая их текущему Raft-лидеру, и отдаёт консистентный статус по любому `job_id` через Arrow Flight `DoAction`.
+    * Поддерживается автоматическая очистка устаревшей статистики по TTL (`raft.job_stats_ttl_secs`, по умолчанию `3600` секунд).
   * **Нативный `BatchWrite` (`Client::batch`)**: автоматическая группировка ключей по нодам кластера Aerospike 8+ и fallback на одиночный `Client::put`.
   * **Умный по-ключевой ретрай**:
     * Ошибки перегрузки (`DEVICE_OVERLOAD`, `KEY_BUSY`, `NO_AVAILABLE_CONNECTIONS_TO_NODE`, `MAX_RETRIES_EXCEEDED`) ретраятся **«до талого» (бесконечно)** с экспоненциальным backoff и полным джиттером, причем из пачки переотправляются только не записавшиеся ключи.
@@ -24,62 +25,86 @@
   * Режимы записи: `update` (обновление только переданных бинов, при `ignore_nulls = false` по умолчанию `null` отправляет `Value::Nil` и удаляет бин) и `replace` (полная перезапись записи).
   * Автоконвертация `Date` и `Timestamp` в `int64` UTC миллисекунды (`Value::Int(i64)`), вложенных `Array`, `Map`, `Struct` — в Aerospike CDT `List` и `OrderedMap`.
   * Авторизация (`Basic` / `Bearer` HMAC-SHA256 токены через `Handshake`) и TLS 1.2/1.3 (включая mTLS).
-  * HTTP-сервер мониторинга (`:9090`) с `/metrics` (Prometheus), `/healthz`, `/cluster/status` и `/jobs/<job_id>`.
+  * HTTP-сервер мониторинга (`:9090`) только с `/metrics` (Prometheus) и `/healthz`.
 * [`spark_connector/`](spark_connector/) — коннектор Spark 3.5 DataSource V2 (`format("aerospike-flight")`):
   * Автоконвертация всех типов Spark `InternalRow` → `Arrow VectorSchemaRoot`.
   * Многопоточная отправка внутри каждого экзекьютор-таска (`connector.writerThreads`) с балансировкой по списку `flight.hosts`.
-  * Отслеживание статуса и метрик загрузки через `AerospikeLoadStatus`, Spark SQL UI (`CustomSumMetric`) и Arrow Flight `DoAction`.
+  * Чтение статуса загрузки в PySpark/Scala как нативного Spark DataFrame (`spark.read.format("aerospike-flight")...load()`), через `spark._jvm` (`AerospikeLoadStatus`) и через Spark SQL UI (`CustomSumMetric`).
   * Сборка в единый fat-JAR (`sbt assembly`) с shading для `io.grpc` и `com.google.protobuf`.
 
 ---
 
-## Как получить информацию и статус по загрузке из Spark
+## Работа из PySpark: выгрузка и получение статистики
 
-Доступны **3 способа** получения статуса и детальной статистики выгрузки:
+### 1. Выгрузка DataFrame из PySpark в Aerospike
 
-### Способ 1. Программно на Spark Driver сразу после `.save()` (`AerospikeLoadStatus`)
+```python
+job_id = "daily-profile-load-2026-11-06"
 
-После завершения `df.write.format("aerospike-flight")...save()` драйвер собирает `WriterCommitMessage` со всех партиций, фиксирует завершение джоба в Raft-кластере прокси и сохраняет итоговый отчёт `LoadJobSummary` в `AerospikeLoadStatus`:
-
-```scala
-import com.asproxy.spark.AerospikeLoadStatus
-
-df.repartition(64, col("user_id"))
-  .write
-  .format("aerospike-flight")
-  .option("connector.jobId", "daily-profile-load-2026-11-06")
-  .option("flight.hosts", "proxy-1:8815,proxy-2:8815,proxy-3:8815")
-  .option("flight.username", "spark_writer")
-  .option("flight.password", "change_me_in_prod")
-  .option("aerospike.namespace", "test")
-  .option("aerospike.set", "users")
-  .option("aerospike.keyColumn", "user_id")
-  .option("aerospike.writeMode", "update")
-  .mode("append")
-  .save()
-
-// Получение полной сводки по конкретному jobId (или AerospikeLoadStatus.lastSummary):
-val summary = AerospikeLoadStatus.getSummary("daily-profile-load-2026-11-06").get
-println(s"Status: ${summary.status}, rows: ${summary.rowsWritten}, overloadRetries: ${summary.overloadRetries}")
-println(summary.toJson) // Включает raft_cluster_status с разбивкой строк по каждой ноде прокси!
+(
+    df.repartition(64, "user_id")
+    .write.format("aerospike-flight")
+    .option("connector.jobId", job_id)
+    .option("flight.hosts", "proxy-1:8815,proxy-2:8815,proxy-3:8815")
+    .option("flight.username", "spark_writer")
+    .option("flight.password", "change_me_in_prod")
+    .option("aerospike.namespace", "test")
+    .option("aerospike.set", "users")
+    .option("aerospike.keyColumn", "user_id")
+    .option("aerospike.writeMode", "update")      # "update" или "replace"
+    .option("aerospike.ignoreNulls", "false")     # по умолчанию false: null в update удаляет бин
+    .option("connector.batchSize", "8192")
+    .option("connector.writerThreads", "4")
+    .mode("append")
+    .save()
+)
 ```
 
-### Способ 2. В реальном времени по RPC (`Arrow Flight DoAction`) или HTTP API любого узла прокси
+### 2. Получение статуса загрузки в PySpark
 
-Во время выполнения выгрузки (или после неё) все равноправные ноды `proxy_server` синхронизируют прогресс через Raft (`:8816`). Опросить статус можно с любой ноды:
+Доступны **3 удобных способа** без использования HTTP-порта метрик:
 
-1. **Из кода Spark/Scala через Arrow Flight `DoAction`**:
-   ```scala
-   val jobJson = AerospikeLoadStatus.fetchRemoteJobStatus(options, "daily-profile-load-2026-11-06")
-   val clusterJson = AerospikeLoadStatus.fetchClusterStatus(options)
-   ```
-2. **По HTTP на порту мониторинга (`:9090`) любой ноды прокси**:
-   * `GET http://proxy-1:9090/jobs/daily-profile-load-2026-11-06` — статус конкретного джоба (`state`, `total_rows_written`, `total_overload_retries`, `per_node_rows`).
-   * `GET http://proxy-1:9090/jobs` — список всех активных и завершённых выгрузок.
-   * `GET http://proxy-1:9090/cluster/status` — состояние Raft-кластера (`leader_id`, `current_term`, список нод и их нагрузка).
+#### Способ А. Нативное чтение статуса как Spark DataFrame (`spark.read.format("aerospike-flight")`)
+Коннектор реализует `SupportsRead`, который опрашивает Raft-кластер прокси по Arrow Flight `DoAction` (и локальный реестр драйвера) и возвращает DataFrame со статистикой:
 
-### Способ 3. В веб-интерфейсе Spark UI (вкладка SQL / DataFrame)
+```python
+# Статус конкретного job_id (или без connector.jobId — список всех джобов в Raft с учетом TTL):
+status_df = (
+    spark.read.format("aerospike-flight")
+    .option("flight.hosts", "proxy-1:8815,proxy-2:8815,proxy-3:8815")
+    .option("flight.username", "spark_writer")
+    .option("flight.password", "change_me_in_prod")
+    .option("connector.jobId", job_id)
+    .load()
+)
 
+status_df.show(truncate=False)
+# Схема: job_id, state, namespace, set_name, rows_written, batches_processed,
+#        overload_retries, other_retries, elapsed_ms, raw_json (включая per_node_rows из Raft)
+```
+
+#### Способ Б. Получение JSON-сводки в Python-словарь через `spark._jvm`
+Сразу после `.save()` или во время работы джоба можно вызвать статические методы `AerospikeLoadStatus` через Py4J:
+
+```python
+import json
+
+status_api = spark._jvm.com.asproxy.spark.AerospikeLoadStatus
+
+# 1. Итоговая сводка драйвера по завершённому джобу (включая слепок Raft):
+summary = json.loads(status_api.getSummaryJson(job_id))
+print(summary["status"], summary["rows_written"], summary["overload_retries"])
+
+# 2. Запрос живого Raft-статуса напрямую с кластера прокси по Arrow Flight DoAction:
+live_raft_job = json.loads(
+    status_api.fetchRemoteJobStatusJson(
+        "proxy-1:8815,proxy-2:8815", job_id, "spark_writer", "change_me_in_prod", False
+    )
+)
+print(live_raft_job["per_node_rows"])
+```
+
+#### Способ В. В веб-интерфейсе Spark UI (вкладка SQL / DataFrame)
 Коннектор регистрирует нативные метрики Spark DataSource V2 (`CustomSumMetric`), которые отображаются прямо в графе выполнения запроса в **Spark UI**:
 * `as_rows_written` — количество записанных строк;
 * `as_batches_sent` — количество отправленных Arrow `RecordBatch`;

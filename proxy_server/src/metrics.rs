@@ -121,7 +121,7 @@ impl ProxyMetrics {
     }
 }
 
-/// Spawn a lightweight HTTP observability server for `/metrics`, `/healthz`, `/cluster/status`, and `/jobs`.
+/// Spawn a lightweight HTTP observability server for `/metrics` and `/healthz`.
 pub async fn serve_observability<F>(
     listen_addr: &str,
     metrics: Arc<ProxyMetrics>,
@@ -133,7 +133,7 @@ where
 {
     let listener = TcpListener::bind(listen_addr).await?;
     info!(
-        "Observability HTTP server listening on http://{listen_addr} (/metrics, /healthz, /cluster/status, /jobs)"
+        "Observability HTTP server listening on http://{listen_addr} (/metrics, /healthz)"
     );
     let health_check = Arc::new(health_check);
 
@@ -199,59 +199,10 @@ where
                         metrics.render_prometheus(is_healthy, raft_info),
                     )
                 }
-                "/cluster/status" => {
-                    if let Some(ref r) = raft_node {
-                        let snap = r.get_cluster_snapshot().await;
-                        let json = serde_json::to_string_pretty(&snap).unwrap_or_default();
-                        ("HTTP/1.1 200 OK", "application/json", format!("{json}\n"))
-                    } else {
-                        (
-                            "HTTP/1.1 503 Service Unavailable",
-                            "application/json",
-                            "{\"error\":\"raft_disabled\"}\n".to_string(),
-                        )
-                    }
-                }
-                "/jobs" | "/jobs/" => {
-                    if let Some(ref r) = raft_node {
-                        let snap = r.get_cluster_snapshot().await;
-                        let json =
-                            serde_json::to_string_pretty(&snap.state.jobs).unwrap_or_default();
-                        ("HTTP/1.1 200 OK", "application/json", format!("{json}\n"))
-                    } else {
-                        (
-                            "HTTP/1.1 503 Service Unavailable",
-                            "application/json",
-                            "{\"error\":\"raft_disabled\"}\n".to_string(),
-                        )
-                    }
-                }
-                p if p.starts_with("/jobs/") => {
-                    let job_id = p.trim_start_matches("/jobs/").trim();
-                    if let Some(ref r) = raft_node {
-                        match r.get_job_status(job_id).await {
-                            Some(job) => {
-                                let json = serde_json::to_string_pretty(&job).unwrap_or_default();
-                                ("HTTP/1.1 200 OK", "application/json", format!("{json}\n"))
-                            }
-                            None => (
-                                "HTTP/1.1 404 Not Found",
-                                "application/json",
-                                format!("{{\"error\":\"job '{job_id}' not found\"}}\n"),
-                            ),
-                        }
-                    } else {
-                        (
-                            "HTTP/1.1 503 Service Unavailable",
-                            "application/json",
-                            "{\"error\":\"raft_disabled\"}\n".to_string(),
-                        )
-                    }
-                }
                 _ => (
                     "HTTP/1.1 404 Not Found",
                     "text/plain; charset=utf-8",
-                    "Not Found. Available endpoints: /metrics, /healthz, /cluster/status, /jobs, /jobs/<job_id>\n".to_string(),
+                    "Not Found. Available endpoints: /metrics, /healthz\n".to_string(),
                 ),
             };
 

@@ -102,6 +102,10 @@ pub struct RaftConfig {
     pub election_timeout_max_ms: u64,
     #[serde(default = "default_heartbeat_ms")]
     pub heartbeat_interval_ms: u64,
+    /// TTL (in seconds) for keeping Spark job load statistics in the Raft state machine.
+    /// Jobs not updated within `job_stats_ttl_secs` are automatically evicted.
+    #[serde(default = "default_job_stats_ttl_secs")]
+    pub job_stats_ttl_secs: u64,
     #[serde(default)]
     pub peers: Vec<RaftPeer>,
 }
@@ -115,6 +119,7 @@ impl Default for RaftConfig {
             election_timeout_min_ms: default_election_min_ms(),
             election_timeout_max_ms: default_election_max_ms(),
             heartbeat_interval_ms: default_heartbeat_ms(),
+            job_stats_ttl_secs: default_job_stats_ttl_secs(),
             peers: Vec::new(),
         }
     }
@@ -414,6 +419,9 @@ fn default_election_max_ms() -> u64 {
 }
 fn default_heartbeat_ms() -> u64 {
     50
+}
+fn default_job_stats_ttl_secs() -> u64 {
+    3600
 }
 fn default_max_msg_mb() -> usize {
     64

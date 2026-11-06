@@ -154,7 +154,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
-    // Spawn HTTP observability server (/metrics, /healthz, /cluster/status, /jobs)
+    // Spawn HTTP observability server (/metrics, /healthz)
     let metrics_addr = cfg.server.metrics_addr.clone();
     let metrics_clone = Arc::clone(&metrics);
     let raft_for_obs = raft_node.clone();

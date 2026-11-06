@@ -40,11 +40,14 @@ case class AerospikeFlightOptions(
 
   require(jobId.trim.nonEmpty, "'connector.jobId' cannot be empty")
   require(hosts.nonEmpty, "'flight.hosts' must contain at least one host:port endpoint")
-  require(namespace.trim.nonEmpty, "'aerospike.namespace' cannot be empty")
-  require(keyColumn.trim.nonEmpty, "'aerospike.keyColumn' cannot be empty")
   require(batchSize > 0, s"'connector.batchSize' must be > 0 (got $batchSize)")
   require(writerThreads > 0, s"'connector.writerThreads' must be > 0 (got $writerThreads)")
   require(queueCapacity > 0, s"'connector.queueCapacity' must be > 0 (got $queueCapacity)")
+
+  def validateWriteTarget(): Unit = {
+    require(namespace.trim.nonEmpty, "'aerospike.namespace' cannot be empty")
+    require(keyColumn.trim.nonEmpty, "'aerospike.keyColumn' cannot be empty")
+  }
 
   /**
    * Select a proxy endpoint for a given Spark partition and worker thread index
@@ -85,10 +88,14 @@ object AerospikeFlightOptions {
   )
 
   def fromSparkOptions(options: CaseInsensitiveStringMap): AerospikeFlightOptions = {
-    fromMap(options.asCaseSensitiveMap().asScala.toMap)
+    fromMap(options.asCaseSensitiveMap().asScala.toMap, requireWriteTarget = true)
   }
 
-  def fromMap(raw: Map[String, String]): AerospikeFlightOptions = {
+  def forStatusQuery(raw: Map[String, String]): AerospikeFlightOptions = {
+    fromMap(raw, requireWriteTarget = false)
+  }
+
+  def fromMap(raw: Map[String, String], requireWriteTarget: Boolean = true): AerospikeFlightOptions = {
     val ci = raw.map { case (k, v) => k.toLowerCase -> v }
 
     def get(key: String): Option[String] = ci.get(key.toLowerCase).map(_.trim).filter(_.nonEmpty)
@@ -113,9 +120,9 @@ object AerospikeFlightOptions {
     val tlsVerifyServer = getOrElse("flight.tls.verifyServer", "true").toBoolean
     val timeoutMs = getOrElse("flight.timeoutMs", "60000").toLong
 
-    val namespace = getRequired("aerospike.namespace")
+    val namespace = if (requireWriteTarget) getRequired("aerospike.namespace") else getOrElse("aerospike.namespace", "")
     val setName = getOrElse("aerospike.set", "")
-    val keyColumn = getRequired("aerospike.keyColumn")
+    val keyColumn = if (requireWriteTarget) getRequired("aerospike.keyColumn") else getOrElse("aerospike.keyColumn", "")
 
     val writeMode = getOrElse("aerospike.writeMode", "update").toLowerCase
     if (!AllowedWriteModes.contains(writeMode)) {

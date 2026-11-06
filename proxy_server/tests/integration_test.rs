@@ -733,6 +733,7 @@ async fn test_three_node_raft_cluster_metadata_and_distributed_job_status() {
             election_timeout_min_ms: 100,
             election_timeout_max_ms: 200,
             heartbeat_interval_ms: 35,
+            job_stats_ttl_secs: 3600,
             peers: peers.clone(),
         };
         let raft_node = RaftNode::new(raft_cfg);
@@ -890,4 +891,49 @@ async fn test_three_node_raft_cluster_metadata_and_distributed_job_status() {
     for r in raft_nodes {
         r.shutdown();
     }
+}
+
+#[tokio::test]
+async fn test_raft_job_stats_ttl_expiration() {
+    let raft_cfg = RaftConfig {
+        enabled: true,
+        node_id: 1,
+        listen_addr: "127.0.0.1:0".to_string(),
+        election_timeout_min_ms: 100,
+        election_timeout_max_ms: 200,
+        heartbeat_interval_ms: 35,
+        job_stats_ttl_secs: 1, // 1 second TTL
+        peers: Vec::new(),
+    };
+    let raft_node = RaftNode::new(raft_cfg);
+    raft_node.start().await.unwrap();
+
+    raft_node
+        .propose(as_proxy_server::raft::MetadataCommand::RecordJobBatch {
+            job_id: "ttl-job-1".to_string(),
+            node_id: 1,
+            namespace: "ns".to_string(),
+            set_name: "set".to_string(),
+            rows_written: 125,
+            overload_retries: 2,
+            other_retries: 0,
+            timestamp_ms: as_proxy_server::raft::now_ms(),
+        })
+        .await
+        .unwrap();
+
+    // Immediately after write, job status is available
+    let status = raft_node.get_job_status("ttl-job-1").await;
+    assert!(status.is_some());
+    assert_eq!(status.unwrap().total_rows_written, 125);
+
+    // Wait for TTL (1s) + background purge interval to elapse
+    tokio::time::sleep(Duration::from_millis(1400)).await;
+
+    // Job stats must now be expired and purged from Raft state
+    assert!(raft_node.get_job_status("ttl-job-1").await.is_none());
+    let snap = raft_node.get_cluster_snapshot().await;
+    assert!(!snap.state.jobs.contains_key("ttl-job-1"));
+
+    raft_node.shutdown();
 }

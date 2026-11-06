@@ -208,7 +208,7 @@ class AerospikeFlightDataWriter(
                   try {
                     val metaBuf = ack.getApplicationMetadata
                     if (metaBuf != null && metaBuf.readableBytes() > 0) {
-                      val bytes = new Array[Byte](metaBuf.readableBytes())
+                      val bytes = new Array[Byte](metaBuf.readableBytes().toInt)
                       metaBuf.getBytes(metaBuf.readerIndex(), bytes)
                       val jsonNode = mapper.readTree(bytes)
                       if (jsonNode != null) {

@@ -69,10 +69,30 @@ object AerospikeLoadStatus {
   def lastSummary: Option[LoadJobSummary] = latestSummaryRef.get()
 
   /**
+   * PySpark / Py4J-friendly helper returning the latest job summary as a JSON string (or `"{}"`).
+   */
+  def getLastSummaryJson(): String =
+    lastSummary.map(_.toJson).getOrElse("{}")
+
+  /**
    * Returns the summary for a specific `connector.jobId`.
    */
   def getSummary(jobId: String): Option[LoadJobSummary] =
     Option(summariesByJobId.get(jobId))
+
+  /**
+   * PySpark / Py4J-friendly helper returning the summary for `jobId` as a JSON string (or `"{}"`).
+   */
+  def getSummaryJson(jobId: String): String =
+    getSummary(jobId).map(_.toJson).getOrElse("{}")
+
+  /**
+   * Returns all summaries recorded in the current Spark Driver session.
+   */
+  def allSummaries: Seq[LoadJobSummary] = {
+    import scala.collection.JavaConverters._
+    summariesByJobId.values().asScala.toSeq
+  }
 
   /**
    * Clear recorded summaries (useful in tests).
@@ -92,11 +112,53 @@ object AerospikeLoadStatus {
   }
 
   /**
+   * PySpark / Py4J-friendly method to query real-time Raft-replicated job status from `proxy_server`.
+   */
+  def fetchRemoteJobStatusJson(
+      hosts: String,
+      jobId: String,
+      username: String = "",
+      password: String = "",
+      tlsEnabled: Boolean = false
+  ): String = {
+    val opts = AerospikeFlightOptions.forStatusQuery(
+      Map(
+        "flight.hosts" -> hosts,
+        "connector.jobId" -> jobId,
+        "flight.username" -> username,
+        "flight.password" -> password,
+        "flight.tls.enabled" -> tlsEnabled.toString
+      )
+    )
+    fetchRemoteJobStatus(opts, jobId)
+  }
+
+  /**
    * Query any `proxy_server` node via Arrow Flight `DoAction("get_cluster_status", "")`
    * to retrieve the Raft cluster snapshot (leader, term, peer nodes, and all jobs).
    */
   def fetchClusterStatus(options: AerospikeFlightOptions): String = {
     executeAction(options, "get_cluster_status", Array.emptyByteArray)
+  }
+
+  /**
+   * PySpark / Py4J-friendly method to query Raft cluster status from `proxy_server`.
+   */
+  def fetchClusterStatusJson(
+      hosts: String,
+      username: String = "",
+      password: String = "",
+      tlsEnabled: Boolean = false
+  ): String = {
+    val opts = AerospikeFlightOptions.forStatusQuery(
+      Map(
+        "flight.hosts" -> hosts,
+        "flight.username" -> username,
+        "flight.password" -> password,
+        "flight.tls.enabled" -> tlsEnabled.toString
+      )
+    )
+    fetchClusterStatus(opts)
   }
 
   /**
@@ -133,9 +195,8 @@ object AerospikeLoadStatus {
       client = createFlightClient(allocator, endpoint, options)
       val callOpts = buildCallOptions(client, options)
       val results = client.doAction(new Action(actionType, body), callOpts: _*)
-      val iter = results.iterator()
-      if (iter.hasNext) {
-        val res = iter.next()
+      if (results.hasNext) {
+        val res = results.next()
         new String(res.getBody, StandardCharsets.UTF_8)
       } else {
         "{}"

@@ -137,6 +137,9 @@ impl ClusterMetadataState {
                 }
                 entry.updated_at_ms = (*timestamp_ms).max(entry.updated_at_ms);
             }
+            MetadataCommand::PurgeExpiredJobs { cutoff_ms } => {
+                self.jobs.retain(|_, job| job.updated_at_ms >= *cutoff_ms);
+            }
         }
     }
 }
@@ -161,6 +164,9 @@ pub enum MetadataCommand {
         state: JobState,
         error_message: Option<String>,
         timestamp_ms: u64,
+    },
+    PurgeExpiredJobs {
+        cutoff_ms: u64,
     },
 }
 
@@ -363,11 +369,61 @@ impl RaftNode {
             });
         }
 
+        if self.config.job_stats_ttl_secs > 0 {
+            let node_for_ttl = Arc::clone(self);
+            let mut ttl_shutdown = self.shutdown_tx.subscribe();
+            let check_interval_ms = (self.config.job_stats_ttl_secs * 1000 / 2).clamp(200, 10_000);
+            tokio::spawn(async move {
+                loop {
+                    tokio::select! {
+                        _ = ttl_shutdown.changed() => {
+                            if *ttl_shutdown.borrow() {
+                                break;
+                            }
+                        }
+                        () = tokio::time::sleep(Duration::from_millis(check_interval_ms)) => {
+                            let is_leader = {
+                                let core = node_for_ttl.core.lock().await;
+                                core.role == RaftRole::Leader
+                            };
+                            if is_leader {
+                                let _ = node_for_ttl.purge_expired_jobs().await;
+                            }
+                        }
+                    }
+                }
+            });
+        }
+
         Ok(bound_addr)
     }
 
     pub fn shutdown(&self) {
         let _ = self.shutdown_tx.send(true);
+    }
+
+    fn job_stats_cutoff_ms(&self) -> Option<u64> {
+        if self.config.job_stats_ttl_secs == 0 {
+            None
+        } else {
+            Some(now_ms().saturating_sub(self.config.job_stats_ttl_secs.saturating_mul(1000)))
+        }
+    }
+
+    /// Evict expired job statistics from the Raft state machine if any entries are older than `job_stats_ttl_secs`.
+    pub async fn purge_expired_jobs(self: &Arc<Self>) -> Result<()> {
+        let Some(cutoff_ms) = self.job_stats_cutoff_ms() else {
+            return Ok(());
+        };
+        let has_expired = {
+            let sm = self.state_machine.read().await;
+            sm.jobs.values().any(|job| job.updated_at_ms < cutoff_ms)
+        };
+        if has_expired {
+            self.propose(MetadataCommand::PurgeExpiredJobs { cutoff_ms })
+                .await?;
+        }
+        Ok(())
     }
 
     /// Propose a metadata command to the Raft cluster.
@@ -417,7 +473,14 @@ impl RaftNode {
     }
 
     pub async fn get_job_status(&self, job_id: &str) -> Option<JobLoadStatus> {
-        self.state_machine.read().await.jobs.get(job_id).cloned()
+        let cutoff_ms = self.job_stats_cutoff_ms().unwrap_or(0);
+        self.state_machine
+            .read()
+            .await
+            .jobs
+            .get(job_id)
+            .filter(|job| job.updated_at_ms >= cutoff_ms)
+            .cloned()
     }
 
     pub async fn get_cluster_snapshot(&self) -> ClusterSnapshot {
@@ -431,7 +494,10 @@ impl RaftNode {
                 core.last_applied,
             )
         };
-        let state = self.state_machine.read().await.clone();
+        let mut state = self.state_machine.read().await.clone();
+        if let Some(cutoff_ms) = self.job_stats_cutoff_ms() {
+            state.jobs.retain(|_, job| job.updated_at_ms >= cutoff_ms);
+        }
         ClusterSnapshot {
             node_id: self.config.node_id,
             role,
