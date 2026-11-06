@@ -12,10 +12,10 @@ libraryDependencies ++= Seq(
   "org.apache.spark" %% "spark-catalyst" % sparkVersion % "provided",
 
   // Apache Arrow Flight & Vector dependencies bundled into the fat-JAR
-  "org.apache.arrow" % "flight-core"         % arrowVersion,
-  "org.apache.arrow" % "flight-grpc"         % arrowVersion,
-  "org.apache.arrow" % "arrow-vector"        % arrowVersion,
-  "org.apache.arrow" % "arrow-memory-unsafe" % arrowVersion,
+  "org.apache.arrow" % "flight-core"        % arrowVersion,
+  "org.apache.arrow" % "flight-grpc"        % arrowVersion,
+  "org.apache.arrow" % "arrow-vector"       % arrowVersion,
+  "org.apache.arrow" % "arrow-memory-netty" % arrowVersion,
 
   // Testing
   "org.scalatest" %% "scalatest" % "3.2.19" % Test
@@ -41,8 +41,10 @@ assembly / assemblyMergeStrategy := {
         MergeStrategy.discard
       case _ => MergeStrategy.first
     }
-  case "module-info.class" => MergeStrategy.discard
-  case "git.properties"    => MergeStrategy.discard
+  case "module-info.class"    => MergeStrategy.discard
+  case "git.properties"       => MergeStrategy.discard
+  case "arrow-git.properties" => MergeStrategy.discard
+  case x if x.endsWith("DefaultAllocationManagerFactory.class") => MergeStrategy.first
   case x =>
     val oldStrategy = (assembly / assemblyMergeStrategy).value
     oldStrategy(x)
