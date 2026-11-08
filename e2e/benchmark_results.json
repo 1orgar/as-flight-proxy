@@ -1,0 +1,286 @@
+[
+  {
+    "case": "B01",
+    "description": "Single-Put (useBatchWrite=false)",
+    "rows": 100000,
+    "proxies": 2,
+    "partitions": 4,
+    "threads": 2,
+    "batch_size": 4096,
+    "batch_write": false,
+    "mode": "update",
+    "elapsed_s": 0.826,
+    "rps": 121045,
+    "batches": 28,
+    "retries": 0,
+    "per_node": {
+      "1": 49152,
+      "2": 50848
+    }
+  },
+  {
+    "case": "B02",
+    "description": "BatchWrite (useBatchWrite=true)",
+    "rows": 100000,
+    "proxies": 2,
+    "partitions": 4,
+    "threads": 2,
+    "batch_size": 4096,
+    "batch_write": true,
+    "mode": "update",
+    "elapsed_s": 0.251,
+    "rps": 397931,
+    "batches": 28,
+    "retries": 0,
+    "per_node": {
+      "1": 46328,
+      "2": 53672
+    }
+  },
+  {
+    "case": "B03",
+    "description": "1 Proxy Node (Single Node)",
+    "rows": 100000,
+    "proxies": 1,
+    "partitions": 4,
+    "threads": 2,
+    "batch_size": 8192,
+    "batch_write": true,
+    "mode": "update",
+    "elapsed_s": 0.248,
+    "rps": 403672,
+    "batches": 16,
+    "retries": 0,
+    "per_node": {
+      "1": 100000
+    }
+  },
+  {
+    "case": "B04",
+    "description": "2 Proxy Nodes (MPP Cluster)",
+    "rows": 100000,
+    "proxies": 2,
+    "partitions": 4,
+    "threads": 2,
+    "batch_size": 8192,
+    "batch_write": true,
+    "mode": "update",
+    "elapsed_s": 0.282,
+    "rps": 354943,
+    "batches": 16,
+    "retries": 0,
+    "per_node": {
+      "1": 50000,
+      "2": 50000
+    }
+  },
+  {
+    "case": "B05",
+    "description": "Small Arrow Batch (batchSize=512)",
+    "rows": 100000,
+    "proxies": 2,
+    "partitions": 4,
+    "threads": 2,
+    "batch_size": 512,
+    "batch_write": true,
+    "mode": "update",
+    "elapsed_s": 0.321,
+    "rps": 311518,
+    "batches": 196,
+    "retries": 0,
+    "per_node": {
+      "1": 48376,
+      "2": 51624
+    }
+  },
+  {
+    "case": "B06",
+    "description": "Medium Arrow Batch (batchSize=2048)",
+    "rows": 100000,
+    "proxies": 2,
+    "partitions": 4,
+    "threads": 2,
+    "batch_size": 2048,
+    "batch_write": true,
+    "mode": "update",
+    "elapsed_s": 0.245,
+    "rps": 408600,
+    "batches": 52,
+    "retries": 0,
+    "per_node": {
+      "1": 45904,
+      "2": 54096
+    }
+  },
+  {
+    "case": "B07",
+    "description": "Large Arrow Batch (batchSize=16384)",
+    "rows": 100000,
+    "proxies": 2,
+    "partitions": 4,
+    "threads": 2,
+    "batch_size": 16384,
+    "batch_write": true,
+    "mode": "update",
+    "elapsed_s": 0.272,
+    "rps": 367721,
+    "batches": 8,
+    "retries": 0,
+    "per_node": {
+      "1": 65536,
+      "2": 34464
+    }
+  },
+  {
+    "case": "B08",
+    "description": "Low Parallelism (2 part x 1 thread)",
+    "rows": 100000,
+    "proxies": 2,
+    "partitions": 2,
+    "threads": 1,
+    "batch_size": 8192,
+    "batch_write": true,
+    "mode": "update",
+    "elapsed_s": 0.273,
+    "rps": 366952,
+    "batches": 14,
+    "retries": 0,
+    "per_node": {
+      "1": 50000,
+      "2": 50000
+    }
+  },
+  {
+    "case": "B09",
+    "description": "High Parallelism (8 part x 2 threads)",
+    "rows": 100000,
+    "proxies": 2,
+    "partitions": 8,
+    "threads": 2,
+    "batch_size": 8192,
+    "batch_write": true,
+    "mode": "update",
+    "elapsed_s": 0.257,
+    "rps": 388533,
+    "batches": 16,
+    "retries": 0,
+    "per_node": {
+      "1": 46116,
+      "2": 53884
+    }
+  },
+  {
+    "case": "B10",
+    "description": "Max Parallelism (8 part x 4 threads)",
+    "rows": 100000,
+    "proxies": 2,
+    "partitions": 8,
+    "threads": 4,
+    "batch_size": 8192,
+    "batch_write": true,
+    "mode": "update",
+    "elapsed_s": 0.347,
+    "rps": 288521,
+    "batches": 16,
+    "retries": 0,
+    "per_node": {
+      "1": 37924,
+      "2": 62076
+    }
+  },
+  {
+    "case": "B11",
+    "description": "Replace Mode (writeMode=replace)",
+    "rows": 100000,
+    "proxies": 2,
+    "partitions": 8,
+    "threads": 2,
+    "batch_size": 8192,
+    "batch_write": true,
+    "mode": "replace",
+    "elapsed_s": 0.249,
+    "rps": 400924,
+    "batches": 16,
+    "retries": 0,
+    "per_node": {
+      "1": 42232,
+      "2": 57768
+    }
+  },
+  {
+    "case": "B12",
+    "description": "DQ Validation Mode (dq=true, Flat)",
+    "rows": 100000,
+    "proxies": 2,
+    "partitions": 8,
+    "threads": 2,
+    "batch_size": 8192,
+    "batch_write": true,
+    "mode": "DQ (Validate)",
+    "elapsed_s": 0.128,
+    "rps": 780924,
+    "batches": 16,
+    "retries": 0,
+    "per_node": {
+      "1": 50000,
+      "2": 50000
+    }
+  },
+  {
+    "case": "B13",
+    "description": "Complex CDT Write (List+Map+Struct)",
+    "rows": 100000,
+    "proxies": 2,
+    "partitions": 4,
+    "threads": 2,
+    "batch_size": 8192,
+    "batch_write": true,
+    "mode": "update",
+    "elapsed_s": 0.749,
+    "rps": 133556,
+    "batches": 16,
+    "retries": 0,
+    "per_node": {
+      "1": 57768,
+      "2": 42232
+    }
+  },
+  {
+    "case": "B14",
+    "description": "Complex CDT DQ Validate (NaN+CDTs)",
+    "rows": 100000,
+    "proxies": 2,
+    "partitions": 4,
+    "threads": 2,
+    "batch_size": 8192,
+    "batch_write": true,
+    "mode": "DQ (Validate)",
+    "elapsed_s": 0.406,
+    "rps": 246363,
+    "batches": 16,
+    "retries": 0,
+    "per_node": {
+      "1": 50000,
+      "2": 50000
+    }
+  },
+  {
+    "case": "B15",
+    "description": "Sustained Load (250k rows, 8p x 4t)",
+    "rows": 250000,
+    "proxies": 2,
+    "partitions": 8,
+    "threads": 4,
+    "batch_size": 8192,
+    "batch_write": true,
+    "mode": "replace",
+    "elapsed_s": 0.894,
+    "rps": 279675,
+    "batches": 32,
+    "retries": 0,
+    "per_node": {
+      "1": 123482,
+      "2": 126518
+    }
+  }
+]

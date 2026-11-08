@@ -443,6 +443,8 @@ docker compose -f docker-compose.e2e.yml up --abort-on-container-exit --exit-cod
 docker compose -f docker-compose.e2e.yml down
 ```
 
+Подробные результаты нагрузочного E2E-бенчмарка (15 прогонов с разными параметрами, до **408 600 строк/сек** на запись и **780 924 строк/сек** на DQ-валидацию) приведены в файле [`BENCHMARK.md`](BENCHMARK.md) (сырой JSON: [`e2e/benchmark_results.json`](e2e/benchmark_results.json), скрипт: [`e2e/run_e2e_bench.py`](e2e/run_e2e_bench.py)).
+
 ---
 
 ## 10. Roadmap развития проекта
