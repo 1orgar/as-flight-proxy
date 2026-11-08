@@ -628,7 +628,10 @@ impl RaftNode {
         self.apply_committed_entries().await;
 
         let committed = self.core.lock().await.commit_index >= entry_index;
-        if !committed {
+        if committed {
+            // Propagate the updated leader_commit index to followers so follower reads are immediately consistent
+            self.replicate_to_peers().await;
+        } else {
             debug!(
                 node_id = self.config.node_id,
                 entry_index, "Entry appended; waiting for async heartbeat replication"

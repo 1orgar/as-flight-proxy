@@ -1,0 +1,56 @@
+[server]
+listen_addr = "0.0.0.0:8815"
+metrics_addr = "0.0.0.0:9090"
+max_decoding_message_size_mb = 64
+http2_stream_window_size_mb = 16
+http2_connection_window_size_mb = 32
+tcp_nodelay = true
+
+[tls]
+enabled = false
+
+[auth]
+enabled = true
+username = "spark_loader"
+password = "super_secret_password"
+token_secret = "shared_cluster_hmac_secret_key_change_in_prod"
+token_ttl_secs = 3600
+
+[aerospike]
+hosts = "aerospike-1:3000,aerospike-2:3000"
+default_namespace = "test"
+default_set = "users"
+connect_timeout_ms = 5000
+timeout_ms = 2000
+max_conns_per_node = 128
+min_conns_per_node = 8
+conn_pools_per_node = 2
+max_bin_name_len = 15
+
+[writer]
+max_in_flight_records = 16384
+use_batch_write = true
+batch_write_size = 128
+max_batch_concurrency = 32
+default_write_mode = "update"
+default_ignore_nulls = false
+
+[retry]
+overload_initial_backoff_ms = 5
+overload_max_backoff_ms = 2000
+max_other_retries = 5
+other_initial_backoff_ms = 20
+other_max_backoff_ms = 1000
+
+[raft]
+enabled = true
+node_id = 1
+listen_addr = "0.0.0.0:8816"
+heartbeat_interval_ms = 50
+election_timeout_min_ms = 200
+election_timeout_max_ms = 400
+job_stats_ttl_secs = 3600
+peers = [
+    { node_id = 1, raft_addr = "proxy-1:8816", flight_addr = "proxy-1:8815" },
+    { node_id = 2, raft_addr = "proxy-2:8816", flight_addr = "proxy-2:8815" },
+]

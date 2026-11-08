@@ -109,47 +109,91 @@ object AerospikeFlightOptions {
       get(key).getOrElse(throw new IllegalArgumentException(s"Missing required option '$key'"))
 
     val jobId = get("connector.jobId")
+      .orElse(get("aerospike.job_id"))
+      .orElse(get("aerospike.jobId"))
       .orElse(get("job.id"))
       .getOrElse(s"as-load-${UUID.randomUUID().toString}")
 
-    val rawHosts = getOrElse("flight.hosts", "127.0.0.1:8815")
+    val rawHosts = get("flight.hosts")
+      .orElse(get("aerospike.flight.endpoint"))
+      .orElse(get("aerospike.flight.hosts"))
+      .getOrElse("127.0.0.1:8815")
     val hosts = parseHosts(rawHosts)
 
-    val username = getOrElse("flight.username", "")
-    val password = getOrElse("flight.password", "")
+    val username = get("flight.username")
+      .orElse(get("aerospike.flight.username"))
+      .getOrElse("")
+    val password = get("flight.password")
+      .orElse(get("aerospike.flight.password"))
+      .getOrElse("")
 
-    val tlsEnabled = getOrElse("flight.tls.enabled", "false").toBoolean
+    val tlsEnabled = get("flight.tls.enabled")
+      .orElse(get("aerospike.flight.tls.enabled"))
+      .getOrElse("false")
+      .toBoolean
     val tlsCaCertPath = get("flight.tls.caCertPath")
+      .orElse(get("aerospike.flight.tls.ca_cert_path"))
+      .orElse(get("aerospike.flight.tls.caCertPath"))
     val tlsClientCertPath = get("flight.tls.clientCertPath")
+      .orElse(get("aerospike.flight.tls.client_cert_path"))
+      .orElse(get("aerospike.flight.tls.clientCertPath"))
     val tlsClientKeyPath = get("flight.tls.clientKeyPath")
-    val tlsVerifyServer = getOrElse("flight.tls.verifyServer", "true").toBoolean
-    val timeoutMs = getOrElse("flight.timeoutMs", "60000").toLong
+      .orElse(get("aerospike.flight.tls.client_key_path"))
+      .orElse(get("aerospike.flight.tls.clientKeyPath"))
+    val tlsVerifyServer = get("flight.tls.verifyServer")
+      .orElse(get("aerospike.flight.tls.verify_server"))
+      .getOrElse("true")
+      .toBoolean
+    val timeoutMs = get("flight.timeoutMs")
+      .orElse(get("aerospike.flight.timeout_ms"))
+      .getOrElse("60000")
+      .toLong
 
     val namespace = if (requireWriteTarget) getRequired("aerospike.namespace") else getOrElse("aerospike.namespace", "")
     val setName = getOrElse("aerospike.set", "")
-    val keyColumn = if (requireWriteTarget) getRequired("aerospike.keyColumn") else getOrElse("aerospike.keyColumn", "")
+    val keyColumn = if (requireWriteTarget) {
+      get("aerospike.keyColumn")
+        .orElse(get("aerospike.key_column"))
+        .getOrElse(throw new IllegalArgumentException("Missing required option 'aerospike.keyColumn' (or 'aerospike.key_column')"))
+    } else {
+      get("aerospike.keyColumn").orElse(get("aerospike.key_column")).getOrElse("")
+    }
 
-    val writeMode = getOrElse("aerospike.writeMode", "update").toLowerCase
+    val writeMode = get("aerospike.writeMode")
+      .orElse(get("aerospike.write_mode"))
+      .getOrElse("update")
+      .toLowerCase
     if (!AllowedWriteModes.contains(writeMode)) {
       throw new IllegalArgumentException(
         s"Unsupported 'aerospike.writeMode' = '$writeMode'. Allowed: ${AllowedWriteModes.mkString(", ")}"
       )
     }
 
-    val ttlSeconds = get("aerospike.ttl").map(_.toLong)
-    val sendKey = getOrElse("aerospike.sendKey", "true").toBoolean
+    val ttlSeconds = get("aerospike.ttl").orElse(get("aerospike.ttl_seconds")).map(_.toLong)
+    val sendKey = get("aerospike.sendKey").orElse(get("aerospike.send_key")).getOrElse("true").toBoolean
     // Default is false: null values in update mode send Value::Nil to delete the bin
-    val ignoreNulls = getOrElse("aerospike.ignoreNulls", "false").toBoolean
-    val useBatchWrite = get("aerospike.useBatchWrite").map(_.toBoolean)
+    val ignoreNulls = get("aerospike.ignoreNulls").orElse(get("aerospike.ignore_nulls")).getOrElse("false").toBoolean
+    val useBatchWrite = get("aerospike.useBatchWrite").orElse(get("aerospike.use_batch_write")).map(_.toBoolean)
     val validateOnly = get("aerospike.dq")
       .orElse(get("aerospike.validateOnly"))
+      .orElse(get("aerospike.validate_only"))
       .orElse(get("connector.dq"))
       .map(_.toBoolean)
       .getOrElse(writeMode == "validate" || writeMode == "dq" || writeMode == "verify")
 
-    val batchSize = getOrElse("connector.batchSize", "8192").toInt
-    val writerThreads = getOrElse("connector.writerThreads", "4").toInt
+    val batchSize = get("connector.batchSize")
+      .orElse(get("aerospike.batch_size"))
+      .orElse(get("aerospike.batchSize"))
+      .getOrElse("8192")
+      .toInt
+    val writerThreads = get("connector.writerThreads")
+      .orElse(get("aerospike.writer_threads"))
+      .orElse(get("aerospike.writerThreads"))
+      .getOrElse("4")
+      .toInt
     val queueCapacity = get("connector.queueCapacity")
+      .orElse(get("aerospike.queue_capacity"))
+      .orElse(get("aerospike.queueCapacity"))
       .map(_.toInt)
       .getOrElse(math.max(writerThreads * 2, 4))
 

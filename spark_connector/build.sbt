@@ -24,10 +24,12 @@ libraryDependencies ++= Seq(
 // Include "provided" dependencies (spark-sql, spark-catalyst) on the Test runtime classpath
 Test / fullClasspath := (Test / fullClasspath).value ++ (Compile / managedClasspath).value
 
-// Shading rules to isolate gRPC, Protobuf, and Arrow from Hadoop / Spark 3.5 classpath conflicts
+// Shading rules to isolate gRPC, Protobuf, Guava, and Arrow from Hadoop / Spark 3.5 classpath conflicts
 assembly / assemblyShadeRules := Seq(
   ShadeRule.rename("io.grpc.**" -> "com.asproxy.shaded.io.grpc.@1").inAll,
-  ShadeRule.rename("com.google.protobuf.**" -> "com.asproxy.shaded.com.google.protobuf.@1").inAll
+  ShadeRule.rename("com.google.protobuf.**" -> "com.asproxy.shaded.com.google.protobuf.@1").inAll,
+  ShadeRule.rename("com.google.common.**" -> "com.asproxy.shaded.com.google.common.@1").inAll,
+  ShadeRule.rename("org.apache.arrow.**" -> "com.asproxy.shaded.org.apache.arrow.@1").inAll
 )
 
 assembly / assemblyMergeStrategy := {

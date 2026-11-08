@@ -25,3 +25,6 @@
 .idea/
 .vscode/
 *.iml
+
+# E2E downloaded / built binaries
+/e2e/artifacts/

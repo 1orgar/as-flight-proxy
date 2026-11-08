@@ -1,0 +1,114 @@
+services:
+  aerospike-1:
+    image: aerospike/aerospike-server:8.0
+    container_name: as-e2e-aerospike-1
+    hostname: aerospike-1
+    volumes:
+      - ./e2e/aerospike.conf:/etc/aerospike/custom.conf:ro
+    command: ["--config-file", "/etc/aerospike/custom.conf"]
+    ports:
+      - "3000:3000"
+    networks:
+      - as-e2e-net
+
+  aerospike-2:
+    image: aerospike/aerospike-server:8.0
+    container_name: as-e2e-aerospike-2
+    hostname: aerospike-2
+    volumes:
+      - ./e2e/aerospike.conf:/etc/aerospike/custom.conf:ro
+    command: ["--config-file", "/etc/aerospike/custom.conf"]
+    ports:
+      - "3010:3000"
+    networks:
+      - as-e2e-net
+
+  proxy-1:
+    image: ubuntu:24.04
+    container_name: as-e2e-proxy-1
+    hostname: proxy-1
+    depends_on:
+      - aerospike-1
+      - aerospike-2
+    volumes:
+      - ./e2e/artifacts/as_proxy_server:/usr/local/bin/as_proxy_server:ro
+      - ./e2e/proxy-1.toml:/etc/as_proxy/proxy.toml:ro
+    environment:
+      - RUST_LOG=info
+    command:
+      - /bin/bash
+      - -c
+      - |
+        for i in {1..30}; do
+          if (echo > /dev/tcp/aerospike-1/3000) >/dev/null 2>&1 && (echo > /dev/tcp/aerospike-2/3000) >/dev/null 2>&1; then
+            break
+          fi
+          sleep 1
+        done
+        sleep 2
+        exec /usr/local/bin/as_proxy_server --config /etc/as_proxy/proxy.toml
+    ports:
+      - "8815:8815"
+      - "8816:8816"
+      - "9090:9090"
+    networks:
+      - as-e2e-net
+
+  proxy-2:
+    image: ubuntu:24.04
+    container_name: as-e2e-proxy-2
+    hostname: proxy-2
+    depends_on:
+      - aerospike-1
+      - aerospike-2
+    volumes:
+      - ./e2e/artifacts/as_proxy_server:/usr/local/bin/as_proxy_server:ro
+      - ./e2e/proxy-2.toml:/etc/as_proxy/proxy.toml:ro
+    environment:
+      - RUST_LOG=info
+    command:
+      - /bin/bash
+      - -c
+      - |
+        for i in {1..30}; do
+          if (echo > /dev/tcp/aerospike-1/3000) >/dev/null 2>&1 && (echo > /dev/tcp/aerospike-2/3000) >/dev/null 2>&1; then
+            break
+          fi
+          sleep 1
+        done
+        sleep 2
+        exec /usr/local/bin/as_proxy_server --config /etc/as_proxy/proxy.toml
+    ports:
+      - "8825:8815"
+      - "8826:8816"
+      - "9091:9090"
+    networks:
+      - as-e2e-net
+
+  spark-e2e:
+    image: apache/spark:3.5.2-scala2.12-java17-python3-ubuntu
+    container_name: as-e2e-spark
+    user: root
+    depends_on:
+      - proxy-1
+      - proxy-2
+    volumes:
+      - ./e2e:/e2e:ro
+    command:
+      - /bin/bash
+      - -c
+      - |
+        set -e
+        pip3 install --quiet pyarrow
+        /opt/spark/bin/spark-submit \
+          --master "local[4]" \
+          --driver-java-options "--add-opens=java.base/java.nio=ALL-UNNAMED --add-opens=java.base/sun.nio.ch=ALL-UNNAMED" \
+          --conf "spark.executor.extraJavaOptions=--add-opens=java.base/java.nio=ALL-UNNAMED --add-opens=java.base/sun.nio.ch=ALL-UNNAMED" \
+          --jars /e2e/artifacts/spark-aerospike-flight-connector-assembly-0.1.0.jar \
+          /e2e/run_e2e_test.py
+    networks:
+      - as-e2e-net
+
+networks:
+  as-e2e-net:
+    driver: bridge

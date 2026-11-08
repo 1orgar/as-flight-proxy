@@ -427,6 +427,22 @@ sbt assembly
 2. `as_proxy_server-linux-arm64` — бинарник прокси-сервера для Linux `ARM64` (`aarch64`).
 3. `spark-aerospike-flight-connector-assembly-0.1.0.jar` — Fat-JAR коннектора для Spark 3.5.
 
+### Запуск полного E2E-стенда (Docker Compose)
+В репозитории подготовлен симметричный E2E-стенд ([`docker-compose.e2e.yml`](docker-compose.e2e.yml) и [`e2e/run_e2e_test.py`](e2e/run_e2e_test.py)), поднимающий **2 ноды Aerospike 8.0 CE** в mesh-кластере (`replication-factor 2`), **2 ноды `as_proxy_server`** в Raft-кластере и контейнер **Spark 3.5 PySpark**:
+
+```bash
+# 1. Скачать бинарник прокси (x86_64 или arm64) и Fat-JAR коннектора из релиза v0.1.0 в e2e/artifacts/
+mkdir -p e2e/artifacts
+ARCH=$(uname -m | sed 's/aarch64/arm64/')
+curl -sL "https://github.com/1orgar/as-flight-proxy/releases/download/v0.1.0/as_proxy_server-linux-${ARCH}" -o e2e/artifacts/as_proxy_server
+chmod +x e2e/artifacts/as_proxy_server
+curl -sL "https://github.com/1orgar/as-flight-proxy/releases/download/v0.1.0/spark-aerospike-flight-connector-assembly-0.1.0.jar" -o e2e/artifacts/spark-aerospike-flight-connector-assembly-0.1.0.jar
+
+# 2. Запустить E2E-тест (запись 500 строк + проверка Raft + позитивный и негативный DQ)
+docker compose -f docker-compose.e2e.yml up --abort-on-container-exit --exit-code-from spark-e2e
+docker compose -f docker-compose.e2e.yml down
+```
+
 ---
 
 ## 10. Roadmap развития проекта
