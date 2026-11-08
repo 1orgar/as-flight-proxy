@@ -5,6 +5,7 @@ import org.apache.arrow.flight._
 import org.apache.arrow.memory.{BufferAllocator, RootAllocator}
 import org.apache.arrow.vector.{VectorLoader, VectorSchemaRoot, VectorUnloader}
 import org.apache.arrow.vector.ipc.message.ArrowRecordBatch
+import org.apache.spark.internal.Logging
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.connector.metric.CustomTaskMetric
 import org.apache.spark.sql.connector.write.{DataWriter, WriterCommitMessage}
@@ -22,13 +23,26 @@ class AerospikeFlightDataWriter(
     taskId: Long,
     sparkSchema: StructType,
     options: AerospikeFlightOptions
-) extends DataWriter[InternalRow] {
+) extends DataWriter[InternalRow]
+    with Logging {
 
   private val startTimeMs: Long = System.currentTimeMillis()
   private val rootAllocator: BufferAllocator = new RootAllocator(Long.MaxValue)
-  private val arrowSchema = ArrowSchemaConverter.toArrowSchema(sparkSchema)
+  private val arrowSchema = ArrowSchemaConverter.toArrowSchema(
+    sparkSchema = sparkSchema,
+    timeZoneId = "UTC",
+    keyColumn = options.keyColumn,
+    ignoreNulls = options.shouldOmitNullsInFlight,
+    validateOnly = options.validateOnly
+  )
   private val stagingRoot: VectorSchemaRoot = VectorSchemaRoot.create(arrowSchema, rootAllocator)
-  private val batchConverter = new ArrowBatchConverter(sparkSchema, options.keyColumn, stagingRoot)
+  private val batchConverter = new ArrowBatchConverter(
+    sparkSchema = sparkSchema,
+    keyColumn = options.keyColumn,
+    root = stagingRoot,
+    ignoreNulls = options.shouldOmitNullsInFlight,
+    validateOnly = options.validateOnly
+  )
 
   private val batchQueue = new ArrayBlockingQueue[Option[ArrowRecordBatch]](options.queueCapacity)
   private val workerError = new AtomicReference[Throwable](null)
@@ -59,6 +73,19 @@ class AerospikeFlightDataWriter(
       override def run(): Unit = runSenderLoop(threadIdx)
     })
   }
+
+  private val assignedEndpointsStr: String = (0 until options.writerThreads)
+    .map(w => options.endpointFor(partitionId, w))
+    .map(ep => s"${ep.host}:${ep.port}")
+    .distinct
+    .mkString(", ")
+
+  logInfo(
+    s"[Executor][Write] Initialized writer for partition=$partitionId, task=$taskId, " +
+      s"jobId='${options.jobId}', target='${options.namespace}.${options.setName}', " +
+      s"writeMode='${options.writeMode}', validateOnly=${options.validateOnly}, " +
+      s"writerThreads=${options.writerThreads}, batchSize=${options.batchSize}, endpoints=[$assignedEndpointsStr]"
+  )
 
   batchConverter.reset()
 
@@ -95,6 +122,14 @@ class AerospikeFlightDataWriter(
       }
       checkWorkerFailure()
 
+      val elapsedMs = math.max(0L, System.currentTimeMillis() - startTimeMs)
+      logInfo(
+        s"[Executor][Write] Committed partition=$partitionId, task=$taskId, jobId='${options.jobId}' " +
+          s"in ${elapsedMs}ms: rowsWritten=${rowsWrittenCounter.get()}, batchesSent=${batchesSentCounter.get()}, " +
+          s"overloadRetries=${overloadRetriesCounter.get()}, otherRetries=${otherRetriesCounter.get()}, " +
+          s"rowsValidated=${rowsValidatedCounter.get()}, mismatchedRows=${mismatchedRowsCounter.get()}"
+      )
+
       AerospikeFlightCommitMessage(
         partitionId = partitionId,
         taskId = taskId,
@@ -102,7 +137,7 @@ class AerospikeFlightDataWriter(
         batchesSent = batchesSentCounter.get(),
         overloadRetries = overloadRetriesCounter.get(),
         otherRetries = otherRetriesCounter.get(),
-        elapsedMs = math.max(0L, System.currentTimeMillis() - startTimeMs),
+        elapsedMs = elapsedMs,
         rowsValidated = rowsValidatedCounter.get(),
         matchedRows = matchedRowsCounter.get(),
         mismatchedRows = mismatchedRowsCounter.get(),
@@ -115,6 +150,10 @@ class AerospikeFlightDataWriter(
   }
 
   override def abort(): Unit = {
+    logWarning(
+      s"[Executor][Write] Aborting writer for partition=$partitionId, task=$taskId, jobId='${options.jobId}' " +
+        s"(rowsWrittenSoFar=${rowsWrittenCounter.get()}, batchesSentSoFar=${batchesSentCounter.get()})"
+    )
     try {
       executor.shutdownNow()
       drainQueue()
@@ -227,11 +266,22 @@ class AerospikeFlightDataWriter(
                       metaBuf.getBytes(metaBuf.readerIndex(), bytes)
                       val jsonNode = mapper.readTree(bytes)
                       if (jsonNode != null) {
-                        if (jsonNode.has("overload_retries")) {
-                          overloadRetriesCounter.addAndGet(jsonNode.get("overload_retries").asLong(0L))
-                        }
-                        if (jsonNode.has("other_retries")) {
-                          otherRetriesCounter.addAndGet(jsonNode.get("other_retries").asLong(0L))
+                        val batchOverload = if (jsonNode.has("overload_retries")) {
+                          val v = jsonNode.get("overload_retries").asLong(0L)
+                          overloadRetriesCounter.addAndGet(v)
+                          v
+                        } else 0L
+                        val batchOther = if (jsonNode.has("other_retries")) {
+                          val v = jsonNode.get("other_retries").asLong(0L)
+                          otherRetriesCounter.addAndGet(v)
+                          v
+                        } else 0L
+                        if (batchOverload > 0L || batchOther > 0L) {
+                          logWarning(
+                            s"[Executor][Write] Partition=$partitionId, task=$taskId, worker=$threadIdx " +
+                              s"(${endpoint.host}:${endpoint.port}) batch experienced retries on proxy: " +
+                              s"overloadRetries=$batchOverload, otherRetries=$batchOther"
+                          )
                         }
                         if (jsonNode.has("rows_validated")) {
                           rowsValidatedCounter.addAndGet(jsonNode.get("rows_validated").asLong(0L))
@@ -269,6 +319,10 @@ class AerospikeFlightDataWriter(
       }
     } catch {
       case t: Throwable =>
+        logError(
+          s"[Executor][Write] Sender worker=$threadIdx failed in partition=$partitionId, task=$taskId, jobId='${options.jobId}': ${t.getMessage}",
+          t
+        )
         workerError.compareAndSet(null, t)
         drainQueue()
     } finally {

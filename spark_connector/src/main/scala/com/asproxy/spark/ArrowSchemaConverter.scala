@@ -1,21 +1,106 @@
 package com.asproxy.spark
 
 import org.apache.arrow.vector.complex.MapVector
+import org.apache.arrow.vector.ipc.WriteChannel
+import org.apache.arrow.vector.ipc.message.MessageSerializer
 import org.apache.arrow.vector.types.{DateUnit, FloatingPointPrecision, TimeUnit}
 import org.apache.arrow.vector.types.pojo.{ArrowType, Field, FieldType, Schema}
 import org.apache.spark.sql.types._
 
-import java.util.Collections
+import java.io.ByteArrayOutputStream
+import java.nio.channels.Channels
+import java.util.{Base64, Collections}
 import scala.collection.JavaConverters._
 
 /**
- * Converts a Spark SQL `StructType` schema into an Apache Arrow `Schema`.
+ * Converts between Spark SQL `StructType` schemas and Apache Arrow `Schema`s.
  * Supports primitive types, Date/Timestamp, Decimal, and nested Array/Map/Struct types.
  */
 object ArrowSchemaConverter {
 
-  def toArrowSchema(sparkSchema: StructType, timeZoneId: String = "UTC"): Schema = {
-    val fields = sparkSchema.fields.map(f => toArrowField(f.name, f.dataType, f.nullable, timeZoneId))
+  def toArrowSchemaIpcBase64(sparkSchema: StructType, timeZoneId: String = "UTC"): String = {
+    val arrowSchema = toArrowSchema(sparkSchema, timeZoneId)
+    val baos = new ByteArrayOutputStream()
+    val writeChannel = new WriteChannel(Channels.newChannel(baos))
+    MessageSerializer.serialize(writeChannel, arrowSchema)
+    Base64.getEncoder.encodeToString(baos.toByteArray)
+  }
+
+  def fromArrowSchema(arrowSchema: Schema): StructType = {
+    val fields = arrowSchema.getFields.asScala.map(fromArrowField)
+    StructType(fields)
+  }
+
+  def fromArrowField(field: Field): StructField = {
+    val dt = fromArrowType(field)
+    StructField(field.getName, dt, nullable = field.isNullable)
+  }
+
+  private def fromArrowType(field: Field): DataType = {
+    val children = field.getChildren.asScala
+    field.getType match {
+      case _: ArrowType.Null => NullType
+      case _: ArrowType.Bool => BooleanType
+      case intType: ArrowType.Int =>
+        intType.getBitWidth match {
+          case 8 => ByteType
+          case 16 => ShortType
+          case 32 => IntegerType
+          case 64 => LongType
+          case other =>
+            throw new UnsupportedOperationException(s"Unsupported Arrow Int bitWidth $other in field '${field.getName}'")
+        }
+      case fpType: ArrowType.FloatingPoint =>
+        fpType.getPrecision match {
+          case FloatingPointPrecision.SINGLE => FloatType
+          case FloatingPointPrecision.DOUBLE => DoubleType
+          case other =>
+            throw new UnsupportedOperationException(s"Unsupported Arrow FloatingPoint precision $other in field '${field.getName}'")
+        }
+      case decType: ArrowType.Decimal =>
+        DecimalType(decType.getPrecision, decType.getScale)
+      case _: ArrowType.Utf8 | _: ArrowType.LargeUtf8 => StringType
+      case _: ArrowType.Binary | _: ArrowType.LargeBinary | _: ArrowType.FixedSizeBinary => BinaryType
+      case _: ArrowType.Date => DateType
+      case _: ArrowType.Timestamp => TimestampType
+      case _: ArrowType.List | _: ArrowType.LargeList | _: ArrowType.FixedSizeList =>
+        if (children.isEmpty) {
+          ArrayType(StringType, containsNull = true)
+        } else {
+          val elemField = children.head
+          ArrayType(fromArrowType(elemField), containsNull = elemField.isNullable)
+        }
+      case _: ArrowType.Map =>
+        if (children.isEmpty || children.head.getChildren.size() < 2) {
+          MapType(StringType, StringType, valueContainsNull = true)
+        } else {
+          val entriesStruct = children.head
+          val keyField = entriesStruct.getChildren.get(0)
+          val valField = entriesStruct.getChildren.get(1)
+          MapType(fromArrowType(keyField), fromArrowType(valField), valueContainsNull = valField.isNullable)
+        }
+      case _: ArrowType.Struct =>
+        StructType(children.map(fromArrowField))
+      case other =>
+        throw new UnsupportedOperationException(
+          s"Unsupported ArrowType '$other' in field '${field.getName}'"
+        )
+    }
+  }
+
+  def toArrowSchema(
+      sparkSchema: StructType,
+      timeZoneId: String = "UTC",
+      keyColumn: String = "",
+      ignoreNulls: Boolean = false,
+      validateOnly: Boolean = false
+  ): Schema = {
+    val effectiveFields = if (ignoreNulls && !validateOnly) {
+      sparkSchema.fields.filter(f => f.name == keyColumn || f.dataType != NullType)
+    } else {
+      sparkSchema.fields
+    }
+    val fields = effectiveFields.map(f => toArrowField(f.name, f.dataType, f.nullable, timeZoneId))
     new Schema(fields.toList.asJava)
   }
 
@@ -26,6 +111,9 @@ object ArrowSchemaConverter {
       timeZoneId: String = "UTC"
   ): Field = {
     dataType match {
+      case NullType =>
+        new Field(name, new FieldType(true, ArrowType.Null.INSTANCE, null), Collections.emptyList())
+
       case BooleanType =>
         new Field(name, new FieldType(nullable, ArrowType.Bool.INSTANCE, null), Collections.emptyList())
 

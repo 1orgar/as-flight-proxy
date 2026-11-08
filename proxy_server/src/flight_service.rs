@@ -1,12 +1,16 @@
+use arrow_array::RecordBatch;
 use arrow_flight::decode::{DecodedPayload, FlightDataDecoder};
+use arrow_flight::encode::FlightDataEncoderBuilder;
 use arrow_flight::error::FlightError;
 use arrow_flight::flight_service_server::FlightService;
 use arrow_flight::{
     Action, ActionType, Criteria, Empty, FlightData, FlightDescriptor, FlightInfo,
     HandshakeRequest, HandshakeResponse, PollInfo, PutResult, SchemaResult, Ticket,
 };
+use arrow_schema::{Field, Schema};
 use bytes::Bytes;
 use futures::stream::{self, BoxStream, StreamExt, TryStreamExt};
+use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -16,12 +20,19 @@ use tonic::{Request, Response, Status, Streaming};
 use tracing::{debug, error, info};
 
 use crate::auth::Authenticator;
-use crate::config::WriteParameters;
-use crate::converter::convert_record_batch;
+use crate::config::{
+    InferSchemaRequest, LookupExchangeParams, LookupJoinType, ReadModeSpec, ReadTicket,
+    WriteParameters,
+};
+use crate::converter::{
+    ScannedRecord, build_lookup_record_batch, convert_record_batch,
+    decode_arrow_schema_ipc_base64, encode_arrow_schema_to_result, extract_keys_from_batch,
+    infer_arrow_schema_from_records, records_to_record_batch,
+};
 use crate::error::ProxyError;
 use crate::metrics::ProxyMetrics;
 use crate::raft::{JobState, MetadataCommand, RaftNode, now_ms};
-use crate::writer::MppWriteEngine;
+use crate::writer::{MppWriteEngine, RecordReadOutcome};
 
 /// JSON payload returned in `PutResult.app_metadata` after each `RecordBatch` is committed or validated.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -482,23 +493,520 @@ impl FlightService for ProxyFlightService {
 
     async fn get_schema(
         &self,
-        _request: Request<FlightDescriptor>,
+        request: Request<FlightDescriptor>,
     ) -> Result<Response<SchemaResult>, Status> {
-        Err(Status::unimplemented("get_schema is not supported"))
+        self.authenticator
+            .verify_metadata(request.metadata())
+            .map_err(Status::from)?;
+
+        let descriptor = request.into_inner();
+        let infer_req: InferSchemaRequest =
+            serde_json::from_slice(&descriptor.cmd).map_err(|e| {
+                Status::invalid_argument(format!(
+                    "Failed to parse InferSchemaRequest JSON from FlightDescriptor.cmd: {e}"
+                ))
+            })?;
+        infer_req.validate().map_err(Status::from)?;
+
+        let start = std::time::Instant::now();
+        let sample_size = infer_req.sample_size.max(1);
+        let mut rx = self
+            .write_engine
+            .scan_partition_range(
+                &infer_req.namespace,
+                &infer_req.set_name,
+                0,
+                4096,
+                None,
+                Some(sample_size as u64),
+            )
+            .await
+            .map_err(Status::from)?;
+
+        let mut sampled_records = Vec::with_capacity(sample_size.min(4096));
+        while let Some(res) = rx.recv().await {
+            let rec = res.map_err(Status::from)?;
+            sampled_records.push(rec);
+            if sampled_records.len() >= sample_size {
+                break;
+            }
+        }
+
+        let elapsed_micros = start.elapsed().as_micros() as u64;
+        self.metrics.observe_read_latency_micros(elapsed_micros);
+
+        let schema = infer_arrow_schema_from_records(&infer_req.key_column, &sampled_records);
+        let node_id = self.raft_node.as_ref().map(|r| r.node_id()).unwrap_or(1);
+        info!(
+            node_id,
+            namespace = %infer_req.namespace,
+            set_name = %infer_req.set_name,
+            sampled = sampled_records.len(),
+            inferred_fields = schema.fields().len(),
+            elapsed_ms = elapsed_micros / 1000,
+            "Completed Arrow Flight GetSchema inference"
+        );
+        let schema_result = encode_arrow_schema_to_result(&schema).map_err(Status::from)?;
+        Ok(Response::new(schema_result))
     }
 
     async fn do_get(
         &self,
-        _request: Request<Ticket>,
+        request: Request<Ticket>,
     ) -> Result<Response<Self::DoGetStream>, Status> {
-        Err(Status::unimplemented("do_get is not supported"))
+        self.authenticator
+            .verify_metadata(request.metadata())
+            .map_err(Status::from)?;
+
+        let ticket = request.into_inner();
+        let read_ticket: ReadTicket = serde_json::from_slice(&ticket.ticket).map_err(|e| {
+            Status::invalid_argument(format!("Failed to parse ReadTicket JSON from Ticket: {e}"))
+        })?;
+        read_ticket.validate().map_err(Status::from)?;
+
+        let target_schema = decode_arrow_schema_ipc_base64(&read_ticket.schema_ipc_base64)
+            .map_err(Status::from)?;
+
+        let requested_bins: Vec<String> = if !read_ticket.bins.is_empty() {
+            read_ticket.bins.clone()
+        } else {
+            target_schema
+                .fields()
+                .iter()
+                .filter(|f| f.name() != &read_ticket.key_column)
+                .map(|f| f.name().clone())
+                .collect()
+        };
+
+        let write_engine = Arc::clone(&self.write_engine);
+        let metrics = Arc::clone(&self.metrics);
+        let schema_for_task = Arc::clone(&target_schema);
+        let batch_size = read_ticket.batch_size.max(1);
+        let node_id = self.raft_node.as_ref().map(|r| r.node_id()).unwrap_or(1);
+
+        let (batch_tx, batch_rx) =
+            mpsc::channel::<std::result::Result<RecordBatch, FlightError>>(8);
+
+        tokio::spawn(async move {
+            let _stream_guard = ActiveStreamGuard::new(Arc::clone(&metrics));
+            let stream_start = std::time::Instant::now();
+            let mut total_rows_emitted: usize = 0;
+            let mut total_batches_emitted: usize = 0;
+
+            match read_ticket.read_mode {
+                ReadModeSpec::PartitionRange {
+                    begin_partition,
+                    partition_count,
+                } => {
+                    let scan_start = std::time::Instant::now();
+                    let mut rx = match write_engine
+                        .scan_partition_range(
+                            &read_ticket.namespace,
+                            &read_ticket.set_name,
+                            begin_partition,
+                            partition_count,
+                            Some(requested_bins),
+                            None,
+                        )
+                        .await
+                    {
+                        Ok(r) => r,
+                        Err(e) => {
+                            let _ = batch_tx
+                                .send(Err(FlightError::Tonic(Box::new(Status::from(e)))))
+                                .await;
+                            return;
+                        }
+                    };
+
+                    let mut buffer: Vec<ScannedRecord> = Vec::with_capacity(batch_size);
+                    while let Some(res) = rx.recv().await {
+                        match res {
+                            Ok(rec) => {
+                                buffer.push(rec);
+                                if buffer.len() >= batch_size {
+                                    match records_to_record_batch(
+                                        &schema_for_task,
+                                        &read_ticket.key_column,
+                                        &buffer,
+                                        read_ticket.type_mismatch_mode,
+                                    ) {
+                                        Ok(rb) => {
+                                            let rows = rb.num_rows();
+                                            total_rows_emitted += rows;
+                                            total_batches_emitted += 1;
+                                            metrics.inc_records_read(rows as u64);
+                                            metrics.inc_read_batches();
+                                            buffer.clear();
+                                            if batch_tx.send(Ok(rb)).await.is_err() {
+                                                return;
+                                            }
+                                        }
+                                        Err(e) => {
+                                            let _ = batch_tx
+                                                .send(Err(FlightError::Tonic(Box::new(
+                                                    Status::from(e),
+                                                ))))
+                                                .await;
+                                            return;
+                                        }
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                let _ = batch_tx
+                                    .send(Err(FlightError::Tonic(Box::new(Status::from(e)))))
+                                    .await;
+                                return;
+                            }
+                        }
+                    }
+
+                    if !buffer.is_empty() {
+                        match records_to_record_batch(
+                            &schema_for_task,
+                            &read_ticket.key_column,
+                            &buffer,
+                            read_ticket.type_mismatch_mode,
+                        ) {
+                            Ok(rb) => {
+                                let rows = rb.num_rows();
+                                total_rows_emitted += rows;
+                                total_batches_emitted += 1;
+                                metrics.inc_records_read(rows as u64);
+                                metrics.inc_read_batches();
+                                let _ = batch_tx.send(Ok(rb)).await;
+                            }
+                            Err(e) => {
+                                let _ = batch_tx
+                                    .send(Err(FlightError::Tonic(Box::new(Status::from(e)))))
+                                    .await;
+                            }
+                        }
+                    }
+
+                    metrics.observe_read_latency_micros(scan_start.elapsed().as_micros() as u64);
+                    info!(
+                        node_id,
+                        namespace = %read_ticket.namespace,
+                        set_name = %read_ticket.set_name,
+                        begin_partition,
+                        partition_count,
+                        batches = total_batches_emitted,
+                        rows = total_rows_emitted,
+                        elapsed_ms = stream_start.elapsed().as_millis() as u64,
+                        "Completed Arrow Flight DoGet PartitionRange stream"
+                    );
+                }
+
+                ReadModeSpec::BatchKeys { keys } => {
+                    let mut as_keys = Vec::with_capacity(keys.len());
+                    for lit in &keys {
+                        match lit.to_key(&read_ticket.namespace, &read_ticket.set_name) {
+                            Ok(k) => as_keys.push(k),
+                            Err(e) => {
+                                let _ = batch_tx
+                                    .send(Err(FlightError::Tonic(Box::new(Status::from(e)))))
+                                    .await;
+                                return;
+                            }
+                        }
+                    }
+
+                    for chunk in as_keys.chunks(batch_size) {
+                        let outcomes = match write_engine
+                            .read_keys(chunk.to_vec(), Some(requested_bins.clone()))
+                            .await
+                        {
+                            Ok(o) => o,
+                            Err(e) => {
+                                let _ = batch_tx
+                                    .send(Err(FlightError::Tonic(Box::new(Status::from(e)))))
+                                    .await;
+                                return;
+                            }
+                        };
+
+                        let mut found_records = Vec::with_capacity(chunk.len());
+                        for (key, outcome) in chunk.iter().zip(outcomes.into_iter()) {
+                            if let RecordReadOutcome::Found(map) = outcome {
+                                let mut bins = IndexMap::with_capacity(map.len());
+                                for (k, v) in map {
+                                    bins.insert(k, v);
+                                }
+                                found_records.push(ScannedRecord {
+                                    key: Some(key.clone()),
+                                    bins,
+                                });
+                            }
+                        }
+
+                        if !found_records.is_empty() {
+                            match records_to_record_batch(
+                                &schema_for_task,
+                                &read_ticket.key_column,
+                                &found_records,
+                                read_ticket.type_mismatch_mode,
+                            ) {
+                                Ok(rb) => {
+                                    let rows = rb.num_rows();
+                                    total_rows_emitted += rows;
+                                    total_batches_emitted += 1;
+                                    metrics.inc_records_read(rows as u64);
+                                    metrics.inc_read_batches();
+                                    if batch_tx.send(Ok(rb)).await.is_err() {
+                                        return;
+                                    }
+                                }
+                                Err(e) => {
+                                    let _ = batch_tx
+                                        .send(Err(FlightError::Tonic(Box::new(Status::from(e)))))
+                                        .await;
+                                    return;
+                                }
+                            }
+                        }
+                    }
+
+                    info!(
+                        node_id,
+                        namespace = %read_ticket.namespace,
+                        set_name = %read_ticket.set_name,
+                        requested_keys = keys.len(),
+                        batches = total_batches_emitted,
+                        rows = total_rows_emitted,
+                        elapsed_ms = stream_start.elapsed().as_millis() as u64,
+                        "Completed Arrow Flight DoGet BatchKeys stream"
+                    );
+                }
+            }
+        });
+
+        let encoded_stream = FlightDataEncoderBuilder::new()
+            .with_schema(target_schema)
+            .build(ReceiverStream::new(batch_rx))
+            .map_err(Status::from)
+            .boxed();
+
+        Ok(Response::new(encoded_stream))
     }
 
     async fn do_exchange(
         &self,
-        _request: Request<Streaming<FlightData>>,
+        request: Request<Streaming<FlightData>>,
     ) -> Result<Response<Self::DoExchangeStream>, Status> {
-        Err(Status::unimplemented("do_exchange is not supported"))
+        self.authenticator
+            .verify_metadata(request.metadata())
+            .map_err(Status::from)?;
+
+        let flight_data_stream = request.into_inner().map_err(FlightError::from);
+        let mut decoder = FlightDataDecoder::new(flight_data_stream);
+
+        let write_engine = Arc::clone(&self.write_engine);
+        let metrics = Arc::clone(&self.metrics);
+        let node_id = self.raft_node.as_ref().map(|r| r.node_id()).unwrap_or(1);
+
+        let (batch_tx, batch_rx) =
+            mpsc::channel::<std::result::Result<RecordBatch, FlightError>>(8);
+
+        tokio::spawn(async move {
+            let _stream_guard = ActiveStreamGuard::new(Arc::clone(&metrics));
+            let stream_start = std::time::Instant::now();
+            let mut lookup_params: Option<LookupExchangeParams> = None;
+            let mut bins_schema: Option<Arc<Schema>> = None;
+            let mut requested_bins: Vec<String> = Vec::new();
+            let mut out_schema_opt: Option<Arc<Schema>> = None;
+            let mut sent_any_batch = false;
+            let mut total_keys_req: usize = 0;
+            let mut total_keys_found: usize = 0;
+            let mut total_rows_out: usize = 0;
+            let mut total_batches_out: usize = 0;
+
+            while let Some(decoded_res) = decoder.next().await {
+                let decoded = match decoded_res {
+                    Ok(d) => d,
+                    Err(e) => {
+                        let _ = batch_tx.send(Err(e)).await;
+                        return;
+                    }
+                };
+
+                if lookup_params.is_none() {
+                    if let Some(ref desc) = decoded.inner.flight_descriptor {
+                        match serde_json::from_slice::<LookupExchangeParams>(&desc.cmd) {
+                            Ok(p) => {
+                                if let Err(e) = p.validate() {
+                                    let _ = batch_tx
+                                        .send(Err(FlightError::Tonic(Box::new(Status::from(e)))))
+                                        .await;
+                                    return;
+                                }
+                                match decode_arrow_schema_ipc_base64(&p.bins_schema_ipc_base64) {
+                                    Ok(bs) => {
+                                        requested_bins = bs
+                                            .fields()
+                                            .iter()
+                                            .filter(|f| f.name() != &p.key_column)
+                                            .map(|f| f.name().clone())
+                                            .collect();
+                                        bins_schema = Some(bs);
+                                        lookup_params = Some(p);
+                                    }
+                                    Err(e) => {
+                                        let _ = batch_tx
+                                            .send(Err(FlightError::Tonic(Box::new(Status::from(
+                                                e,
+                                            )))))
+                                            .await;
+                                        return;
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                let _ = batch_tx
+                                    .send(Err(FlightError::Tonic(Box::new(
+                                        Status::invalid_argument(format!(
+                                            "Invalid LookupExchangeParams JSON: {e}"
+                                        )),
+                                    ))))
+                                    .await;
+                                return;
+                            }
+                        }
+                    }
+                }
+
+                match decoded.payload {
+                    DecodedPayload::None => {}
+                    DecodedPayload::Schema(input_schema) => {
+                        if let (Some(p), Some(bs)) = (&lookup_params, &bins_schema) {
+                            let mut fields: Vec<Arc<Field>> =
+                                input_schema.fields().iter().cloned().collect();
+                            for f in bs.fields() {
+                                if f.name() == &p.key_column
+                                    && input_schema.index_of(&p.key_column).is_ok()
+                                {
+                                    continue;
+                                }
+                                let nullable =
+                                    f.is_nullable() || p.join_type == LookupJoinType::Left;
+                                fields.push(Arc::new(f.as_ref().clone().with_nullable(nullable)));
+                            }
+                            out_schema_opt = Some(Arc::new(Schema::new(fields)));
+                        }
+                    }
+                    DecodedPayload::RecordBatch(input_batch) => {
+                        let (Some(p), Some(bs)) = (&lookup_params, &bins_schema) else {
+                            let _ = batch_tx
+                                .send(Err(FlightError::Tonic(Box::new(
+                                    Status::invalid_argument(
+                                        "Missing LookupExchangeParams FlightDescriptor before RecordBatch",
+                                    ),
+                                ))))
+                                .await;
+                            return;
+                        };
+
+                        let keys = match extract_keys_from_batch(
+                            &input_batch,
+                            &p.namespace,
+                            &p.set_name,
+                            &p.key_column,
+                        ) {
+                            Ok(k) => k,
+                            Err(e) => {
+                                let _ = batch_tx
+                                    .send(Err(FlightError::Tonic(Box::new(Status::from(e)))))
+                                    .await;
+                                return;
+                            }
+                        };
+
+                        let num_keys = keys.len();
+                        total_keys_req += num_keys;
+                        metrics.inc_lookup_keys_requested(num_keys as u64);
+
+                        let outcomes = match write_engine
+                            .read_keys(keys, Some(requested_bins.clone()))
+                            .await
+                        {
+                            Ok(o) => o,
+                            Err(e) => {
+                                let _ = batch_tx
+                                    .send(Err(FlightError::Tonic(Box::new(Status::from(e)))))
+                                    .await;
+                                return;
+                            }
+                        };
+
+                        let found_in_batch = outcomes
+                            .iter()
+                            .filter(|o| matches!(o, RecordReadOutcome::Found(_)))
+                            .count();
+                        total_keys_found += found_in_batch;
+                        metrics.inc_lookup_keys_found(found_in_batch as u64);
+
+                        match build_lookup_record_batch(
+                            &input_batch,
+                            bs,
+                            &p.key_column,
+                            &outcomes,
+                            p.join_type,
+                            p.type_mismatch_mode,
+                        ) {
+                            Ok(Some(out_batch)) => {
+                                let rows = out_batch.num_rows();
+                                total_rows_out += rows;
+                                total_batches_out += 1;
+                                metrics.inc_records_read(rows as u64);
+                                metrics.inc_read_batches();
+                                sent_any_batch = true;
+                                if batch_tx.send(Ok(out_batch)).await.is_err() {
+                                    return;
+                                }
+                            }
+                            Ok(None) => {
+                                // All rows filtered out in Inner join mode for this batch
+                            }
+                            Err(e) => {
+                                let _ = batch_tx
+                                    .send(Err(FlightError::Tonic(Box::new(Status::from(e)))))
+                                    .await;
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+
+            if !sent_any_batch {
+                if let Some(out_schema) = out_schema_opt {
+                    let _ = batch_tx.send(Ok(RecordBatch::new_empty(out_schema))).await;
+                }
+            }
+
+            if let Some(p) = &lookup_params {
+                info!(
+                    node_id,
+                    namespace = %p.namespace,
+                    set_name = %p.set_name,
+                    join_type = ?p.join_type,
+                    keys_requested = total_keys_req,
+                    keys_found = total_keys_found,
+                    batches_out = total_batches_out,
+                    rows_out = total_rows_out,
+                    elapsed_ms = stream_start.elapsed().as_millis() as u64,
+                    "Completed Arrow Flight DoExchange lookup stream"
+                );
+            }
+        });
+
+        let encoded_stream = FlightDataEncoderBuilder::new()
+            .build(ReceiverStream::new(batch_rx))
+            .map_err(Status::from)
+            .boxed();
+
+        Ok(Response::new(encoded_stream))
     }
 }
 

@@ -415,6 +415,204 @@ impl WriteParameters {
     }
 }
 
+/// Behavior when an Aerospike bin's runtime value type does not match the target Arrow schema column type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TypeMismatchMode {
+    /// Fail the read/lookup request immediately with a conversion error.
+    #[default]
+    Fail,
+    /// Substitute `NULL` for the mismatched cell and continue reading.
+    Null,
+}
+
+impl TypeMismatchMode {
+    pub fn from_str_insensitive(s: &str) -> Result<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "fail" | "error" | "strict" => Ok(TypeMismatchMode::Fail),
+            "null" | "ignore" | "permissive" => Ok(TypeMismatchMode::Null),
+            other => Err(ProxyError::InvalidArgument(format!(
+                "Unsupported type_mismatch_mode '{other}'. Expected 'fail' or 'null'"
+            ))),
+        }
+    }
+}
+
+/// Join semantics when enriching a DataFrame of primary keys via `DoExchange`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum LookupJoinType {
+    /// Keep all input rows; if a key is missing in Aerospike, populate all requested bins with `NULL`.
+    #[default]
+    Left,
+    /// Emit only rows whose primary key exists in Aerospike.
+    Inner,
+}
+
+impl LookupJoinType {
+    pub fn from_str_insensitive(s: &str) -> Result<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "left" | "left_outer" => Ok(LookupJoinType::Left),
+            "inner" => Ok(LookupJoinType::Inner),
+            other => Err(ProxyError::InvalidArgument(format!(
+                "Unsupported lookup join_type '{other}'. Expected 'left' or 'inner'"
+            ))),
+        }
+    }
+}
+
+/// Typed primary key literal for `BatchKeys` reads.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(tag = "type", content = "value", rename_all = "snake_case")]
+pub enum KeyLiteral {
+    String(String),
+    Int(i64),
+    Bytes(Vec<u8>),
+}
+
+impl KeyLiteral {
+    pub fn to_aerospike_value(&self) -> aerospike::Value {
+        match self {
+            KeyLiteral::String(s) => aerospike::Value::String(s.clone()),
+            KeyLiteral::Int(i) => aerospike::Value::Int(*i),
+            KeyLiteral::Bytes(b) => aerospike::Value::Blob(b.clone()),
+        }
+    }
+
+    pub fn to_key(&self, namespace: &str, set_name: &str) -> Result<aerospike::Key> {
+        aerospike::Key::new(namespace, set_name, self.to_aerospike_value()).map_err(|e| {
+            ProxyError::InvalidArgument(format!(
+                "Failed to build Aerospike Key for literal {self:?}: {e}"
+            ))
+        })
+    }
+}
+
+/// Read execution strategy for `DoGet`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum ReadModeSpec {
+    /// Parallel scan over a contiguous range of Aerospike's 4096 partitions `[begin_partition, begin_partition + partition_count)`.
+    PartitionRange {
+        begin_partition: usize,
+        partition_count: usize,
+    },
+    /// Direct `batch_get` lookup for a specific list of primary keys.
+    BatchKeys {
+        keys: Vec<KeyLiteral>,
+    },
+}
+
+/// JSON payload encoded inside `Ticket.ticket` for `DoGet` read streams.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ReadTicket {
+    pub namespace: String,
+    #[serde(default)]
+    pub set_name: String,
+    pub key_column: String,
+    #[serde(default)]
+    pub bins: Vec<String>,
+    pub read_mode: ReadModeSpec,
+    #[serde(default = "default_read_batch_size")]
+    pub batch_size: usize,
+    #[serde(default)]
+    pub type_mismatch_mode: TypeMismatchMode,
+    /// Base64-encoded Arrow IPC Schema bytes representing the exact output schema expected by Spark.
+    pub schema_ipc_base64: String,
+}
+
+impl ReadTicket {
+    pub fn validate(&self) -> Result<()> {
+        if self.namespace.trim().is_empty() {
+            return Err(ProxyError::InvalidArgument(
+                "ReadTicket.namespace cannot be empty".to_string(),
+            ));
+        }
+        if self.key_column.trim().is_empty() {
+            return Err(ProxyError::InvalidArgument(
+                "ReadTicket.key_column cannot be empty".to_string(),
+            ));
+        }
+        if let ReadModeSpec::PartitionRange {
+            begin_partition,
+            partition_count,
+        } = self.read_mode
+        {
+            if begin_partition >= 4096 || partition_count == 0 || begin_partition + partition_count > 4096 {
+                return Err(ProxyError::InvalidArgument(format!(
+                    "Invalid Aerospike partition range: begin={begin_partition}, count={partition_count} (must be within 0..4096)"
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// JSON payload encoded inside `FlightDescriptor.cmd` for `get_schema` (schema inference by sampling).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct InferSchemaRequest {
+    pub namespace: String,
+    #[serde(default)]
+    pub set_name: String,
+    pub key_column: String,
+    #[serde(default = "default_sample_size")]
+    pub sample_size: usize,
+}
+
+impl InferSchemaRequest {
+    pub fn validate(&self) -> Result<()> {
+        if self.namespace.trim().is_empty() {
+            return Err(ProxyError::InvalidArgument(
+                "InferSchemaRequest.namespace cannot be empty".to_string(),
+            ));
+        }
+        if self.key_column.trim().is_empty() {
+            return Err(ProxyError::InvalidArgument(
+                "InferSchemaRequest.key_column cannot be empty".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// JSON payload encoded inside `FlightDescriptor.cmd` for `do_exchange` (distributed DataFrame key lookup).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct LookupExchangeParams {
+    pub namespace: String,
+    #[serde(default)]
+    pub set_name: String,
+    pub key_column: String,
+    #[serde(default)]
+    pub join_type: LookupJoinType,
+    #[serde(default)]
+    pub type_mismatch_mode: TypeMismatchMode,
+    /// Base64-encoded Arrow IPC Schema bytes for the bins to fetch from Aerospike.
+    pub bins_schema_ipc_base64: String,
+}
+
+impl LookupExchangeParams {
+    pub fn validate(&self) -> Result<()> {
+        if self.namespace.trim().is_empty() {
+            return Err(ProxyError::InvalidArgument(
+                "LookupExchangeParams.namespace cannot be empty".to_string(),
+            ));
+        }
+        if self.key_column.trim().is_empty() {
+            return Err(ProxyError::InvalidArgument(
+                "LookupExchangeParams.key_column cannot be empty".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn default_read_batch_size() -> usize {
+    4096
+}
+fn default_sample_size() -> usize {
+    1000
+}
+
 fn default_listen_addr() -> String {
     "0.0.0.0:8815".to_string()
 }

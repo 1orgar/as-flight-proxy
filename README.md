@@ -1,6 +1,8 @@
 # as-flight-proxy: Spark → Arrow Flight → Rust MPP Proxy → Aerospike 8+ CE
 
 [![CI & Build Artifacts](https://github.com/1orgar/as-flight-proxy/actions/workflows/ci.yml/badge.svg)](https://github.com/1orgar/as-flight-proxy/actions/workflows/ci.yml)
+[![Coverage (Rust Proxy)](https://img.shields.io/badge/coverage%20(rust)-86.1%25-brightgreen?logo=rust)](https://github.com/1orgar/as-flight-proxy/actions/workflows/ci.yml)
+[![Coverage (Spark Connector)](https://img.shields.io/badge/coverage%20(scala)-87.9%25-brightgreen?logo=scala)](https://github.com/1orgar/as-flight-proxy/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/1orgar/as-flight-proxy?include_prereleases&label=Release)](https://github.com/1orgar/as-flight-proxy/releases)
 [![Rust](https://img.shields.io/badge/Rust-1.88%2B-orange?logo=rust)](https://www.rust-lang.org/)
 [![Spark](https://img.shields.io/badge/Apache%20Spark-3.5-E25A1C?logo=apachespark)](https://spark.apache.org/)
@@ -392,33 +394,45 @@ if not dq_status["dq_passed"]:
 
 На порту `server.metrics_addr` (по умолчанию `:9090`) доступны только служебные эндпоинты:
 * `GET /healthz` — проверка связности прокси с кластером Aerospike (`200 OK` / `503 Service Unavailable`).
-* `GET /metrics` — метрики в формате Prometheus:
-  * `as_proxy_records_written_total` — общее число записанных в Aerospike записей.
-  * `as_proxy_batches_processed_total` — общее число обработанных Arrow `RecordBatch`.
-  * `as_proxy_overload_retries_total` — число ретраев перегрузки (`DEVICE_OVERLOAD`, `KEY_BUSY`, `NO_MORE_CONNECTIONS`, `MAX_RETRIES_EXCEEDED`).
-  * `as_proxy_other_retries_total` — число прочих ретраев.
-  * `as_proxy_failed_records_total` — число записей, завершившихся фатальной ошибкой после исчерпания ретраев.
-  * `as_proxy_in_flight_records` — текущее число записей в полёте к Aerospike.
-  * `as_proxy_active_streams` — текущее число активных стримов `DoPut`.
-  * `as_proxy_write_duration_seconds_sum` / `_count` — суммарное время и количество вызовов под-батчей Aerospike.
-  * `as_proxy_aerospike_connected` — статус подключения к Aerospike (`1` / `0`).
-  * `as_proxy_raft_term`, `as_proxy_raft_is_leader`, `as_proxy_raft_commit_index` — метрики состояния Raft-узла.
+* `GET /metrics` — 21 метрика в формате Prometheus:
+  * **Запись (`DoPut`)**:
+    * `as_proxy_records_written_total` — общее число записанных в Aerospike записей.
+    * `as_proxy_batches_processed_total` — общее число обработанных на запись Arrow `RecordBatch`.
+    * `as_proxy_write_duration_seconds_sum` / `_count` — суммарное время и количество вызовов под-батчей записи в Aerospike.
+  * **Чтение и Lookup (`DoGet` / `DoExchange` / `GetSchema`)**:
+    * `as_proxy_records_read_total` — общее число прочитанных из Aerospike записей (`DoGet` + `DoExchange`).
+    * `as_proxy_read_batches_total` — общее число сформированных и отправленных клиенту выходных `RecordBatch`.
+    * `as_proxy_lookup_keys_requested_total` — общее число ключей, запрошенных через `DoExchange` Lookup.
+    * `as_proxy_lookup_keys_found_total` — общее число ключей, найденных в Aerospike при `DoExchange` Lookup.
+    * `as_proxy_read_duration_seconds_sum` / `_count` — суммарное время и количество операций чтения (`GetSchema`, `DoGet`, `DoExchange`).
+  * **DQ-валидация (`validateOnly = true`)**:
+    * `as_proxy_records_validated_total` — общее число проверенных строк в режиме DQ.
+    * `as_proxy_validation_mismatches_total` — общее число обнаруженных расхождений (`MissingKey` + `BinMismatch`).
+  * **Ретраи, ошибки и параллелизм**:
+    * `as_proxy_overload_retries_total` — число ретраев перегрузки (`DEVICE_OVERLOAD`, `KEY_BUSY`, `NO_MORE_CONNECTIONS`, `MAX_RETRIES_EXCEEDED`).
+    * `as_proxy_other_retries_total` — число прочих ретраев.
+    * `as_proxy_failed_records_total` — число записей, завершившихся фатальной ошибкой после исчерпания ретраев.
+    * `as_proxy_in_flight_records` — текущее число записей в полёте к Aerospike.
+    * `as_proxy_active_streams` — текущее число активных стримов (`DoPut`, `DoGet`, `DoExchange`).
+  * **Кластер Aerospike и Raft**:
+    * `as_proxy_aerospike_connected` — статус подключения к Aerospike (`1` / `0`).
+    * `as_proxy_raft_term`, `as_proxy_raft_is_leader`, `as_proxy_raft_commit_index` — метрики состояния Raft-узла.
 
 ---
 
 ## 9. Сборка, тесты и CI/CD артефакты
 
-### Локальная сборка и запуск тестов
+### Локальная сборка, запуск тестов и проверка покрытия (>= 85%)
 ```bash
-# Rust Proxy Server
+# Rust Proxy Server (покрытие cargo-llvm-cov >= 85%)
 cd proxy_server
-cargo test
+cargo llvm-cov --all-targets --summary-only --fail-under-lines 85
 cargo build --release
 
-# Spark Connector (Scala 2.12 / Spark 3.5)
+# Spark Connector (Scala 2.12 / Spark 3.5, покрытие sbt-scoverage >= 85%)
 cd ../spark_connector
-sbt test
-sbt assembly
+sbt clean coverage test coverageReport
+sbt "set ThisBuild / coverageEnabled := false" assembly
 ```
 
 ### GitHub Actions CI и релизные артефакты

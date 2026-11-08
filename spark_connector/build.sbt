@@ -21,6 +21,16 @@ libraryDependencies ++= Seq(
   "org.scalatest" %% "scalatest" % "3.2.19" % Test
 )
 
+// Align Jackson version with Spark 3.5.2's jackson-module-scala 2.15.2
+dependencyOverrides ++= Seq(
+  "com.fasterxml.jackson.core" % "jackson-core"        % "2.15.2",
+  "com.fasterxml.jackson.core" % "jackson-annotations" % "2.15.2",
+  "com.fasterxml.jackson.core" % "jackson-databind"    % "2.15.2"
+)
+
+coverageMinimumStmtTotal := 85
+coverageFailOnMinimum := true
+
 // Include "provided" dependencies (spark-sql, spark-catalyst) on the Test runtime classpath
 Test / fullClasspath := (Test / fullClasspath).value ++ (Compile / managedClasspath).value
 

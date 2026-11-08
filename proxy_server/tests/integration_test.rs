@@ -26,9 +26,15 @@ use tonic::Request;
 
 use as_proxy_server::auth::Authenticator;
 use as_proxy_server::config::{
-    AuthConfig, RaftConfig, RaftPeer, RetryConfig, WriteMode, WriteParameters, WriterConfig,
+    AuthConfig, InferSchemaRequest, KeyLiteral, LookupExchangeParams, LookupJoinType, RaftConfig,
+    RaftPeer, ReadModeSpec, ReadTicket, RetryConfig, TypeMismatchMode, WriteMode, WriteParameters,
+    WriterConfig,
 };
-use as_proxy_server::converter::{PreparedRecord, convert_record_batch, values_equal_dq};
+use as_proxy_server::converter::{
+    PreparedRecord, ScannedRecord, convert_record_batch, encode_arrow_schema_ipc_base64,
+    values_equal_dq,
+};
+use as_proxy_server::error::Result as ProxyResult;
 use as_proxy_server::flight_service::{ProxyFlightService, PutBatchAck};
 use as_proxy_server::metrics::ProxyMetrics;
 use as_proxy_server::raft::{JobLoadStatus, JobState, RaftNode, RaftRole};
@@ -118,10 +124,33 @@ impl AerospikeSink for MockAerospikeSink {
         records: &[PreparedRecord],
         _params: &WriteParameters,
     ) -> Vec<RecordReadOutcome> {
+        let mut attempts_guard = self.write_attempts.lock().unwrap();
         let stored_guard = self.stored.lock().unwrap();
         let mut outcomes = Vec::with_capacity(records.len());
 
         for rec in records {
+            let count = attempts_guard.entry(rec.key.clone()).or_insert(0);
+            *count += 1;
+            let current_attempt = *count;
+
+            if let Some(&fail_until) = self.overload_failures_per_key.get(&rec.key) {
+                if current_attempt <= fail_until {
+                    outcomes.push(RecordReadOutcome::OverloadError(
+                        "Simulated DEVICE_OVERLOAD on read".to_string(),
+                    ));
+                    continue;
+                }
+            }
+
+            if let Some(&fail_until) = self.other_failures_per_key.get(&rec.key) {
+                if current_attempt <= fail_until {
+                    outcomes.push(RecordReadOutcome::OtherError(
+                        "Simulated ServerError on read".to_string(),
+                    ));
+                    continue;
+                }
+            }
+
             match stored_guard.get(&rec.key) {
                 Some(bins) => {
                     let mut map = HashMap::new();
@@ -137,6 +166,58 @@ impl AerospikeSink for MockAerospikeSink {
             }
         }
         outcomes
+    }
+
+    async fn scan_partition_range(
+        &self,
+        namespace: &str,
+        set_name: &str,
+        begin_partition: usize,
+        partition_count: usize,
+        bins: Option<Vec<String>>,
+        max_records: Option<u64>,
+    ) -> ProxyResult<tokio::sync::mpsc::Receiver<ProxyResult<ScannedRecord>>> {
+        let stored_guard = self.stored.lock().unwrap();
+        let (tx, rx) = tokio::sync::mpsc::channel(256);
+        let mut items = Vec::new();
+        for (key, stored_bins) in stored_guard.iter() {
+            if key.namespace() != namespace || (!set_name.is_empty() && key.set_name() != set_name)
+            {
+                continue;
+            }
+            let pid = key.partition_id();
+            if pid < begin_partition || pid >= begin_partition + partition_count {
+                continue;
+            }
+            let mut map = IndexMap::new();
+            for b in stored_bins {
+                if b.value != Value::Nil {
+                    if let Some(ref req_bins) = bins {
+                        if req_bins.is_empty() || !req_bins.iter().any(|rb| rb == &b.name) {
+                            continue;
+                        }
+                    }
+                    map.insert(b.name.clone(), b.value.clone());
+                }
+            }
+            items.push(ScannedRecord {
+                key: Some(key.clone()),
+                bins: map,
+            });
+            if let Some(max_rec) = max_records {
+                if items.len() >= max_rec as usize {
+                    break;
+                }
+            }
+        }
+        tokio::spawn(async move {
+            for item in items {
+                if tx.send(Ok(item)).await.is_err() {
+                    break;
+                }
+            }
+        });
+        Ok(rx)
     }
 
     fn is_connected(&self) -> bool {
@@ -335,7 +416,7 @@ fn test_convert_all_types_and_null_modes() {
     );
     assert_eq!(r1.bins[2], Bin::new("active", Value::Nil));
 
-    // 2. Replace mode omits null bins!
+    // 2. Replace mode omits null bins (and skips rows where all bins are null)!
     let mut params_replace = params_update_nil.clone();
     params_replace.write_mode = WriteMode::Replace;
     let records_replace = convert_record_batch(&batch, &params_replace, 64).unwrap();
@@ -343,6 +424,27 @@ fn test_convert_all_types_and_null_modes() {
     assert_eq!(
         records_replace[1].bins[0],
         Bin::new("score", Value::Float(FloatValue::from(50.0)))
+    );
+
+    // Also verify that in Replace mode, a row where ALL bins are null is completely omitted
+    let all_null_schema = Arc::new(Schema::new(vec![
+        Field::new("user_id", DataType::Utf8, false),
+        Field::new("age", DataType::Int32, true),
+    ]));
+    let mut all_null_id = StringBuilder::new();
+    let mut all_null_age = Int32Builder::new();
+    all_null_id.append_value("u_all_null");
+    all_null_age.append_null();
+    let all_null_batch = RecordBatch::try_new(
+        all_null_schema,
+        vec![Arc::new(all_null_id.finish()), Arc::new(all_null_age.finish())],
+    )
+    .unwrap();
+    let records_replace_all_null =
+        convert_record_batch(&all_null_batch, &params_replace, 64).unwrap();
+    assert!(
+        records_replace_all_null.is_empty(),
+        "Replace mode must skip rows where all bins are null"
     );
 
     // 3. Update mode with ignore_nulls = true also omits null bins!
@@ -393,6 +495,68 @@ fn test_null_primary_key_and_bin_name_length_validation() {
     let batch_valid_key = batch.slice(0, 1);
     let err_len = convert_record_batch(&batch_valid_key, &params, 15).unwrap_err();
     assert!(err_len.to_string().contains("exceeds configured max_bin_name_len"));
+
+    // Bin name with invalid characters (whitespace / delimiter / non-ASCII) must fail
+    for bad_name in ["bad space", "bad:colon", "bad;semi", "кириллица"] {
+        let bad_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new(bad_name, DataType::Int32, true),
+        ]));
+        let mut k = StringBuilder::new();
+        let mut v = Int32Builder::new();
+        k.append_value("k1");
+        v.append_value(10);
+        let b = RecordBatch::try_new(bad_schema, vec![Arc::new(k.finish()), Arc::new(v.finish())])
+            .unwrap();
+        let err_fmt = convert_record_batch(&b, &params, 64).unwrap_err();
+        assert!(err_fmt.to_string().contains("invalid format"));
+    }
+
+    // Schema with only PK column and 0 bin columns must fail
+    let only_pk_schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Utf8, false)]));
+    let mut k_only = StringBuilder::new();
+    k_only.append_value("k1");
+    let b_only_pk =
+        RecordBatch::try_new(only_pk_schema, vec![Arc::new(k_only.finish())]).unwrap();
+    let err_zero_bins = convert_record_batch(&b_only_pk, &params, 15).unwrap_err();
+    assert!(err_zero_bins
+        .to_string()
+        .contains("must contain at least 1 bin column"));
+
+    // Row with PK and ALL bins set to NULL (both typed null and DataType::Null)
+    let all_null_bins_schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Utf8, false),
+        Field::new("bin_a", DataType::Int32, true),
+        Field::new("bin_b", DataType::Null, true),
+    ]));
+    let mut k_null_test = StringBuilder::new();
+    let mut a_null_test = Int32Builder::new();
+    k_null_test.append_value("user_deleted_all_bins");
+    a_null_test.append_null();
+    let b_all_null = RecordBatch::try_new(
+        all_null_bins_schema,
+        vec![
+            Arc::new(k_null_test.finish()),
+            Arc::new(a_null_test.finish()),
+            Arc::new(arrow_array::NullArray::new(1)),
+        ],
+    )
+    .unwrap();
+
+    let converted = convert_record_batch(&b_all_null, &params, 15).unwrap();
+    assert_eq!(converted.len(), 1);
+    assert_eq!(
+        converted[0].bins,
+        vec![
+            Bin::new("bin_a", Value::Nil),
+            Bin::new("bin_b", Value::Nil),
+        ]
+    );
+    // In DQ validation, if all bins were deleted (Value::Nil), an absent record (None) in Aerospike must match!
+    assert_eq!(
+        as_proxy_server::converter::validate_record_against_bins(&converted[0], None),
+        as_proxy_server::converter::RecordDqResult::Matched
+    );
 }
 
 #[test]
@@ -1200,4 +1364,1814 @@ async fn test_dq_validation_with_nan_equality_and_mismatch_detection() {
     assert!(status_ok.dq_mismatch_samples.is_empty());
 
     raft_node.shutdown();
+}
+
+#[tokio::test]
+async fn test_flight_read_get_schema_do_get_and_do_exchange_lookup() {
+    use arrow_flight::decode::{DecodedPayload, FlightDataDecoder};
+    use arrow_flight::Ticket;
+
+    let sink = Arc::new(MockAerospikeSink::new(HashMap::new(), HashMap::new()));
+    let metrics = ProxyMetrics::new();
+    let engine = Arc::new(MppWriteEngine::new(
+        sink.clone(),
+        WriterConfig::default(),
+        RetryConfig::default(),
+        metrics.clone(),
+    ));
+    let auth = Arc::new(Authenticator::new(AuthConfig {
+        enabled: false,
+        ..AuthConfig::default()
+    }));
+    let flight_svc = ProxyFlightService::new(auth, engine, metrics.clone(), 15);
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        Server::builder()
+            .add_service(FlightServiceServer::new(flight_svc))
+            .serve_with_incoming(TcpListenerStream::new(listener))
+            .await
+            .unwrap();
+    });
+
+    let channel = tonic::transport::Endpoint::from_shared(format!("http://{addr}"))
+        .unwrap()
+        .connect()
+        .await
+        .unwrap();
+    let mut client = FlightServiceClient::new(channel);
+
+    // 1. Write 4 records via DoPut
+    let write_schema = Arc::new(Schema::new(vec![
+        Field::new("pk", DataType::Utf8, false),
+        Field::new("age", DataType::Int32, true),
+        Field::new("score", DataType::Float64, true),
+        Field::new("name", DataType::Utf8, true),
+    ]));
+
+    let mut pk_b = StringBuilder::new();
+    let mut age_b = Int32Builder::new();
+    let mut score_b = Float64Builder::new();
+    let mut name_b = StringBuilder::new();
+
+    for (k, a, s, n) in [
+        ("u_1", 25, 10.5, "Alice"),
+        ("u_2", 30, 20.0, "Bob"),
+        ("u_3", 35, 30.25, "Charlie"),
+        ("u_4", 40, 40.75, "Diana"),
+    ] {
+        pk_b.append_value(k);
+        age_b.append_value(a);
+        score_b.append_value(s);
+        name_b.append_value(n);
+    }
+
+    let write_batch = RecordBatch::try_new(
+        write_schema.clone(),
+        vec![
+            Arc::new(pk_b.finish()),
+            Arc::new(age_b.finish()),
+            Arc::new(score_b.finish()),
+            Arc::new(name_b.finish()),
+        ],
+    )
+    .unwrap();
+
+    let w_params = WriteParameters {
+        job_id: Some("job-seed-read".to_string()),
+        namespace: "test".to_string(),
+        set_name: "users".to_string(),
+        key_column: "pk".to_string(),
+        write_mode: WriteMode::Update,
+        ttl_seconds: None,
+        send_key: true,
+        ignore_nulls: false,
+        use_batch_write: Some(true),
+        validate_only: false,
+    };
+
+    let desc = FlightDescriptor::new_cmd(serde_json::to_vec(&w_params).unwrap());
+    let put_stream = FlightDataEncoderBuilder::new()
+        .with_schema(write_schema.clone())
+        .with_flight_descriptor(Some(desc))
+        .build(stream::iter(vec![Ok(write_batch)]))
+        .map(|r| r.unwrap());
+
+    let mut put_resp = client.do_put(Request::new(put_stream)).await.unwrap().into_inner();
+    while (put_resp.try_next().await.unwrap()).is_some() {}
+
+    // 2. Test get_schema (inferSchema by sampling)
+    let infer_req = InferSchemaRequest {
+        namespace: "test".to_string(),
+        set_name: "users".to_string(),
+        key_column: "pk".to_string(),
+        sample_size: 100,
+    };
+    let schema_res = client
+        .get_schema(Request::new(FlightDescriptor::new_cmd(
+            serde_json::to_vec(&infer_req).unwrap(),
+        )))
+        .await
+        .unwrap()
+        .into_inner();
+    let inferred_schema = Schema::try_from(&schema_res).unwrap();
+    assert_eq!(inferred_schema.fields().len(), 4);
+    assert_eq!(inferred_schema.field(0).name(), "pk");
+
+    // 3. Test do_get with PartitionRange across 2 splits (0..2048 and 2048..4096) + Column Pruning (only pk & age)
+    let pruned_schema = Arc::new(Schema::new(vec![
+        Field::new("pk", DataType::Utf8, false),
+        Field::new("age", DataType::Int32, true),
+    ]));
+    let pruned_schema_b64 = encode_arrow_schema_ipc_base64(&pruned_schema).unwrap();
+
+    let mut scanned_rows = 0;
+    for (begin, count) in [(0, 2048), (2048, 2048)] {
+        let ticket_json = serde_json::to_vec(&ReadTicket {
+            namespace: "test".to_string(),
+            set_name: "users".to_string(),
+            key_column: "pk".to_string(),
+            bins: vec!["age".to_string()],
+            read_mode: ReadModeSpec::PartitionRange {
+                begin_partition: begin,
+                partition_count: count,
+            },
+            batch_size: 2,
+            type_mismatch_mode: TypeMismatchMode::Fail,
+            schema_ipc_base64: pruned_schema_b64.clone(),
+        })
+        .unwrap();
+
+        let do_get_stream = client
+            .do_get(Request::new(Ticket {
+                ticket: Bytes::from(ticket_json),
+            }))
+            .await
+            .unwrap()
+            .into_inner()
+            .map_err(arrow_flight::error::FlightError::from);
+
+        let mut dec = FlightDataDecoder::new(do_get_stream);
+        while let Some(msg) = dec.try_next().await.unwrap() {
+            if let DecodedPayload::RecordBatch(rb) = msg.payload {
+                assert_eq!(rb.num_columns(), 2);
+                scanned_rows += rb.num_rows();
+            }
+        }
+    }
+    assert_eq!(scanned_rows, 4);
+
+    // 4. Test do_get with BatchKeys (2 existing keys + 1 missing key -> returns 2 found records)
+    let batch_keys_ticket = serde_json::to_vec(&ReadTicket {
+        namespace: "test".to_string(),
+        set_name: "users".to_string(),
+        key_column: "pk".to_string(),
+        bins: vec!["age".to_string(), "score".to_string(), "name".to_string()],
+        read_mode: ReadModeSpec::BatchKeys {
+            keys: vec![
+                KeyLiteral::String("u_2".to_string()),
+                KeyLiteral::String("u_missing".to_string()),
+                KeyLiteral::String("u_4".to_string()),
+            ],
+        },
+        batch_size: 10,
+        type_mismatch_mode: TypeMismatchMode::Fail,
+        schema_ipc_base64: encode_arrow_schema_ipc_base64(&write_schema).unwrap(),
+    })
+    .unwrap();
+
+    let bk_stream = client
+        .do_get(Request::new(Ticket {
+            ticket: Bytes::from(batch_keys_ticket),
+        }))
+        .await
+        .unwrap()
+        .into_inner()
+        .map_err(arrow_flight::error::FlightError::from);
+    let mut bk_dec = FlightDataDecoder::new(bk_stream);
+    let mut bk_rows = 0;
+    while let Some(msg) = bk_dec.try_next().await.unwrap() {
+        if let DecodedPayload::RecordBatch(rb) = msg.payload {
+            bk_rows += rb.num_rows();
+        }
+    }
+    assert_eq!(bk_rows, 2);
+
+    // 5. Test do_exchange distributed DataFrame key lookup (both Left and Inner join)
+    let input_df_schema = Arc::new(Schema::new(vec![
+        Field::new("req_id", DataType::Int32, false),
+        Field::new("pk", DataType::Utf8, false),
+    ]));
+    let mut req_b = Int32Builder::new();
+    let mut key_b = StringBuilder::new();
+    req_b.append_value(100);
+    key_b.append_value("u_1");
+    req_b.append_value(200);
+    key_b.append_value("u_not_in_aerospike");
+    req_b.append_value(300);
+    key_b.append_value("u_3");
+
+    let input_df_batch = RecordBatch::try_new(
+        input_df_schema.clone(),
+        vec![Arc::new(req_b.finish()), Arc::new(key_b.finish())],
+    )
+    .unwrap();
+
+    let bins_only_schema = Arc::new(Schema::new(vec![
+        Field::new("age", DataType::Int32, true),
+        Field::new("name", DataType::Utf8, true),
+    ]));
+    let bins_schema_b64 = encode_arrow_schema_ipc_base64(&bins_only_schema).unwrap();
+
+    // 5a. Left join -> returns all 3 rows, with row 1 having NULL age & name
+    let left_params = LookupExchangeParams {
+        namespace: "test".to_string(),
+        set_name: "users".to_string(),
+        key_column: "pk".to_string(),
+        join_type: LookupJoinType::Left,
+        type_mismatch_mode: TypeMismatchMode::Fail,
+        bins_schema_ipc_base64: bins_schema_b64.clone(),
+    };
+    let left_desc = FlightDescriptor::new_cmd(serde_json::to_vec(&left_params).unwrap());
+    let left_req_stream = FlightDataEncoderBuilder::new()
+        .with_schema(input_df_schema.clone())
+        .with_flight_descriptor(Some(left_desc))
+        .build(stream::iter(vec![Ok(input_df_batch.clone())]))
+        .map(|r| r.unwrap());
+
+    let left_resp = client
+        .do_exchange(Request::new(left_req_stream))
+        .await
+        .unwrap()
+        .into_inner()
+        .map_err(arrow_flight::error::FlightError::from);
+    let mut left_dec = FlightDataDecoder::new(left_resp);
+    let mut left_batches = Vec::new();
+    while let Some(msg) = left_dec.try_next().await.unwrap() {
+        if let DecodedPayload::RecordBatch(rb) = msg.payload {
+            left_batches.push(rb);
+        }
+    }
+    assert_eq!(left_batches.len(), 1);
+    let l_rb = &left_batches[0];
+    assert_eq!(l_rb.num_rows(), 3);
+    assert_eq!(l_rb.num_columns(), 4); // req_id, pk, age, name
+    assert!(!l_rb.column(2).is_null(0));
+    assert!(l_rb.column(2).is_null(1)); // u_not_in_aerospike -> age is NULL
+    assert!(l_rb.column(3).is_null(1)); // u_not_in_aerospike -> name is NULL
+    assert!(!l_rb.column(2).is_null(2));
+
+    // 5b. Inner join -> returns only the 2 matching rows (u_1 and u_3)
+    let inner_params = LookupExchangeParams {
+        namespace: "test".to_string(),
+        set_name: "users".to_string(),
+        key_column: "pk".to_string(),
+        join_type: LookupJoinType::Inner,
+        type_mismatch_mode: TypeMismatchMode::Fail,
+        bins_schema_ipc_base64: bins_schema_b64,
+    };
+    let inner_desc = FlightDescriptor::new_cmd(serde_json::to_vec(&inner_params).unwrap());
+    let inner_req_stream = FlightDataEncoderBuilder::new()
+        .with_schema(input_df_schema)
+        .with_flight_descriptor(Some(inner_desc))
+        .build(stream::iter(vec![Ok(input_df_batch)]))
+        .map(|r| r.unwrap());
+
+    let inner_resp = client
+        .do_exchange(Request::new(inner_req_stream))
+        .await
+        .unwrap()
+        .into_inner()
+        .map_err(arrow_flight::error::FlightError::from);
+    let mut inner_dec = FlightDataDecoder::new(inner_resp);
+    let mut inner_rows = 0;
+    while let Some(msg) = inner_dec.try_next().await.unwrap() {
+        if let DecodedPayload::RecordBatch(rb) = msg.payload {
+            inner_rows += rb.num_rows();
+        }
+    }
+    assert_eq!(inner_rows, 2);
+
+    // 6. Verify Prometheus metrics for read & lookup operations
+    let prom_text = metrics.render_prometheus(true, None);
+    // 4 scanned + 2 batch_keys + 3 left_lookup + 2 inner_lookup = 11 records read
+    assert!(
+        prom_text.contains("as_proxy_records_read_total 11"),
+        "Expected as_proxy_records_read_total 11 in:\n{prom_text}"
+    );
+    // 3 left_lookup keys + 3 inner_lookup keys = 6 lookup keys requested, 4 found
+    assert!(
+        prom_text.contains("as_proxy_lookup_keys_requested_total 6"),
+        "Expected as_proxy_lookup_keys_requested_total 6 in:\n{prom_text}"
+    );
+    assert!(
+        prom_text.contains("as_proxy_lookup_keys_found_total 4"),
+        "Expected as_proxy_lookup_keys_found_total 4 in:\n{prom_text}"
+    );
+}
+
+#[test]
+fn test_config_headers_validation_and_error_status_conversions() {
+    use aerospike::{Expiration, RecordExistsAction};
+    use as_proxy_server::config::{
+        AerospikeConfig, AppConfig, ServerConfig, TlsConfig,
+    };
+    use as_proxy_server::error::ProxyError;
+    use tonic::Code;
+
+    // 1. Default configs & TOML loading
+    let def_cfg = AppConfig::default();
+    assert_eq!(def_cfg.server.listen_addr, "0.0.0.0:8815");
+    assert_eq!(ServerConfig::default().metrics_addr, "0.0.0.0:9090");
+    assert!(!TlsConfig::default().enabled);
+    assert_eq!(AerospikeConfig::default().max_bin_name_len, 64);
+
+    let tmp_file = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(
+        tmp_file.path(),
+        r#"
+        [server]
+        listen_addr = "127.0.0.1:18815"
+        [aerospike]
+        hosts = "10.0.0.1:3000"
+        "#,
+    )
+    .unwrap();
+    let loaded = AppConfig::from_file(tmp_file.path()).unwrap();
+    assert_eq!(loaded.server.listen_addr, "127.0.0.1:18815");
+    assert_eq!(loaded.aerospike.hosts, "10.0.0.1:3000");
+
+    assert!(AppConfig::from_file("/non/existent/path/config.toml").is_err());
+    let bad_toml = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(bad_toml.path(), "invalid = [toml").unwrap();
+    assert!(AppConfig::from_file(bad_toml.path()).is_err());
+
+    // 2. WriteMode parsing and RecordExistsAction mapping
+    for (s, mode, action) in [
+        ("update", WriteMode::Update, RecordExistsAction::Update),
+        ("bins", WriteMode::Update, RecordExistsAction::Update),
+        ("replace", WriteMode::Replace, RecordExistsAction::Replace),
+        ("row", WriteMode::Replace, RecordExistsAction::Replace),
+        ("full", WriteMode::Replace, RecordExistsAction::Replace),
+        ("update_only", WriteMode::UpdateOnly, RecordExistsAction::UpdateOnly),
+        ("replace_only", WriteMode::ReplaceOnly, RecordExistsAction::ReplaceOnly),
+        ("create_only", WriteMode::CreateOnly, RecordExistsAction::CreateOnly),
+        ("validate", WriteMode::Validate, RecordExistsAction::Update),
+        ("dq", WriteMode::Validate, RecordExistsAction::Update),
+        ("verify", WriteMode::Validate, RecordExistsAction::Update),
+    ] {
+        let parsed = WriteMode::from_str_insensitive(s).unwrap();
+        assert_eq!(parsed, mode);
+        assert_eq!(parsed.to_record_exists_action(), action);
+    }
+    assert!(WriteMode::from_str_insensitive("invalid_mode").is_err());
+
+    // 3. WriteParameters from gRPC MetadataMap headers & expiration
+    let mut headers = MetadataMap::new();
+    assert!(WriteParameters::from_descriptor_or_headers(None, &headers).is_err());
+    headers.insert("x-as-namespace", MetadataValue::from_static("ns1"));
+    assert!(WriteParameters::from_descriptor_or_headers(None, &headers).is_err());
+    headers.insert("x-as-key-column", MetadataValue::from_static("pk"));
+    headers.insert("x-as-set", MetadataValue::from_static("set1"));
+    headers.insert("x-as-job-id", MetadataValue::from_static("job-42"));
+    headers.insert("x-as-write-mode", MetadataValue::from_static("replace"));
+    headers.insert("x-as-ttl", MetadataValue::from_static("120"));
+    headers.insert("x-as-send-key", MetadataValue::from_static("false"));
+    headers.insert("x-as-ignore-nulls", MetadataValue::from_static("true"));
+    headers.insert("x-as-use-batch-write", MetadataValue::from_static("1"));
+    headers.insert("x-as-validate-only", MetadataValue::from_static("0"));
+
+    let mut wp = WriteParameters::from_descriptor_or_headers(None, &headers).unwrap();
+    assert_eq!(wp.job_id.as_deref(), Some("job-42"));
+    assert_eq!(wp.namespace, "ns1");
+    assert_eq!(wp.set_name, "set1");
+    assert_eq!(wp.key_column, "pk");
+    assert_eq!(wp.write_mode, WriteMode::Replace);
+    assert!(!wp.send_key);
+    assert!(wp.ignore_nulls);
+    assert_eq!(wp.use_batch_write, Some(true));
+    assert!(!wp.validate_only);
+    assert!(matches!(wp.expiration(), Expiration::Seconds(120)));
+
+    wp.ttl_seconds = None;
+    assert!(matches!(wp.expiration(), Expiration::NamespaceDefault));
+    wp.ttl_seconds = Some(0);
+    assert!(matches!(wp.expiration(), Expiration::NamespaceDefault));
+    wp.ttl_seconds = Some(-1);
+    assert!(matches!(wp.expiration(), Expiration::Never));
+    wp.ttl_seconds = Some(-2);
+    assert!(matches!(wp.expiration(), Expiration::DontUpdate));
+    wp.ttl_seconds = Some(-99);
+    assert!(matches!(wp.expiration(), Expiration::NamespaceDefault));
+
+    // Invalid TTL & empty namespace/key_column
+    headers.insert("x-as-ttl", MetadataValue::from_static("not_a_number"));
+    assert!(WriteParameters::from_descriptor_or_headers(None, &headers).is_err());
+    assert!(WriteParameters::from_descriptor_or_headers(Some(b"{bad_json"), &headers).is_err());
+
+    let mut invalid_wp = wp.clone();
+    invalid_wp.namespace = "   ".to_string();
+    assert!(invalid_wp.validate().is_err());
+    invalid_wp.namespace = "ns1".to_string();
+    invalid_wp.key_column = "".to_string();
+    assert!(invalid_wp.validate().is_err());
+
+    // 4. TypeMismatchMode, LookupJoinType, KeyLiteral, ReadTicket, InferSchemaRequest, LookupExchangeParams
+    assert_eq!(TypeMismatchMode::from_str_insensitive("FAIL").unwrap(), TypeMismatchMode::Fail);
+    assert_eq!(TypeMismatchMode::from_str_insensitive("strict").unwrap(), TypeMismatchMode::Fail);
+    assert_eq!(TypeMismatchMode::from_str_insensitive("null").unwrap(), TypeMismatchMode::Null);
+    assert_eq!(TypeMismatchMode::from_str_insensitive("permissive").unwrap(), TypeMismatchMode::Null);
+    assert!(TypeMismatchMode::from_str_insensitive("bad").is_err());
+
+    assert_eq!(LookupJoinType::from_str_insensitive("left").unwrap(), LookupJoinType::Left);
+    assert_eq!(LookupJoinType::from_str_insensitive("left_outer").unwrap(), LookupJoinType::Left);
+    assert_eq!(LookupJoinType::from_str_insensitive("INNER").unwrap(), LookupJoinType::Inner);
+    assert!(LookupJoinType::from_str_insensitive("full").is_err());
+
+    assert!(KeyLiteral::String("k1".into()).to_key("test", "s").is_ok());
+    assert!(KeyLiteral::Int(42).to_key("test", "s").is_ok());
+    assert!(KeyLiteral::Bytes(vec![1, 2, 3]).to_key("test", "s").is_ok());
+
+    let mut rt = ReadTicket {
+        namespace: "".to_string(),
+        set_name: "s".to_string(),
+        key_column: "pk".to_string(),
+        bins: vec![],
+        read_mode: ReadModeSpec::PartitionRange {
+            begin_partition: 0,
+            partition_count: 100,
+        },
+        batch_size: 100,
+        type_mismatch_mode: TypeMismatchMode::Fail,
+        schema_ipc_base64: "".to_string(),
+    };
+    assert!(rt.validate().is_err());
+    rt.namespace = "test".to_string();
+    rt.key_column = "".to_string();
+    assert!(rt.validate().is_err());
+    rt.key_column = "pk".to_string();
+    rt.read_mode = ReadModeSpec::PartitionRange {
+        begin_partition: 4096,
+        partition_count: 1,
+    };
+    assert!(rt.validate().is_err());
+    rt.read_mode = ReadModeSpec::PartitionRange {
+        begin_partition: 0,
+        partition_count: 0,
+    };
+    assert!(rt.validate().is_err());
+    rt.read_mode = ReadModeSpec::PartitionRange {
+        begin_partition: 4000,
+        partition_count: 200,
+    };
+    assert!(rt.validate().is_err());
+    rt.read_mode = ReadModeSpec::PartitionRange {
+        begin_partition: 0,
+        partition_count: 4096,
+    };
+    assert!(rt.validate().is_ok());
+
+    assert!(InferSchemaRequest {
+        namespace: "".into(),
+        set_name: "s".into(),
+        key_column: "pk".into(),
+        sample_size: 10,
+    }
+    .validate()
+    .is_err());
+    assert!(InferSchemaRequest {
+        namespace: "ns".into(),
+        set_name: "s".into(),
+        key_column: "".into(),
+        sample_size: 10,
+    }
+    .validate()
+    .is_err());
+
+    assert!(LookupExchangeParams {
+        namespace: "".into(),
+        set_name: "s".into(),
+        key_column: "pk".into(),
+        join_type: LookupJoinType::Left,
+        type_mismatch_mode: TypeMismatchMode::Fail,
+        bins_schema_ipc_base64: "".into(),
+    }
+    .validate()
+    .is_err());
+    assert!(LookupExchangeParams {
+        namespace: "ns".into(),
+        set_name: "s".into(),
+        key_column: "".into(),
+        join_type: LookupJoinType::Left,
+        type_mismatch_mode: TypeMismatchMode::Fail,
+        bins_schema_ipc_base64: "".into(),
+    }
+    .validate()
+    .is_err());
+
+    // 5. ProxyError -> tonic::Status conversions
+    assert_eq!(tonic::Status::from(ProxyError::Config("bad".into())).code(), Code::Internal);
+    assert_eq!(tonic::Status::from(ProxyError::Unauthenticated("no".into())).code(), Code::Unauthenticated);
+    assert_eq!(tonic::Status::from(ProxyError::InvalidArgument("arg".into())).code(), Code::InvalidArgument);
+    assert_eq!(tonic::Status::from(ProxyError::Conversion("conv".into())).code(), Code::InvalidArgument);
+    assert_eq!(
+        tonic::Status::from(ProxyError::Flight(arrow_flight::error::FlightError::DecodeError("dec".into()))).code(),
+        Code::InvalidArgument
+    );
+    assert_eq!(
+        tonic::Status::from(ProxyError::Flight(arrow_flight::error::FlightError::Tonic(Box::new(
+            tonic::Status::permission_denied("perm")
+        ))))
+        .code(),
+        Code::PermissionDenied
+    );
+    assert_eq!(
+        tonic::Status::from(ProxyError::WriteFailed {
+            attempts: 3,
+            message: "err".into(),
+        })
+        .code(),
+        Code::Aborted
+    );
+    assert_eq!(tonic::Status::from(ProxyError::Internal("int".into())).code(), Code::Internal);
+}
+
+#[tokio::test]
+async fn test_auth_modes_and_observability_http_endpoints() {
+    use as_proxy_server::metrics::serve_observability;
+    use base64::Engine;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
+
+    // 1. Disabled auth mode
+    let disabled_auth = Authenticator::new(AuthConfig {
+        enabled: false,
+        ..AuthConfig::default()
+    });
+    assert!(!disabled_auth.is_enabled());
+    assert!(disabled_auth.verify_credentials("any", "any").is_ok());
+    assert!(disabled_auth.verify_token("not-even-a-token").is_ok());
+    let empty_meta = MetadataMap::new();
+    assert!(disabled_auth.verify_metadata(&empty_meta).is_ok());
+    assert!(disabled_auth.authenticate_handshake(&empty_meta, b"").is_ok());
+
+    // 2. Enabled auth mode: Basic header, Bearer header, user:pass payload, expired token, malformed tokens
+    let auth = Authenticator::new(AuthConfig {
+        enabled: true,
+        username: "admin".to_string(),
+        password: "secret".to_string(),
+        token_secret: "my_secret_key".to_string(),
+        token_ttl_secs: 3600,
+    });
+    assert!(auth.is_enabled());
+
+    let b64_creds = base64::engine::general_purpose::STANDARD.encode("admin:secret");
+    let mut basic_meta = MetadataMap::new();
+    basic_meta.insert(
+        "authorization",
+        MetadataValue::try_from(format!("Basic {b64_creds}")).unwrap(),
+    );
+    assert!(auth.verify_metadata(&basic_meta).is_ok());
+    let issued_tok = auth.authenticate_handshake(&basic_meta, b"").unwrap();
+
+    // Handshake with Bearer header
+    let mut bearer_meta = MetadataMap::new();
+    bearer_meta.insert(
+        "authorization",
+        MetadataValue::try_from(format!("Bearer {issued_tok}")).unwrap(),
+    );
+    assert!(auth.authenticate_handshake(&bearer_meta, b"").is_ok());
+
+    // Raw token in authorization header
+    let mut raw_meta = MetadataMap::new();
+    raw_meta.insert(
+        "authorization",
+        MetadataValue::try_from(issued_tok.clone()).unwrap(),
+    );
+    assert!(auth.verify_metadata(&raw_meta).is_ok());
+
+    // Handshake with UTF-8 "user:pass" payload
+    assert!(auth.authenticate_handshake(&empty_meta, b"admin:secret").is_ok());
+    assert!(auth.authenticate_handshake(&empty_meta, b"").is_err());
+
+    // Invalid Basic headers
+    let mut bad_basic = MetadataMap::new();
+    bad_basic.insert("authorization", MetadataValue::from_static("Basic !!!not_base64!!!"));
+    assert!(auth.verify_metadata(&bad_basic).is_err());
+
+    let no_colon = base64::engine::general_purpose::STANDARD.encode("admin_without_colon");
+    bad_basic.insert(
+        "authorization",
+        MetadataValue::try_from(format!("Basic {no_colon}")).unwrap(),
+    );
+    assert!(auth.verify_metadata(&bad_basic).is_err());
+
+    // Malformed / unknown-user / expired tokens
+    assert!(auth.verify_token("no_dot_separator").is_err());
+    let wrong_user_tok = auth.issue_token("wrong_user").unwrap();
+    assert!(auth.verify_token(&wrong_user_tok).is_err());
+
+    // Observability HTTP server test (/healthz, /metrics, /404)
+    let obs_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let obs_addr = obs_listener.local_addr().unwrap();
+    drop(obs_listener);
+
+    let metrics = ProxyMetrics::new();
+    metrics.inc_records_written(10);
+    metrics.inc_records_read(20);
+    metrics.inc_records_validated(5);
+    metrics.inc_validation_mismatches(1);
+    let healthy_flag = Arc::new( std::sync::atomic::AtomicBool::new(true));
+    let healthy_clone = Arc::clone(&healthy_flag);
+    let addr_str = obs_addr.to_string();
+    tokio::spawn(async move {
+        let _ = serve_observability(&addr_str, metrics, None, move || {
+            healthy_clone.load(Ordering::Relaxed)
+        })
+        .await;
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    async fn http_get(addr: std::net::SocketAddr, path: &str) -> String {
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        let req = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\n\r\n");
+        stream.write_all(req.as_bytes()).await.unwrap();
+        let mut resp = String::new();
+        stream.read_to_string(&mut resp).await.unwrap();
+        resp
+    }
+
+    let resp_ok = http_get(obs_addr, "/healthz").await;
+    assert!(resp_ok.contains("200 OK"));
+    assert!(resp_ok.contains("\"status\":\"ok\""));
+
+    healthy_flag.store(false, Ordering::Relaxed);
+    let resp_unhealthy = http_get(obs_addr, "/readyz").await;
+    assert!(resp_unhealthy.contains("503 Service Unavailable"));
+
+    let resp_metrics = http_get(obs_addr, "/metrics").await;
+    assert!(resp_metrics.contains("200 OK"));
+    assert!(resp_metrics.contains("as_proxy_records_written_total 10"));
+    assert!(resp_metrics.contains("as_proxy_records_read_total 20"));
+
+    let resp_404 = http_get(obs_addr, "/unknown_path").await;
+    assert!(resp_404.contains("404 Not Found"));
+}
+
+#[test]
+fn test_converter_all_read_write_types_and_mismatch_modes() {
+    use arrow_array::builder::{
+        Date64Builder, Float32Builder, FixedSizeBinaryBuilder, Int8Builder, Int16Builder,
+        LargeBinaryBuilder, LargeStringBuilder, TimestampMillisecondBuilder,
+        TimestampNanosecondBuilder, TimestampSecondBuilder, UInt8Builder, UInt16Builder,
+        UInt32Builder, UInt64Builder,
+    };
+    use arrow_array::NullArray;
+    use as_proxy_server::converter::{
+        build_array_from_values, build_lookup_record_batch, decode_arrow_schema_ipc_base64,
+        extract_keys_from_batch, infer_arrow_schema_from_records, records_to_record_batch,
+        validate_record_against_bins, RecordDqResult,
+    };
+
+    // 1. Test build_array_from_values across all supported Arrow DataTypes in both Fail and Null mismatch modes
+    let mut omap = IndexMap::new();
+    omap.insert(Value::String("k1".into()), Value::Int(100));
+    omap.insert(Value::String("f_str".into()), Value::String("hello".into()));
+    omap.insert(Value::String("f_nil".into()), Value::Nil);
+
+    let mut hmap = HashMap::new();
+    hmap.insert(Value::String("k2".into()), Value::Int(200));
+    hmap.insert(Value::String("f_str".into()), Value::String("world".into()));
+
+    let v_bool = Value::Bool(true);
+    let v_int0 = Value::Int(0);
+    let v_int1 = Value::Int(1);
+    let v_int_small = Value::Int(42);
+    let v_int_huge = Value::Int(i64::MAX);
+    let v_float = Value::Float(FloatValue::from(3.5));
+    let v_dec_pos = Value::String("+123.45".into());
+    let v_dec_neg = Value::String("-99.1".into());
+    let v_dec_int = Value::String("50".into());
+    let v_dec_bad = Value::String("not_a_decimal".into());
+    let v_str = Value::String("abc".into());
+    let v_geo = Value::GeoJson("{\"type\":\"Point\"}".into());
+    let v_blob = Value::Blob(vec![1, 2, 3]);
+    let v_hll = Value::Hll(vec![9, 8]);
+    let v_nil = Value::Nil;
+    let v_list = Value::List(vec![Value::Int(10), Value::Nil, Value::Int(20)]);
+    let v_omap = Value::OrderedMap(omap);
+    let v_hmap = Value::HashMap(hmap);
+
+    // Null type
+    let null_arr = build_array_from_values("c", &DataType::Null, &[Some(&v_nil), None], TypeMismatchMode::Fail).unwrap();
+    assert_eq!(null_arr.len(), 2);
+
+    // Boolean (Bool, Int(0), Int(1), Nil, mismatch)
+    let b_arr = build_array_from_values(
+        "c",
+        &DataType::Boolean,
+        &[Some(&v_bool), Some(&v_int0), Some(&v_int1), Some(&v_nil), None, Some(&v_str)],
+        TypeMismatchMode::Null,
+    )
+    .unwrap();
+    assert_eq!(b_arr.len(), 6);
+    assert!(b_arr.is_null(5));
+    assert!(build_array_from_values("c", &DataType::Boolean, &[Some(&v_str)], TypeMismatchMode::Fail).is_err());
+
+    // Int8, Int16, Int32, Int64 (including overflow and mismatch)
+    for dt in [DataType::Int8, DataType::Int16, DataType::Int32, DataType::Int64] {
+        let arr = build_array_from_values(
+            "c",
+            &dt,
+            &[Some(&v_int_small), Some(&v_int_huge), Some(&v_str), None],
+            TypeMismatchMode::Null,
+        )
+        .unwrap();
+        assert_eq!(arr.len(), 4);
+        assert!(build_array_from_values("c", &dt, &[Some(&v_str)], TypeMismatchMode::Fail).is_err());
+    }
+    assert!(build_array_from_values("c", &DataType::Int8, &[Some(&v_int_huge)], TypeMismatchMode::Fail).is_err());
+    assert!(build_array_from_values("c", &DataType::Int16, &[Some(&v_int_huge)], TypeMismatchMode::Fail).is_err());
+    assert!(build_array_from_values("c", &DataType::Int32, &[Some(&v_int_huge)], TypeMismatchMode::Fail).is_err());
+
+    // Float32 & Float64
+    for dt in [DataType::Float32, DataType::Float64] {
+        let arr = build_array_from_values(
+            "c",
+            &dt,
+            &[Some(&v_float), Some(&v_int_small), Some(&v_str), None],
+            TypeMismatchMode::Null,
+        )
+        .unwrap();
+        assert_eq!(arr.len(), 4);
+        assert!(build_array_from_values("c", &dt, &[Some(&v_str)], TypeMismatchMode::Fail).is_err());
+    }
+
+    // Decimal128
+    let dec_dt = DataType::Decimal128(10, 2);
+    let dec_arr = build_array_from_values(
+        "c",
+        &dec_dt,
+        &[
+            Some(&v_dec_pos),
+            Some(&v_dec_neg),
+            Some(&v_dec_int),
+            Some(&v_int_small),
+            Some(&v_dec_bad),
+            Some(&v_blob),
+            None,
+        ],
+        TypeMismatchMode::Null,
+    )
+    .unwrap();
+    assert_eq!(dec_arr.len(), 7);
+    assert!(dec_arr.is_null(4));
+    assert!(dec_arr.is_null(5));
+    assert!(build_array_from_values("c", &dec_dt, &[Some(&v_dec_bad)], TypeMismatchMode::Fail).is_err());
+
+    // Utf8 & Binary
+    let utf_arr = build_array_from_values(
+        "c",
+        &DataType::Utf8,
+        &[Some(&v_str), Some(&v_geo), Some(&v_int_small), None],
+        TypeMismatchMode::Null,
+    )
+    .unwrap();
+    assert_eq!(utf_arr.len(), 4);
+    assert!(build_array_from_values("c", &DataType::Utf8, &[Some(&v_int_small)], TypeMismatchMode::Fail).is_err());
+
+    let bin_arr = build_array_from_values(
+        "c",
+        &DataType::Binary,
+        &[Some(&v_blob), Some(&v_hll), Some(&v_str), None],
+        TypeMismatchMode::Null,
+    )
+    .unwrap();
+    assert_eq!(bin_arr.len(), 4);
+    assert!(build_array_from_values("c", &DataType::Binary, &[Some(&v_str)], TypeMismatchMode::Fail).is_err());
+
+    // Date32 & Timestamps (Second, Millisecond, Microsecond, Nanosecond)
+    for dt in [
+        DataType::Date32,
+        DataType::Timestamp(TimeUnit::Second, None),
+        DataType::Timestamp(TimeUnit::Millisecond, None),
+        DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+        DataType::Timestamp(TimeUnit::Nanosecond, None),
+    ] {
+        let arr = build_array_from_values(
+            "c",
+            &dt,
+            &[Some(&v_int_small), Some(&v_str), None],
+            TypeMismatchMode::Null,
+        )
+        .unwrap();
+        assert_eq!(arr.len(), 3);
+        assert!(build_array_from_values("c", &dt, &[Some(&v_str)], TypeMismatchMode::Fail).is_err());
+    }
+
+    // List, Map, Struct
+    let list_dt = DataType::List(Arc::new(Field::new("item", DataType::Int64, true)));
+    let list_arr = build_array_from_values(
+        "c",
+        &list_dt,
+        &[Some(&v_list), Some(&v_str), None],
+        TypeMismatchMode::Null,
+    )
+    .unwrap();
+    assert_eq!(list_arr.len(), 3);
+    assert!(build_array_from_values("c", &list_dt, &[Some(&v_str)], TypeMismatchMode::Fail).is_err());
+
+    let map_entries_field = Arc::new(Field::new(
+        "entries",
+        DataType::Struct(Fields::from(vec![
+            Field::new("keys", DataType::Utf8, false),
+            Field::new("values", DataType::Int64, true),
+        ])),
+        false,
+    ));
+    let map_dt = DataType::Map(map_entries_field, false);
+    let map_arr = build_array_from_values(
+        "c",
+        &map_dt,
+        &[Some(&v_omap), Some(&v_hmap), Some(&v_str), None],
+        TypeMismatchMode::Null,
+    )
+    .unwrap();
+    assert_eq!(map_arr.len(), 4);
+    assert!(build_array_from_values("c", &map_dt, &[Some(&v_str)], TypeMismatchMode::Fail).is_err());
+
+    let struct_dt = DataType::Struct(Fields::from(vec![
+        Field::new("f_str", DataType::Utf8, true),
+        Field::new("f_nil", DataType::Utf8, true),
+        Field::new("f_missing", DataType::Int64, true),
+    ]));
+    let struct_arr = build_array_from_values(
+        "c",
+        &struct_dt,
+        &[Some(&v_omap), Some(&v_hmap), Some(&v_str), None],
+        TypeMismatchMode::Null,
+    )
+    .unwrap();
+    assert_eq!(struct_arr.len(), 4);
+    assert!(build_array_from_values("c", &struct_dt, &[Some(&v_str)], TypeMismatchMode::Fail).is_err());
+
+    // 2. Test infer_arrow_schema_from_records & digest-only key fallback
+    let digest_only_key = Key::with_digest("test", "users", None, [0xABu8; 20]);
+    let mut rec_bins = IndexMap::new();
+    rec_bins.insert("b_nil".to_string(), Value::Nil);
+    rec_bins.insert("b_bool".to_string(), Value::Bool(true));
+    rec_bins.insert("b_int".to_string(), Value::Int(1));
+    rec_bins.insert("b_flt".to_string(), Value::Float(FloatValue::from(1.0)));
+    rec_bins.insert("b_str".to_string(), Value::String("s".into()));
+    rec_bins.insert("b_blob".to_string(), Value::Blob(vec![1]));
+    rec_bins.insert("b_list".to_string(), Value::List(vec![Value::Int(1)]));
+    rec_bins.insert("b_omap".to_string(), v_omap.clone());
+    rec_bins.insert("b_hmap".to_string(), v_hmap.clone());
+
+    let scanned = vec![ScannedRecord {
+        key: Some(digest_only_key),
+        bins: rec_bins,
+    }];
+    let inferred = infer_arrow_schema_from_records("pk", &scanned);
+    assert_eq!(inferred.fields().len(), 10);
+
+    // records_to_record_batch with 0 fields (count() query) and with digest fallback
+    let empty_schema = Arc::new(Schema::empty());
+    let empty_rb = records_to_record_batch(&empty_schema, "pk", &scanned, TypeMismatchMode::Fail).unwrap();
+    assert_eq!(empty_rb.num_rows(), 1);
+    assert_eq!(empty_rb.num_columns(), 0);
+
+    let hex_key_schema = Arc::new(Schema::new(vec![Field::new("pk", DataType::Utf8, false)]));
+    let hex_rb = records_to_record_batch(&hex_key_schema, "pk", &scanned, TypeMismatchMode::Fail).unwrap();
+    assert_eq!(hex_rb.num_rows(), 1);
+
+    let bin_key_schema = Arc::new(Schema::new(vec![Field::new("pk", DataType::Binary, false)]));
+    let bin_rb = records_to_record_batch(&bin_key_schema, "pk", &scanned, TypeMismatchMode::Fail).unwrap();
+    assert_eq!(bin_rb.num_rows(), 1);
+
+    // 3. Test convert_record_batch and extract_keys_from_batch across extended Arrow types
+    let ext_schema = Arc::new(Schema::new(vec![
+        Field::new("pk", DataType::UInt32, false),
+        Field::new("i8", DataType::Int8, true),
+        Field::new("i16", DataType::Int16, true),
+        Field::new("u8", DataType::UInt8, true),
+        Field::new("u16", DataType::UInt16, true),
+        Field::new("u64", DataType::UInt64, true),
+        Field::new("f32", DataType::Float32, true),
+        Field::new("lstr", DataType::LargeUtf8, true),
+        Field::new("lbin", DataType::LargeBinary, true),
+        Field::new("fbin", DataType::FixedSizeBinary(4), true),
+        Field::new("d64", DataType::Date64, true),
+        Field::new("ts_s", DataType::Timestamp(TimeUnit::Second, None), true),
+        Field::new("ts_ms", DataType::Timestamp(TimeUnit::Millisecond, None), true),
+        Field::new("ts_ns", DataType::Timestamp(TimeUnit::Nanosecond, None), true),
+        Field::new("null_col", DataType::Null, true),
+    ]));
+
+    let mut pk_u32 = UInt32Builder::new();
+    pk_u32.append_value(77);
+    let mut b_i8 = Int8Builder::new();
+    b_i8.append_value(1);
+    let mut b_i16 = Int16Builder::new();
+    b_i16.append_value(2);
+    let mut b_u8 = UInt8Builder::new();
+    b_u8.append_value(3);
+    let mut b_u16 = UInt16Builder::new();
+    b_u16.append_value(4);
+    let mut b_u64 = UInt64Builder::new();
+    b_u64.append_value(5);
+    let mut b_f32 = Float32Builder::new();
+    b_f32.append_value(1.5);
+    let mut b_lstr = LargeStringBuilder::new();
+    b_lstr.append_value("large_str");
+    let mut b_lbin = LargeBinaryBuilder::new();
+    b_lbin.append_value(b"lbin");
+    let mut b_fbin = FixedSizeBinaryBuilder::new(4);
+    b_fbin.append_value(b"abcd").unwrap();
+    let mut b_d64 = Date64Builder::new();
+    b_d64.append_value(86_400_000);
+    let mut b_ts_s = TimestampSecondBuilder::new();
+    b_ts_s.append_value(100);
+    let mut b_ts_ms = TimestampMillisecondBuilder::new();
+    b_ts_ms.append_value(100_000);
+    let mut b_ts_ns = TimestampNanosecondBuilder::new();
+    b_ts_ns.append_value(100_000_000_000);
+
+    let ext_rb = RecordBatch::try_new(
+        ext_schema,
+        vec![
+            Arc::new(pk_u32.finish()),
+            Arc::new(b_i8.finish()),
+            Arc::new(b_i16.finish()),
+            Arc::new(b_u8.finish()),
+            Arc::new(b_u16.finish()),
+            Arc::new(b_u64.finish()),
+            Arc::new(b_f32.finish()),
+            Arc::new(b_lstr.finish()),
+            Arc::new(b_lbin.finish()),
+            Arc::new(b_fbin.finish()),
+            Arc::new(b_d64.finish()),
+            Arc::new(b_ts_s.finish()),
+            Arc::new(b_ts_ms.finish()),
+            Arc::new(b_ts_ns.finish()),
+            Arc::new(NullArray::new(1)),
+        ],
+    )
+    .unwrap();
+
+    let wp_ext = WriteParameters {
+        job_id: None,
+        namespace: "test".into(),
+        set_name: "ext".into(),
+        key_column: "pk".into(),
+        write_mode: WriteMode::Replace,
+        ttl_seconds: None,
+        send_key: true,
+        ignore_nulls: false,
+        use_batch_write: Some(true),
+        validate_only: false,
+    };
+    let prep = convert_record_batch(&ext_rb, &wp_ext, 15).unwrap();
+    assert_eq!(prep.len(), 1);
+    assert_eq!(prep[0].bins.len(), 13); // null_col omitted in Replace mode
+
+    let extr_keys = extract_keys_from_batch(&ext_rb, "test", "ext", "pk").unwrap();
+    assert_eq!(extr_keys.len(), 1);
+    assert!(extract_keys_from_batch(&ext_rb, "test", "ext", "non_existent").is_err());
+
+    // Invalid bin name characters in convert_record_batch
+    for bad_name in ["", "bad space", "bad:colon", "bad;semi", "bad\x01ctrl", "кириллица"] {
+        let bad_schema = Arc::new(Schema::new(vec![
+            Field::new("pk", DataType::Int32, false),
+            Field::new(bad_name, DataType::Int32, true),
+        ]));
+        let mut k = Int32Builder::new();
+        k.append_value(1);
+        let mut v = Int32Builder::new();
+        v.append_value(2);
+        let rb = RecordBatch::try_new(bad_schema, vec![Arc::new(k.finish()), Arc::new(v.finish())]).unwrap();
+        assert!(convert_record_batch(&rb, &wp_ext, 15).is_err());
+    }
+
+    // 4. DQ equality & validate_record_against_bins edge cases
+    assert!(values_equal_dq(&Value::Bool(true), &Value::Int(1)));
+    assert!(values_equal_dq(&Value::Int(0), &Value::Bool(false)));
+    assert!(values_equal_dq(&v_omap, &v_omap));
+    assert!(values_equal_dq(&v_hmap, &v_hmap));
+
+    let all_nil_rec = PreparedRecord {
+        key: Key::new("test", "s", Value::String("k".into())).unwrap(),
+        bins: vec![Bin::new("b1".to_string(), Value::Nil)],
+    };
+    // All-Nil expected record against missing key in Aerospike -> Matched!
+    assert_eq!(validate_record_against_bins(&all_nil_rec, None), RecordDqResult::Matched);
+    let mut non_nil_map = HashMap::new();
+    non_nil_map.insert("b1".to_string(), Value::Int(5));
+    assert!(matches!(
+        validate_record_against_bins(&all_nil_rec, Some(&non_nil_map)),
+        RecordDqResult::BinMismatch(_)
+    ));
+
+    // decode_arrow_schema_ipc_base64 error paths
+    assert!(decode_arrow_schema_ipc_base64("!!!not_base64!!!").is_err());
+    assert!(decode_arrow_schema_ipc_base64("YWJj").is_err());
+
+    // build_lookup_record_batch when Inner join matches 0 rows -> Ok(None)
+    let bins_s = Arc::new(Schema::new(vec![Field::new("b", DataType::Int64, true)]));
+    let none_res = build_lookup_record_batch(
+        &ext_rb,
+        &bins_s,
+        "pk",
+        &[RecordReadOutcome::NotFound],
+        LookupJoinType::Inner,
+        TypeMismatchMode::Fail,
+    )
+    .unwrap();
+    assert!(none_res.is_none());
+}
+
+#[tokio::test]
+async fn test_flight_service_actions_and_error_paths() {
+    use aerospike::ResultCode;
+    use arrow_flight::{Criteria, Empty};
+    use as_proxy_server::writer::{classify_aerospike_failure, compute_backoff_with_jitter};
+
+    // 1. Test classify_aerospike_failure & compute_backoff_with_jitter
+    assert!(matches!(
+        classify_aerospike_failure(None, Some(ResultCode::DeviceOverload)),
+        RecordWriteOutcome::OverloadError(_)
+    ));
+    assert!(matches!(
+        classify_aerospike_failure(None, Some(ResultCode::KeyBusy)),
+        RecordWriteOutcome::OverloadError(_)
+    ));
+    assert!(matches!(
+        classify_aerospike_failure(None, Some(ResultCode::ParameterError)),
+        RecordWriteOutcome::OtherError(_)
+    ));
+    assert!(matches!(
+        classify_aerospike_failure(None, None),
+        RecordWriteOutcome::OtherError(_)
+    ));
+    let backoff = compute_backoff_with_jitter(
+        &RetryConfig {
+            max_other_retries: 3,
+            initial_backoff_ms: 1,
+            max_backoff_ms: 1,
+            backoff_multiplier: 0.5,
+        },
+        0,
+    );
+    assert_eq!(backoff, Duration::from_millis(1));
+
+    // 2. Start Flight server WITHOUT Raft -> do_action returns Unavailable
+    let sink = Arc::new(MockAerospikeSink::new(HashMap::new(), HashMap::new()));
+    let metrics = ProxyMetrics::new();
+    let engine = Arc::new(MppWriteEngine::new(
+        sink,
+        WriterConfig::default(),
+        RetryConfig::default(),
+        metrics.clone(),
+    ));
+    let auth = Arc::new(Authenticator::new(AuthConfig {
+        enabled: false,
+        ..AuthConfig::default()
+    }));
+    let svc_no_raft = ProxyFlightService::new(auth, engine, metrics, 15);
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        Server::builder()
+            .add_service(FlightServiceServer::new(svc_no_raft))
+            .serve_with_incoming(TcpListenerStream::new(listener))
+            .await
+            .unwrap();
+    });
+
+    let channel = tonic::transport::Endpoint::from_shared(format!("http://{addr}"))
+        .unwrap()
+        .connect()
+        .await
+        .unwrap();
+    let mut client = FlightServiceClient::new(channel);
+
+    // list_actions succeeds, unimplemented RPCs return Unimplemented, do_action without Raft returns Unavailable
+    let actions: Vec<_> = client
+        .list_actions(Request::new(Empty {}))
+        .await
+        .unwrap()
+        .into_inner()
+        .try_collect()
+        .await
+        .unwrap();
+    assert_eq!(actions.len(), 4);
+
+    assert!(client.list_flights(Request::new(Criteria { expression: Bytes::new() })).await.is_err());
+    assert!(client.get_flight_info(Request::new(FlightDescriptor::new_cmd(vec![]))).await.is_err());
+    assert!(client.poll_flight_info(Request::new(FlightDescriptor::new_cmd(vec![]))).await.is_err());
+    assert!(client
+        .do_action(Request::new(Action {
+            r#type: "get_cluster_status".into(),
+            body: Bytes::new(),
+        }))
+        .await
+        .is_err());
+}
+
+#[tokio::test]
+async fn test_read_keys_and_dq_validate_retries_and_raft_actions() {
+    use arrow_flight::decode::{DecodedPayload, FlightDataDecoder};
+    use arrow_flight::Ticket;
+
+    let k_ok = Key::new("test", "retry_set", Value::String("k_ok".into())).unwrap();
+    let k_ov = Key::new("test", "retry_set", Value::String("k_ov".into())).unwrap();
+    let k_oth = Key::new("test", "retry_set", Value::String("k_oth".into())).unwrap();
+    let k_fatal = Key::new("test", "retry_set", Value::String("k_fatal".into())).unwrap();
+
+    let mut overload_map = HashMap::new();
+    overload_map.insert(k_ov.clone(), 2);
+    let mut other_map = HashMap::new();
+    other_map.insert(k_oth.clone(), 1);
+    other_map.insert(k_fatal.clone(), 10);
+
+    let sink = Arc::new(MockAerospikeSink::new(overload_map, other_map));
+    {
+        let mut stored = sink.stored.lock().unwrap();
+        stored.insert(k_ok.clone(), vec![Bin::new("v", Value::Int(10))]);
+        stored.insert(k_ov.clone(), vec![Bin::new("v", Value::Int(20))]);
+        stored.insert(k_oth.clone(), vec![Bin::new("v", Value::Int(30))]);
+    }
+
+    let metrics = ProxyMetrics::new();
+    let engine = Arc::new(MppWriteEngine::new(
+        sink.clone(),
+        WriterConfig {
+            use_batch_write: true,
+            batch_write_size: 2,
+            max_in_flight_records: 16,
+            max_concurrent_subbatches_per_stream: 2,
+        },
+        RetryConfig {
+            max_other_retries: 2,
+            initial_backoff_ms: 1,
+            max_backoff_ms: 2,
+            backoff_multiplier: 1.5,
+        },
+        metrics.clone(),
+    ));
+    assert!(engine.is_connected());
+
+    // 1. Test read_keys with OverloadError + OtherError retries succeeding
+    let outcomes = engine
+        .read_keys(vec![k_ok.clone(), k_ov.clone(), k_oth.clone()], Some(vec!["v".into()]))
+        .await
+        .unwrap();
+    assert_eq!(outcomes.len(), 3);
+    assert!(matches!(outcomes[0], RecordReadOutcome::Found(_)));
+    assert!(matches!(outcomes[1], RecordReadOutcome::Found(_)));
+    assert!(matches!(outcomes[2], RecordReadOutcome::Found(_)));
+
+    // 2. Test read_keys with fatal OtherError exceeding max_other_retries
+    assert!(engine.read_keys(vec![k_fatal.clone()], None).await.is_err());
+
+    // 3. Reset attempt counters and test DQ validate_records with OverloadError + OtherError retries
+    sink.write_attempts.lock().unwrap().clear();
+    let dq_params = WriteParameters {
+        job_id: Some("job-dq-retry".into()),
+        namespace: "test".into(),
+        set_name: "retry_set".into(),
+        key_column: "pk".into(),
+        write_mode: WriteMode::Validate,
+        ttl_seconds: None,
+        send_key: true,
+        ignore_nulls: false,
+        use_batch_write: Some(true),
+        validate_only: true,
+    };
+    let dq_stats = engine
+        .validate_records(
+            vec![
+                PreparedRecord {
+                    key: k_ok.clone(),
+                    bins: vec![Bin::new("v", Value::Int(10))],
+                },
+                PreparedRecord {
+                    key: k_ov.clone(),
+                    bins: vec![Bin::new("v", Value::Int(20))],
+                },
+                PreparedRecord {
+                    key: k_oth.clone(),
+                    bins: vec![Bin::new("v", Value::Int(999))], // mismatch
+                },
+            ],
+            &dq_params,
+        )
+        .await
+        .unwrap();
+    assert_eq!(dq_stats.rows_validated, 3);
+    assert_eq!(dq_stats.matched_rows, 2);
+    assert_eq!(dq_stats.mismatched_rows, 1);
+    assert!(dq_stats.overload_retries >= 2);
+    assert!(dq_stats.other_retries >= 1);
+
+    // DQ validate with fatal OtherError
+    sink.write_attempts.lock().unwrap().clear();
+    assert!(engine
+        .validate_records(
+            vec![PreparedRecord {
+                key: k_fatal.clone(),
+                bins: vec![Bin::new("v", Value::Int(1))],
+            }],
+            &dq_params
+        )
+        .await
+        .is_err());
+
+    // 4. Start single-node Raft + Flight service to test do_action (complete_job, fail_job, not_found, unsupported)
+    // and do_put with metadata headers + do_get/do_exchange error paths
+    let raft_l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let raft_addr = raft_l.local_addr().unwrap();
+    drop(raft_l);
+
+    let raft_node = RaftNode::new(RaftConfig {
+        enabled: true,
+        node_id: 1,
+        listen_addr: raft_addr.to_string(),
+        election_timeout_min_ms: 80,
+        election_timeout_max_ms: 150,
+        heartbeat_interval_ms: 25,
+        job_stats_ttl_secs: 3600,
+        peers: vec![],
+    });
+    raft_node.start().await.unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let auth = Arc::new(Authenticator::new(AuthConfig {
+        enabled: false,
+        ..AuthConfig::default()
+    }));
+    let flight_svc = ProxyFlightService::new(auth, engine, metrics, 15).with_raft_node(raft_node);
+
+    let fl_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let fl_addr = fl_listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        Server::builder()
+            .add_service(FlightServiceServer::new(flight_svc))
+            .serve_with_incoming(TcpListenerStream::new(fl_listener))
+            .await
+            .unwrap();
+    });
+
+    let channel = tonic::transport::Endpoint::from_shared(format!("http://{fl_addr}"))
+        .unwrap()
+        .connect()
+        .await
+        .unwrap();
+    let mut client = FlightServiceClient::new(channel);
+
+    // do_action: complete_job & fail_job (plain string and JSON payload), get_job_status not found, unsupported action
+    assert!(client
+        .do_action(Request::new(Action {
+            r#type: "get_job_status".into(),
+            body: Bytes::from_static(b"non_existent_job"),
+        }))
+        .await
+        .is_err());
+    assert!(client
+        .do_action(Request::new(Action {
+            r#type: "get_job_status".into(),
+            body: Bytes::from_static(b"   "),
+        }))
+        .await
+        .is_err());
+    assert!(client
+        .do_action(Request::new(Action {
+            r#type: "complete_job".into(),
+            body: Bytes::from_static(b"job-plain-1"),
+        }))
+        .await
+        .is_ok());
+    assert!(client
+        .do_action(Request::new(Action {
+            r#type: "fail_job".into(),
+            body: Bytes::from_static(br#"{"job_id":"job-json-1","namespace":"test","set_name":"s","error":"boom"}"#),
+        }))
+        .await
+        .is_ok());
+    assert!(client
+        .do_action(Request::new(Action {
+            r#type: "unknown_action".into(),
+            body: Bytes::new(),
+        }))
+        .await
+        .is_err());
+
+    // do_put using gRPC metadata headers (no FlightDescriptor)
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("pk", DataType::Utf8, false),
+        Field::new("v", DataType::Int64, true),
+    ]));
+    let mut k_b = StringBuilder::new();
+    k_b.append_value("k_hdr_1");
+    let mut v_b = Int64Builder::new();
+    v_b.append_value(100);
+    let rb = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(k_b.finish()), Arc::new(v_b.finish())],
+    )
+    .unwrap();
+
+    let put_stream = FlightDataEncoderBuilder::new()
+        .with_schema(schema.clone())
+        .build(stream::iter(vec![Ok(rb)]))
+        .map(|r| r.unwrap());
+    let mut put_req = Request::new(put_stream);
+    put_req.metadata_mut().insert("x-as-namespace", MetadataValue::from_static("test"));
+    put_req.metadata_mut().insert("x-as-set", MetadataValue::from_static("retry_set"));
+    put_req.metadata_mut().insert("x-as-key-column", MetadataValue::from_static("pk"));
+    put_req.metadata_mut().insert("x-as-job-id", MetadataValue::from_static("job-hdr-1"));
+    let mut put_resp = client.do_put(put_req).await.unwrap().into_inner();
+    while (put_resp.try_next().await.unwrap()).is_some() {}
+
+    // do_get PartitionRange with batch_size=3 (4 records -> 3 in loop + 1 trailing flush)
+    let schema_b64 = encode_arrow_schema_ipc_base64(&schema).unwrap();
+    let scan_ticket = serde_json::to_vec(&ReadTicket {
+        namespace: "test".into(),
+        set_name: "retry_set".into(),
+        key_column: "pk".into(),
+        bins: vec![],
+        read_mode: ReadModeSpec::PartitionRange {
+            begin_partition: 0,
+            partition_count: 4096,
+        },
+        batch_size: 3,
+        type_mismatch_mode: TypeMismatchMode::Fail,
+        schema_ipc_base64: schema_b64,
+    })
+    .unwrap();
+    let dg_stream = client
+        .do_get(Request::new(Ticket {
+            ticket: Bytes::from(scan_ticket),
+        }))
+        .await
+        .unwrap()
+        .into_inner()
+        .map_err(arrow_flight::error::FlightError::from);
+    let mut dg_dec = FlightDataDecoder::new(dg_stream);
+    let mut total_scanned = 0;
+    while let Some(msg) = dg_dec.try_next().await.unwrap() {
+        if let DecodedPayload::RecordBatch(b) = msg.payload {
+            total_scanned += b.num_rows();
+        }
+    }
+    assert_eq!(total_scanned, 4);
+
+    // do_put error paths with raft_node & job_id:
+    // (a) conversion error (null PK)
+    let nullable_pk_schema = Arc::new(Schema::new(vec![
+        Field::new("pk", DataType::Utf8, true),
+        Field::new("v", DataType::Int64, true),
+    ]));
+    let mut null_pk_b = StringBuilder::new();
+    null_pk_b.append_null();
+    let mut v_b2 = Int64Builder::new();
+    v_b2.append_value(1);
+    let bad_rb = RecordBatch::try_new(
+        nullable_pk_schema.clone(),
+        vec![Arc::new(null_pk_b.finish()), Arc::new(v_b2.finish())],
+    )
+    .unwrap();
+    let err_params = WriteParameters {
+        job_id: Some("job-conv-err".into()),
+        namespace: "test".into(),
+        set_name: "retry_set".into(),
+        key_column: "pk".into(),
+        write_mode: WriteMode::Update,
+        ttl_seconds: None,
+        send_key: true,
+        ignore_nulls: false,
+        use_batch_write: Some(true),
+        validate_only: false,
+    };
+    let bad_put_stream = FlightDataEncoderBuilder::new()
+        .with_schema(nullable_pk_schema)
+        .with_flight_descriptor(Some(FlightDescriptor::new_cmd(
+            serde_json::to_vec(&err_params).unwrap(),
+        )))
+        .build(stream::iter(vec![Ok(bad_rb)]))
+        .map(|r| r.unwrap());
+    let mut bad_put_resp = client.do_put(Request::new(bad_put_stream)).await.unwrap().into_inner();
+    assert!(bad_put_resp.try_next().await.is_err());
+
+    // (b) fatal write error & fatal DQ validation error via do_put
+    for (jid, val_only) in [("job-write-fatal", false), ("job-dq-fatal", true)] {
+        sink.write_attempts.lock().unwrap().clear();
+        let mut kf_b = StringBuilder::new();
+        kf_b.append_value("k_fatal");
+        let mut vf_b = Int64Builder::new();
+        vf_b.append_value(42);
+        let fatal_rb = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(kf_b.finish()), Arc::new(vf_b.finish())],
+        )
+        .unwrap();
+        let fatal_params = WriteParameters {
+            job_id: Some(jid.into()),
+            namespace: "test".into(),
+            set_name: "retry_set".into(),
+            key_column: "pk".into(),
+            write_mode: if val_only { WriteMode::Validate } else { WriteMode::Update },
+            ttl_seconds: None,
+            send_key: true,
+            ignore_nulls: false,
+            use_batch_write: Some(true),
+            validate_only: val_only,
+        };
+        let fatal_stream = FlightDataEncoderBuilder::new()
+            .with_schema(schema.clone())
+            .with_flight_descriptor(Some(FlightDescriptor::new_cmd(
+                serde_json::to_vec(&fatal_params).unwrap(),
+            )))
+            .build(stream::iter(vec![Ok(fatal_rb)]))
+            .map(|r| r.unwrap());
+        let mut fatal_resp = client.do_put(Request::new(fatal_stream)).await.unwrap().into_inner();
+        assert!(fatal_resp.try_next().await.is_err());
+    }
+
+    // do_get & get_schema error paths
+    assert!(client
+        .get_schema(Request::new(FlightDescriptor::new_cmd(b"{bad_json".to_vec())))
+        .await
+        .is_err());
+    assert!(client
+        .do_get(Request::new(Ticket {
+            ticket: Bytes::from_static(b"{bad_json"),
+        }))
+        .await
+        .is_err());
+
+    // do_exchange when Inner join matches 0 keys -> emits empty batch with out_schema
+    let mut k_miss = StringBuilder::new();
+    k_miss.append_value("definitely_missing_key");
+    let miss_schema = Arc::new(Schema::new(vec![Field::new("pk", DataType::Utf8, false)]));
+    let miss_rb = RecordBatch::try_new(miss_schema.clone(), vec![Arc::new(k_miss.finish())]).unwrap();
+    let bins_only = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, true)]));
+    let ex_params = LookupExchangeParams {
+        namespace: "test".into(),
+        set_name: "retry_set".into(),
+        key_column: "pk".into(),
+        join_type: LookupJoinType::Inner,
+        type_mismatch_mode: TypeMismatchMode::Fail,
+        bins_schema_ipc_base64: encode_arrow_schema_ipc_base64(&bins_only).unwrap(),
+    };
+    let ex_stream = FlightDataEncoderBuilder::new()
+        .with_schema(miss_schema.clone())
+        .with_flight_descriptor(Some(FlightDescriptor::new_cmd(serde_json::to_vec(&ex_params).unwrap())))
+        .build(stream::iter(vec![Ok(miss_rb.clone())]))
+        .map(|r| r.unwrap());
+    let ex_resp = client
+        .do_exchange(Request::new(ex_stream))
+        .await
+        .unwrap()
+        .into_inner()
+        .map_err(arrow_flight::error::FlightError::from);
+    let mut ex_dec = FlightDataDecoder::new(ex_resp);
+    let mut ex_rows = 0;
+    while let Some(msg) = ex_dec.try_next().await.unwrap() {
+        if let DecodedPayload::RecordBatch(b) = msg.payload {
+            ex_rows += b.num_rows();
+        }
+    }
+    assert_eq!(ex_rows, 0);
+
+    // do_exchange error paths: missing FlightDescriptor & invalid FlightDescriptor JSON
+    let no_desc_stream = FlightDataEncoderBuilder::new()
+        .with_schema(miss_schema.clone())
+        .build(stream::iter(vec![Ok(miss_rb.clone())]))
+        .map(|r| r.unwrap());
+    let mut no_desc_resp = client.do_exchange(Request::new(no_desc_stream)).await.unwrap().into_inner();
+    assert!(no_desc_resp.try_next().await.is_err());
+
+    let bad_desc_stream = FlightDataEncoderBuilder::new()
+        .with_schema(miss_schema.clone())
+        .with_flight_descriptor(Some(FlightDescriptor::new_cmd(b"{bad".to_vec())))
+        .build(stream::iter(vec![Ok(miss_rb)]))
+        .map(|r| r.unwrap());
+    let mut bad_desc_resp = client.do_exchange(Request::new(bad_desc_stream)).await.unwrap().into_inner();
+    assert!(bad_desc_resp.try_next().await.is_err());
+
+    // Additional do_get & do_exchange error paths (fatal read_keys & type mismatch fail)
+    let mismatch_schema = Arc::new(Schema::new(vec![
+        Field::new("pk", DataType::Utf8, false),
+        Field::new("v", DataType::Utf8, true), // stored 'v' is Int(10), so Fail mode errors!
+    ]));
+    let mismatch_b64 = encode_arrow_schema_ipc_base64(&mismatch_schema).unwrap();
+
+    for bs in [1, 10] {
+        let t_bytes = serde_json::to_vec(&ReadTicket {
+            namespace: "test".into(),
+            set_name: "retry_set".into(),
+            key_column: "pk".into(),
+            bins: vec!["v".into()],
+            read_mode: ReadModeSpec::PartitionRange {
+                begin_partition: 0,
+                partition_count: 4096,
+            },
+            batch_size: bs,
+            type_mismatch_mode: TypeMismatchMode::Fail,
+            schema_ipc_base64: mismatch_b64.clone(),
+        })
+        .unwrap();
+        let mut s = client
+            .do_get(Request::new(Ticket {
+                ticket: Bytes::from(t_bytes),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        while let Ok(Some(_)) = s.try_next().await {}
+    }
+
+    // BatchKeys with fatal read_keys error & BatchKeys with type mismatch error
+    for (key_str, sc_b64) in [
+        ("k_fatal", encode_arrow_schema_ipc_base64(&schema).unwrap()),
+        ("k_ok", mismatch_b64.clone()),
+    ] {
+        sink.write_attempts.lock().unwrap().clear();
+        let bk_t = serde_json::to_vec(&ReadTicket {
+            namespace: "test".into(),
+            set_name: "retry_set".into(),
+            key_column: "pk".into(),
+            bins: vec!["v".into()],
+            read_mode: ReadModeSpec::BatchKeys {
+                keys: vec![KeyLiteral::String(key_str.into())],
+            },
+            batch_size: 10,
+            type_mismatch_mode: TypeMismatchMode::Fail,
+            schema_ipc_base64: sc_b64,
+        })
+        .unwrap();
+        let mut s = client
+            .do_get(Request::new(Ticket {
+                ticket: Bytes::from(bk_t),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        while let Ok(Some(_)) = s.try_next().await {}
+    }
+
+    // do_exchange with fatal read_keys error & type mismatch error
+    let wrong_bins_only = Arc::new(Schema::new(vec![Field::new("v", DataType::Utf8, true)]));
+    for (key_str, b_schema) in [("k_fatal", bins_only), ("k_ok", wrong_bins_only)] {
+        sink.write_attempts.lock().unwrap().clear();
+        let mut kb = StringBuilder::new();
+        kb.append_value(key_str);
+        let in_rb = RecordBatch::try_new(miss_schema.clone(), vec![Arc::new(kb.finish())]).unwrap();
+        let p = LookupExchangeParams {
+            namespace: "test".into(),
+            set_name: "retry_set".into(),
+            key_column: "pk".into(),
+            join_type: LookupJoinType::Left,
+            type_mismatch_mode: TypeMismatchMode::Fail,
+            bins_schema_ipc_base64: encode_arrow_schema_ipc_base64(&b_schema).unwrap(),
+        };
+        let st = FlightDataEncoderBuilder::new()
+            .with_schema(miss_schema.clone())
+            .with_flight_descriptor(Some(FlightDescriptor::new_cmd(serde_json::to_vec(&p).unwrap())))
+            .build(stream::iter(vec![Ok(in_rb)]))
+            .map(|r| r.unwrap());
+        let mut resp = client.do_exchange(Request::new(st)).await.unwrap().into_inner();
+        while let Ok(Some(_)) = resp.try_next().await {}
+    }
+}
+
+#[test]
+fn test_converter_remaining_key_and_value_types_and_dq_branches() {
+    use arrow_array::{
+        ArrayRef, BinaryViewArray, Decimal256Array, FixedSizeBinaryArray, FixedSizeListArray,
+        Int16Array, Int8Array, LargeBinaryArray, LargeListArray, LargeStringArray, StringViewArray,
+        StructArray, UInt16Array, UInt64Array, UInt8Array,
+    };
+    use arrow_buffer::{i256, NullBuffer, OffsetBuffer};
+    use as_proxy_server::converter::{validate_record_against_bins, RecordDqResult};
+    use indexmap::IndexMap;
+
+    let base_params = WriteParameters {
+        job_id: None,
+        namespace: "test".into(),
+        set_name: "users".into(),
+        key_column: "pk".into(),
+        write_mode: WriteMode::Update,
+        ttl_seconds: None,
+        send_key: true,
+        ignore_nulls: false,
+        use_batch_write: None,
+        validate_only: false,
+    };
+
+    // 1. Empty batch (0 rows) -> Ok(vec![])
+    let s_ok = Arc::new(Schema::new(vec![
+        Field::new("pk", DataType::Int64, false),
+        Field::new("v", DataType::Int64, true),
+    ]));
+    let empty_rb = RecordBatch::new_empty(s_ok.clone());
+    assert!(convert_record_batch(&empty_rb, &base_params, 15).unwrap().is_empty());
+
+    // 2. Missing key_column -> Err
+    let mut bad_key_params = base_params.clone();
+    bad_key_params.key_column = "non_existent".into();
+    let one_row_rb = RecordBatch::try_new(
+        s_ok,
+        vec![
+            Arc::new(arrow_array::Int64Array::from(vec![1])),
+            Arc::new(arrow_array::Int64Array::from(vec![10])),
+        ],
+    )
+    .unwrap();
+    assert!(convert_record_batch(&one_row_rb, &bad_key_params, 15).is_err());
+
+    // 3. Only key column (0 bin columns) -> Err
+    let s_only_pk = Arc::new(Schema::new(vec![Field::new("pk", DataType::Int64, false)]));
+    let rb_only_pk = RecordBatch::try_new(
+        s_only_pk,
+        vec![Arc::new(arrow_array::Int64Array::from(vec![1]))],
+    )
+    .unwrap();
+    assert!(convert_record_batch(&rb_only_pk, &base_params, 15).is_err());
+
+    // 4. Duplicate bin names in schema -> Err
+    let s_dup = Arc::new(Schema::new(vec![
+        Field::new("pk", DataType::Int64, false),
+        Field::new("v", DataType::Int64, true),
+        Field::new("v", DataType::Int64, true),
+    ]));
+    let rb_dup = RecordBatch::try_new(
+        s_dup,
+        vec![
+            Arc::new(arrow_array::Int64Array::from(vec![1])),
+            Arc::new(arrow_array::Int64Array::from(vec![10])),
+            Arc::new(arrow_array::Int64Array::from(vec![20])),
+        ],
+    )
+    .unwrap();
+    assert!(convert_record_batch(&rb_dup, &base_params, 15).is_err());
+
+    // 5. All remaining key types in convert_record_batch
+    let key_arrays: Vec<(DataType, ArrayRef, bool)> = vec![
+        (DataType::Int8, Arc::new(Int8Array::from(vec![7i8])), true),
+        (DataType::Int16, Arc::new(Int16Array::from(vec![700i16])), true),
+        (DataType::Int32, Arc::new(arrow_array::Int32Array::from(vec![70_000i32])), true),
+        (DataType::UInt8, Arc::new(UInt8Array::from(vec![200u8])), true),
+        (DataType::UInt16, Arc::new(UInt16Array::from(vec![50_000u16])), true),
+        (DataType::UInt64, Arc::new(UInt64Array::from(vec![123_456u64])), true),
+        (DataType::UInt64, Arc::new(UInt64Array::from(vec![u64::MAX])), false), // overflow
+        (DataType::LargeUtf8, Arc::new(LargeStringArray::from(vec!["k_large"])), true),
+        (DataType::Utf8View, Arc::new(StringViewArray::from(vec!["k_view"])), true),
+        (DataType::Binary, Arc::new(arrow_array::BinaryArray::from(vec![b"bin_k".as_slice()])), true),
+        (DataType::LargeBinary, Arc::new(LargeBinaryArray::from(vec![b"lbin_k".as_slice()])), true),
+        (
+            DataType::FixedSizeBinary(4),
+            Arc::new(FixedSizeBinaryArray::try_from_iter(vec![vec![1u8, 2, 3, 4]].into_iter()).unwrap()),
+            true,
+        ),
+        (DataType::BinaryView, Arc::new(BinaryViewArray::from(vec![b"bview_k".as_slice()])), true),
+        (DataType::Float64, Arc::new(arrow_array::Float64Array::from(vec![1.5])), false), // unsupported key type
+    ];
+
+    for (dt, key_arr, should_succeed) in key_arrays {
+        let sc = Arc::new(Schema::new(vec![
+            Field::new("pk", dt, false),
+            Field::new("v", DataType::Int64, true),
+        ]));
+        let rb = RecordBatch::try_new(
+            sc,
+            vec![key_arr, Arc::new(arrow_array::Int64Array::from(vec![1]))],
+        )
+        .unwrap();
+        assert_eq!(convert_record_batch(&rb, &base_params, 15).is_ok(), should_succeed);
+    }
+
+    // 6. Remaining value types: Decimal256, Utf8View, BinaryView, LargeList, FixedSizeList, Struct with ignore_nulls=true
+    let dec256_arr = Decimal256Array::from(vec![i256::from_i128(12345)])
+        .with_precision_and_scale(38, 2)
+        .unwrap();
+    let uview_arr = StringViewArray::from(vec!["hello_view"]);
+    let bview_arr = BinaryViewArray::from(vec![b"bytes_view".as_slice()]);
+
+    let item_field = Arc::new(Field::new("item", DataType::Int32, true));
+    let llist_arr = LargeListArray::new(
+        item_field.clone(),
+        OffsetBuffer::new(vec![0i64, 2].into()),
+        Arc::new(arrow_array::Int32Array::from(vec![10, 20])),
+        None,
+    );
+    let fslist_arr = FixedSizeListArray::new(
+        item_field,
+        2,
+        Arc::new(arrow_array::Int32Array::from(vec![30, 40])),
+        None,
+    );
+
+    let struct_fields: arrow_schema::Fields = vec![
+        Field::new("keep", DataType::Int32, true),
+        Field::new("drop_null", DataType::Utf8, true),
+    ]
+    .into();
+    let mut drop_b = StringBuilder::new();
+    drop_b.append_null();
+    let struct_arr = StructArray::new(
+        struct_fields.clone(),
+        vec![
+            Arc::new(arrow_array::Int32Array::from(vec![99])),
+            Arc::new(drop_b.finish()),
+        ],
+        Some(NullBuffer::from(vec![true])),
+    );
+
+    let val_schema = Arc::new(Schema::new(vec![
+        Field::new("pk", DataType::Int64, false),
+        Field::new("d256", DataType::Decimal256(38, 2), true),
+        Field::new("uv", DataType::Utf8View, true),
+        Field::new("bv", DataType::BinaryView, true),
+        Field::new("ll", DataType::LargeList(Arc::new(Field::new("item", DataType::Int32, true))), true),
+        Field::new("fsl", DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Int32, true)), 2), true),
+        Field::new("st", DataType::Struct(struct_fields), true),
+    ]));
+
+    let val_rb = RecordBatch::try_new(
+        val_schema,
+        vec![
+            Arc::new(arrow_array::Int64Array::from(vec![1])),
+            Arc::new(dec256_arr),
+            Arc::new(uview_arr),
+            Arc::new(bview_arr),
+            Arc::new(llist_arr),
+            Arc::new(fslist_arr),
+            Arc::new(struct_arr),
+        ],
+    )
+    .unwrap();
+
+    let mut ignore_null_params = base_params.clone();
+    ignore_null_params.ignore_nulls = true;
+    let recs = convert_record_batch(&val_rb, &ignore_null_params, 15).unwrap();
+    assert_eq!(recs.len(), 1);
+    assert_eq!(recs[0].bins.len(), 6);
+    if let Value::OrderedMap(m) = &recs[0].bins[5].value {
+        assert_eq!(m.len(), 1); // drop_null was omitted because ignore_nulls = true
+    } else {
+        panic!("expected OrderedMap for struct bin");
+    }
+
+    // 7. values_equal_dq & validate_record_against_bins remaining branches
+    assert!(values_equal_dq(&Value::Bool(true), &Value::Bool(true)));
+    assert!(!values_equal_dq(&Value::Bool(true), &Value::Bool(false)));
+    assert!(values_equal_dq(&Value::Bool(true), &Value::Int(1)));
+    assert!(values_equal_dq(&Value::Int(0), &Value::Bool(false)));
+    assert!(values_equal_dq(&Value::Blob(vec![1, 2]), &Value::Blob(vec![1, 2])));
+
+    let mut hm = HashMap::new();
+    hm.insert(Value::String("k".into()), Value::Float(FloatValue::from(f64::NAN)));
+    let mut om = IndexMap::new();
+    om.insert(Value::String("k".into()), Value::Float(FloatValue::from(f64::NAN)));
+    assert!(values_equal_dq(&Value::HashMap(hm.clone()), &Value::OrderedMap(om.clone())));
+    assert!(values_equal_dq(&Value::OrderedMap(om.clone()), &Value::HashMap(hm.clone())));
+    assert!(values_equal_dq(&Value::OrderedMap(om.clone()), &Value::OrderedMap(om)));
+    assert!(values_equal_dq(&Value::HashMap(hm.clone()), &Value::HashMap(hm)));
+
+    let key = Key::new("test", "users", Value::Int(1)).unwrap();
+    let prep_non_nil = PreparedRecord {
+        key: key.clone(),
+        bins: vec![Bin::new("a", Value::Int(1))],
+    };
+    let prep_all_nil = PreparedRecord {
+        key: key.clone(),
+        bins: vec![Bin::new("a", Value::Nil)],
+    };
+    assert_eq!(
+        validate_record_against_bins(&prep_non_nil, None),
+        RecordDqResult::MissingKey
+    );
+    assert_eq!(
+        validate_record_against_bins(&prep_all_nil, None),
+        RecordDqResult::Matched
+    );
+    let empty_actual = HashMap::new();
+    assert!(matches!(
+        validate_record_against_bins(&prep_non_nil, Some(&empty_actual)),
+        RecordDqResult::BinMismatch(_)
+    ));
+    let mut actual_map = HashMap::new();
+    actual_map.insert("a".to_string(), Value::Int(1));
+    assert_eq!(
+        validate_record_against_bins(&prep_non_nil, Some(&actual_map)),
+        RecordDqResult::Matched
+    );
+    assert!(matches!(
+        validate_record_against_bins(&prep_all_nil, Some(&actual_map)),
+        RecordDqResult::BinMismatch(_)
+    ));
 }

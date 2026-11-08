@@ -13,7 +13,9 @@ import org.apache.spark.sql.types._
 class ArrowBatchConverter(
     sparkSchema: StructType,
     keyColumn: String,
-    root: VectorSchemaRoot
+    root: VectorSchemaRoot,
+    ignoreNulls: Boolean = false,
+    validateOnly: Boolean = false
 ) {
 
   private val fields: Array[StructField] = sparkSchema.fields
@@ -25,8 +27,20 @@ class ArrowBatchConverter(
     idx
   }
 
-  private val fieldVectors: Array[FieldVector] =
-    fields.indices.map(i => root.getVector(i)).toArray
+  // Indices of non-key columns in the input Spark InternalRow that can carry non-null values
+  private val nonKeySparkOrdinals: Array[Int] = fields.indices
+    .filter(i => i != keyColumnIndex && !(ignoreNulls && !validateOnly && fields(i).dataType == NullType))
+    .toArray
+
+  // Active columns mapped into VectorSchemaRoot (excludes NullType columns when ignoreNulls = true)
+  private val activeColumns: Array[(Int, StructField, FieldVector)] = {
+    val activeSparkIndices = fields.indices.filter { i =>
+      i == keyColumnIndex || !(ignoreNulls && !validateOnly && fields(i).dataType == NullType)
+    }
+    activeSparkIndices.zipWithIndex.map { case (sparkIdx, arrowIdx) =>
+      (sparkIdx, fields(sparkIdx), root.getVector(arrowIdx))
+    }.toArray
+  }
 
   private var currentRowCount: Int = 0
 
@@ -35,22 +49,41 @@ class ArrowBatchConverter(
     currentRowCount = 0
   }
 
-  def appendRow(row: InternalRow): Unit = {
+  /**
+   * Append a Spark `InternalRow` to the current Arrow batch.
+   * Returns `true` if the row was appended, or `false` if `ignoreNulls = true` (and `!validateOnly`)
+   * and all bin columns in the row are `null` (so the row is not sent over Arrow Flight).
+   */
+  def appendRow(row: InternalRow): Boolean = {
     if (row.isNullAt(keyColumnIndex)) {
       throw new IllegalArgumentException(
         s"Null value encountered in primary key column '$keyColumn' at batch row $currentRowCount"
       )
     }
 
-    var colIdx = 0
-    while (colIdx < fields.length) {
-      val field = fields(colIdx)
-      val vector = fieldVectors(colIdx)
-      writeValue(row, colIdx, field.dataType, vector, currentRowCount)
-      colIdx += 1
+    if (ignoreNulls && !validateOnly) {
+      var hasNonNullBin = false
+      var i = 0
+      while (i < nonKeySparkOrdinals.length && !hasNonNullBin) {
+        if (!row.isNullAt(nonKeySparkOrdinals(i))) {
+          hasNonNullBin = true
+        }
+        i += 1
+      }
+      if (!hasNonNullBin) {
+        return false
+      }
+    }
+
+    var idx = 0
+    while (idx < activeColumns.length) {
+      val (sparkOrdinal, field, vector) = activeColumns(idx)
+      writeValue(row, sparkOrdinal, field.dataType, vector, currentRowCount)
+      idx += 1
     }
 
     currentRowCount += 1
+    true
   }
 
   def finishBatch(): Int = {
@@ -74,6 +107,9 @@ class ArrowBatchConverter(
     }
 
     dataType match {
+      case NullType =>
+        setNull(vector, targetIndex)
+
       case BooleanType =>
         vector.asInstanceOf[BitVector].setSafe(targetIndex, if (getter.getBoolean(ordinal)) 1 else 0)
 
@@ -197,6 +233,7 @@ class ArrowBatchConverter(
       case v: BaseVariableWidthVector => v.setNull(targetIndex)
       case v: ListVector              => v.setNull(targetIndex)
       case v: StructVector            => v.setNull(targetIndex)
+      case _: NullVector              => // NullVector entries are inherently null
       case _                          =>
     }
   }

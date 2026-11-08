@@ -39,6 +39,10 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+          components: llvm-tools-preview
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
 
       - name: Cache Cargo build
         uses: Swatinem/rust-cache@v2
@@ -46,8 +50,13 @@ jobs:
           workspaces: "proxy_server -> target"
           key: ${{ matrix.arch }}
 
-      - name: Run unit & integration tests
-        run: cargo test --all-targets --target ${{ matrix.target }}
+      - name: Run unit & integration tests with coverage (>= 85%)
+        run: |
+          cargo llvm-cov --all-targets --target ${{ matrix.target }} --summary-only --fail-under-lines 85 | tee coverage-rust.txt
+          echo "### 🦀 Rust Proxy Server Coverage (${{ matrix.arch }})" >> $GITHUB_STEP_SUMMARY
+          echo '```text' >> $GITHUB_STEP_SUMMARY
+          cat coverage-rust.txt >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
 
       - name: Build release binary (${{ matrix.arch }})
         run: |
@@ -83,11 +92,19 @@ jobs:
       - name: Set up sbt
         uses: sbt/setup-sbt@v1
 
-      - name: Run Scala unit tests
-        run: sbt test
+      - name: Run Scala unit tests with scoverage (>= 85%)
+        run: |
+          sbt --batch clean coverage test coverageReport
+          STMT_COV=$(python3 -c "import xml.etree.ElementTree as ET; r = ET.parse('target/scala-2.12/scoverage-report/scoverage.xml').getroot(); print(r.attrib.get('statement-rate', '0'))")
+          BRANCH_COV=$(python3 -c "import xml.etree.ElementTree as ET; r = ET.parse('target/scala-2.12/scoverage-report/scoverage.xml').getroot(); print(r.attrib.get('branch-rate', '0'))")
+          echo "### ⚡ Spark Connector (Scala 2.12) Coverage" >> $GITHUB_STEP_SUMMARY
+          echo "| Metric | Coverage | Minimum Threshold |" >> $GITHUB_STEP_SUMMARY
+          echo "| :--- | :---: | :---: |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Statement Coverage** | **${STMT_COV}%** | >= 85.00% |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Branch Coverage** | **${BRANCH_COV}%** | - |" >> $GITHUB_STEP_SUMMARY
 
       - name: Build shaded Fat-JAR (sbt assembly)
-        run: sbt assembly
+        run: sbt --batch "set ThisBuild / coverageEnabled := false" assembly
 
       - name: Upload Spark Connector Fat-JAR artifact
         uses: actions/upload-artifact@v4

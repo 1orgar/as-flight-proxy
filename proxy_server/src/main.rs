@@ -45,20 +45,7 @@ struct CliArgs {
     aerospike_hosts: Option<String>,
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .init();
-
-    let args = CliArgs::parse();
-    let mut cfg = match args.config {
-        Some(ref path) => AppConfig::from_file(path)?,
-        None => AppConfig::default(),
-    };
-
+fn apply_cli_overrides(cfg: &mut AppConfig, args: CliArgs) {
     if let Some(addr) = args.listen_addr {
         cfg.server.listen_addr = addr;
     }
@@ -71,6 +58,89 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(hosts) = args.aerospike_hosts {
         cfg.aerospike.hosts = hosts;
     }
+}
+
+fn load_and_apply_config(args: CliArgs) -> Result<AppConfig, Box<dyn std::error::Error>> {
+    let mut cfg = match args.config {
+        Some(ref path) => AppConfig::from_file(path)?,
+        None => AppConfig::default(),
+    };
+    apply_cli_overrides(&mut cfg, args);
+    Ok(cfg)
+}
+
+fn build_client_policy(cfg: &AppConfig) -> ClientPolicy {
+    let mut client_policy = ClientPolicy::default();
+    client_policy.auth_mode = AuthMode::None;
+    client_policy.timeout = cfg.aerospike.timeout_ms;
+    client_policy.connect_timeout = cfg.aerospike.connect_timeout_ms;
+    client_policy.min_conns_per_node = cfg.aerospike.min_conns_per_node;
+    client_policy.max_conns_per_node = cfg.aerospike.max_conns_per_node;
+    client_policy.conn_pools_per_node = cfg.aerospike.conn_pools_per_node;
+    client_policy
+}
+
+fn build_node_status_meta(
+    cfg: &AppConfig,
+    metrics: &ProxyMetrics,
+    aerospike_connected: bool,
+) -> NodeStatusMeta {
+    NodeStatusMeta {
+        node_id: cfg.raft.node_id,
+        raft_addr: cfg.raft.listen_addr.clone(),
+        flight_addr: cfg.server.listen_addr.clone(),
+        active_streams: metrics.active_streams.load(Ordering::Relaxed),
+        in_flight_records: metrics.in_flight_records.load(Ordering::Relaxed),
+        total_records_written: metrics.records_written_total.load(Ordering::Relaxed),
+        aerospike_connected,
+        last_updated_ms: now_ms(),
+    }
+}
+
+fn configure_server_builder(cfg: &AppConfig) -> Result<Server, Box<dyn std::error::Error>> {
+    let mut server_builder = Server::builder()
+        .tcp_nodelay(cfg.server.tcp_nodelay)
+        .initial_stream_window_size(cfg.server.http2_stream_window_size_mb * 1024 * 1024)
+        .initial_connection_window_size(cfg.server.http2_connection_window_size_mb * 1024 * 1024);
+
+    if cfg.tls.enabled {
+        let cert_path = cfg
+            .tls
+            .cert_path
+            .as_ref()
+            .ok_or("tls.cert_path is required when tls.enabled = true")?;
+        let key_path = cfg
+            .tls
+            .key_path
+            .as_ref()
+            .ok_or("tls.key_path is required when tls.enabled = true")?;
+
+        let cert_pem = fs::read(cert_path)?;
+        let key_pem = fs::read(key_path)?;
+        let identity = Identity::from_pem(cert_pem, key_pem);
+
+        let mut tls_config = ServerTlsConfig::new().identity(identity);
+        if let Some(ref ca_path) = cfg.tls.client_ca_path {
+            let ca_pem = fs::read(ca_path)?;
+            tls_config = tls_config.client_ca_root(Certificate::from_pem(ca_pem));
+        }
+
+        server_builder = server_builder.tls_config(tls_config)?;
+        info!("TLS enabled on Arrow Flight gRPC server");
+    }
+
+    Ok(server_builder)
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
+        .init();
+
+    let cfg = load_and_apply_config(CliArgs::parse())?;
 
     info!(
         node_id = cfg.raft.node_id,
@@ -86,15 +156,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "Starting Arrow Flight -> Aerospike 8+ MPP Proxy Server"
     );
 
-    // Initialize Aerospike 8+ Community Edition async client (no auth)
-    let mut client_policy = ClientPolicy::default();
-    client_policy.auth_mode = AuthMode::None;
-    client_policy.timeout = cfg.aerospike.timeout_ms;
-    client_policy.connect_timeout = cfg.aerospike.connect_timeout_ms;
-    client_policy.min_conns_per_node = cfg.aerospike.min_conns_per_node;
-    client_policy.max_conns_per_node = cfg.aerospike.max_conns_per_node;
-    client_policy.conn_pools_per_node = cfg.aerospike.conn_pools_per_node;
-
+    let client_policy = build_client_policy(&cfg);
     let as_client = Arc::new(
         Client::new(&client_policy, &cfg.aerospike.hosts)
             .await
@@ -119,30 +181,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let node = RaftNode::new(cfg.raft.clone());
         node.start().await?;
 
-        // Periodically publish this node's status into the Raft metadata state machine
         let raft_for_hb = Arc::clone(&node);
         let metrics_for_hb = Arc::clone(&metrics);
         let engine_for_hb = Arc::clone(&write_engine);
-        let node_id = cfg.raft.node_id;
-        let raft_addr_str = cfg.raft.listen_addr.clone();
-        let flight_addr_str = cfg.server.listen_addr.clone();
+        let cfg_for_hb = cfg.clone();
 
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(2));
             loop {
                 interval.tick().await;
-                let meta = NodeStatusMeta {
-                    node_id,
-                    raft_addr: raft_addr_str.clone(),
-                    flight_addr: flight_addr_str.clone(),
-                    active_streams: metrics_for_hb.active_streams.load(Ordering::Relaxed),
-                    in_flight_records: metrics_for_hb.in_flight_records.load(Ordering::Relaxed),
-                    total_records_written: metrics_for_hb
-                        .records_written_total
-                        .load(Ordering::Relaxed),
-                    aerospike_connected: engine_for_hb.is_connected(),
-                    last_updated_ms: now_ms(),
-                };
+                let meta = build_node_status_meta(&cfg_for_hb, &metrics_for_hb, engine_for_hb.is_connected());
                 let _ = raft_for_hb
                     .propose(MetadataCommand::UpsertNodeStatus(meta))
                     .await;
@@ -189,39 +237,79 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .max_encoding_message_size(max_msg_bytes);
 
     let addr: SocketAddr = cfg.server.listen_addr.parse()?;
-    let mut server_builder = Server::builder()
-        .tcp_nodelay(cfg.server.tcp_nodelay)
-        .initial_stream_window_size(cfg.server.http2_stream_window_size_mb * 1024 * 1024)
-        .initial_connection_window_size(cfg.server.http2_connection_window_size_mb * 1024 * 1024);
-
-    if cfg.tls.enabled {
-        let cert_path = cfg
-            .tls
-            .cert_path
-            .as_ref()
-            .ok_or("tls.cert_path is required when tls.enabled = true")?;
-        let key_path = cfg
-            .tls
-            .key_path
-            .as_ref()
-            .ok_or("tls.key_path is required when tls.enabled = true")?;
-
-        let cert_pem = fs::read(cert_path)?;
-        let key_pem = fs::read(key_path)?;
-        let identity = Identity::from_pem(cert_pem, key_pem);
-
-        let mut tls_config = ServerTlsConfig::new().identity(identity);
-        if let Some(ref ca_path) = cfg.tls.client_ca_path {
-            let ca_pem = fs::read(ca_path)?;
-            tls_config = tls_config.client_ca_root(Certificate::from_pem(ca_pem));
-        }
-
-        server_builder = server_builder.tls_config(tls_config)?;
-        info!("TLS enabled on Arrow Flight gRPC server");
-    }
+    let mut server_builder = configure_server_builder(&cfg)?;
 
     info!("Arrow Flight gRPC server listening on {addr}");
     server_builder.add_service(svc).serve(addr).await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_cli_args_parsing_and_helpers() {
+        let args = CliArgs::try_parse_from([
+            "as_proxy_server",
+            "--listen-addr",
+            "127.0.0.1:9915",
+            "--raft-addr",
+            "127.0.0.1:9916",
+            "--node-id",
+            "3",
+            "--aerospike-hosts",
+            "10.0.0.10:3000",
+        ])
+        .unwrap();
+
+        let mut cfg = load_and_apply_config(args).unwrap();
+        assert_eq!(cfg.server.listen_addr, "127.0.0.1:9915");
+        assert_eq!(cfg.raft.listen_addr, "127.0.0.1:9916");
+        assert_eq!(cfg.raft.node_id, 3);
+        assert_eq!(cfg.aerospike.hosts, "10.0.0.10:3000");
+
+        let policy = build_client_policy(&cfg);
+        assert_eq!(policy.timeout, cfg.aerospike.timeout_ms);
+
+        let metrics = ProxyMetrics::new();
+        let meta = build_node_status_meta(&cfg, &metrics, true);
+        assert_eq!(meta.node_id, 3);
+        assert!(meta.aerospike_connected);
+
+        assert!(configure_server_builder(&cfg).is_ok());
+
+        // TLS enabled validation checks
+        cfg.tls.enabled = true;
+        assert!(configure_server_builder(&cfg).is_err());
+        cfg.tls.cert_path = Some("/nonexistent/cert.pem".into());
+        assert!(configure_server_builder(&cfg).is_err());
+        cfg.tls.key_path = Some("/nonexistent/key.pem".into());
+        assert!(configure_server_builder(&cfg).is_err());
+
+        let cert_file = tempfile::NamedTempFile::new().unwrap();
+        let key_file = tempfile::NamedTempFile::new().unwrap();
+        let ca_file = tempfile::NamedTempFile::new().unwrap();
+        fs::write(cert_file.path(), b"-----BEGIN CERTIFICATE-----\n-----END CERTIFICATE-----\n").unwrap();
+        fs::write(key_file.path(), b"-----BEGIN PRIVATE KEY-----\n-----END PRIVATE KEY-----\n").unwrap();
+        fs::write(ca_file.path(), b"-----BEGIN CERTIFICATE-----\n-----END CERTIFICATE-----\n").unwrap();
+
+        cfg.tls.cert_path = Some(cert_file.path().to_string_lossy().to_string());
+        cfg.tls.key_path = Some(key_file.path().to_string_lossy().to_string());
+        cfg.tls.client_ca_path = Some(ca_file.path().to_string_lossy().to_string());
+        let _ = configure_server_builder(&cfg);
+
+        // Also test loading from --config file
+        let cfg_file = tempfile::NamedTempFile::new().unwrap();
+        fs::write(cfg_file.path(), "[server]\nlisten_addr = \"127.0.0.1:7715\"\n").unwrap();
+        let args_from_file = CliArgs::try_parse_from([
+            "as_proxy_server",
+            "--config",
+            &cfg_file.path().to_string_lossy(),
+        ])
+        .unwrap();
+        let loaded = load_and_apply_config(args_from_file).unwrap();
+        assert_eq!(loaded.server.listen_addr, "127.0.0.1:7715");
+    }
 }

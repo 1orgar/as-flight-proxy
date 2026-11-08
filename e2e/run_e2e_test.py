@@ -293,6 +293,113 @@ def main():
     assert len(dq_fail_status["dq_mismatch_samples"]) == 5
     print("  [OK] Negative DQ Validation accurately caught 3 bin mismatches and 2 missing keys!")
 
+    # -------------------------------------------------------------------------
+    # STEP 5: Read from Aerospike into Spark DataFrame (Explicit Schema, inferSchema, & PK Pushdown)
+    # -------------------------------------------------------------------------
+    print(f"\n=== [Step 5] Reading {total_rows} rows back into Spark DataFrame (Partition Scan, inferSchema, & PK Pushdown) ===")
+
+    common_read_opts = {
+        "flight.hosts": ",".join(PROXY_ENDPOINTS),
+        "flight.username": USERNAME,
+        "flight.password": PASSWORD,
+        "aerospike.namespace": NAMESPACE,
+        "aerospike.set": SET_NAME,
+        "aerospike.keyColumn": "user_id",
+        "aerospike.read.numPartitions": "8",
+    }
+
+    # 5a. Full parallel partition scan with explicit schema (including Date, Timestamp, Array, Map, Struct)
+    df_read_full = (
+        spark.read.format("aerospike-flight")
+        .schema(schema)
+        .options(**common_read_opts)
+        .load()
+    )
+    read_count = df_read_full.count()
+    assert read_count == total_rows, f"Expected {total_rows} rows from full scan, got {read_count}"
+
+    sample_row = df_read_full.filter("user_id = 'user_0001'").collect()
+    assert len(sample_row) == 1
+    r_u1 = sample_row[0]
+    assert r_u1["age"] == 21
+    assert r_u1["is_active"] is False
+    assert list(r_u1["tags"]) == ["tag_1", "common"]
+    assert r_u1["profile"]["tier"] == "silver"
+    assert r_u1["profile"]["points"] == 100
+    print(f"  [OK] Full Partition Scan with explicit schema read {read_count} rows (nested CDT Struct/Map/Array verified)!")
+
+    # 5b. Auto schema inference (no .schema(...) call) + Column Pruning
+    df_inferred = (
+        spark.read.format("aerospike-flight")
+        .options(**common_read_opts)
+        .option("aerospike.read.sampleSize", "50")
+        .load()
+    )
+    inferred_cols = set(df_inferred.columns)
+    assert {"user_id", "age", "balance", "is_active", "tags"}.issubset(inferred_cols), (
+        f"Unexpected inferred columns: {inferred_cols}"
+    )
+    pruned_rows = df_inferred.select("user_id", "age").collect()
+    assert len(pruned_rows) == total_rows
+    print(f"  [OK] inferSchema + Column Pruning succeeded ({len(inferred_cols)} columns inferred, {len(pruned_rows)} rows read)!")
+
+    # 5c. PK Filter Pushdown (WHERE user_id IN (...)) -> executes BatchGet instead of full scan
+    df_pk_pushed = (
+        spark.read.format("aerospike-flight")
+        .schema(schema)
+        .options(**common_read_opts)
+        .load()
+        .filter("user_id IN ('user_0001', 'user_0010', 'user_0025', 'user_does_not_exist')")
+    )
+    pushed_rows = df_pk_pushed.collect()
+    assert len(pushed_rows) == 3, f"Expected 3 rows from PK pushdown BatchGet, got {len(pushed_rows)}"
+    print("  [OK] PK Filter Pushdown (BatchGet) returned 3/3 existing keys!")
+
+    # -------------------------------------------------------------------------
+    # STEP 6: Distributed DataFrame Key-Lookup via Arrow Flight DoExchange
+    # -------------------------------------------------------------------------
+    print("\n=== [Step 6] Enriching Distributed Keys DataFrame via DoExchange (AerospikeFlightLookup & sourceView) ===")
+    from pyspark.sql import DataFrame
+
+    keys_data = [
+        (1001, "user_0001"),
+        (1002, "user_0002"),
+        (1003, "user_missing_9999"),
+        (1004, "user_0004"),
+    ]
+    keys_df = spark.createDataFrame(keys_data, ["req_id", "user_id"]).repartition(2)
+
+    # 6a. Direct call via AerospikeFlightLookup.lookup (Left join)
+    lookup_opts = dict(common_read_opts)
+    lookup_opts["aerospike.lookup.joinType"] = "left"
+    jdf_left = spark._jvm.com.asproxy.spark.AerospikeFlightLookup.lookup(
+        keys_df._jdf,
+        "age INT, is_active BOOLEAN, tags ARRAY<STRING>",
+        lookup_opts,
+    )
+    enriched_left_df = DataFrame(jdf_left, spark)
+    left_rows = {r["req_id"]: r for r in enriched_left_df.collect()}
+    assert len(left_rows) == 4, f"Expected 4 rows in left lookup, got {len(left_rows)}"
+    assert left_rows[1001]["age"] == 21
+    assert left_rows[1002]["age"] == 22
+    assert left_rows[1003]["age"] is None and left_rows[1003]["tags"] is None
+    assert left_rows[1004]["age"] == 24
+    print("  [OK] AerospikeFlightLookup.lookup (LEFT join) enriched 4 rows (preserving req_id and setting NULL for missing key)!")
+
+    # 6b. Native spark.read with aerospike.lookup.sourceView (Inner join, no _jvm needed!)
+    keys_df.createOrReplaceTempView("keys_to_enrich")
+    enriched_inner_df = (
+        spark.read.format("aerospike-flight")
+        .options(**common_read_opts)
+        .option("aerospike.lookup.sourceView", "keys_to_enrich")
+        .option("aerospike.lookup.binsSchema", "age INT, is_active BOOLEAN")
+        .option("aerospike.lookup.joinType", "inner")
+        .load()
+    )
+    inner_rows = enriched_inner_df.collect()
+    assert len(inner_rows) == 3, f"Expected 3 rows in inner lookup via sourceView, got {len(inner_rows)}"
+    print("  [OK] spark.read with aerospike.lookup.sourceView (INNER join) returned 3 matched rows without _jvm!")
+
     print("\n======================================================================")
     print("ALL E2E TESTS PASSED SUCCESSFULLY! (2x Aerospike CE + 2x Proxy + Spark)")
     print("======================================================================\n")

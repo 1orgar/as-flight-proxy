@@ -1,7 +1,9 @@
 use aerospike::operations;
+use aerospike::query::PartitionFilter;
 use aerospike::{
     BatchOperation, BatchPolicy, BatchReadPolicy, BatchWritePolicy, Bins, Client,
-    ClientResultCode, Concurrency, ErrorKind, ResultCode, Value, WritePolicy,
+    ClientResultCode, Concurrency, ErrorKind, Key, QueryPolicy, ResultCode, Statement, Value,
+    WritePolicy,
 };
 use futures::stream::{FuturesUnordered, StreamExt};
 use rand::Rng;
@@ -9,11 +11,13 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::Semaphore;
+use tokio::sync::{Semaphore, mpsc};
 use tracing::{debug, warn};
 
 use crate::config::{RetryConfig, WriteParameters, WriterConfig};
-use crate::converter::{PreparedRecord, RecordDqResult, validate_record_against_bins};
+use crate::converter::{
+    PreparedRecord, RecordDqResult, ScannedRecord, validate_record_against_bins,
+};
 use crate::error::{ProxyError, Result};
 use crate::metrics::ProxyMetrics;
 
@@ -85,6 +89,69 @@ pub trait AerospikeSink: Send + Sync + 'static {
         params: &WriteParameters,
     ) -> Vec<RecordReadOutcome>;
 
+    async fn execute_batch_read_keys(
+        &self,
+        keys: &[Key],
+        bins: Option<&[String]>,
+    ) -> Vec<RecordReadOutcome> {
+        let dummy_params = WriteParameters {
+            job_id: None,
+            namespace: keys
+                .first()
+                .map(|k| k.namespace().to_string())
+                .unwrap_or_else(|| "test".to_string()),
+            set_name: keys
+                .first()
+                .map(|k| k.set_name().to_string())
+                .unwrap_or_default(),
+            key_column: "pk".to_string(),
+            write_mode: crate::config::WriteMode::Update,
+            ttl_seconds: None,
+            send_key: true,
+            ignore_nulls: false,
+            use_batch_write: Some(true),
+            validate_only: true,
+        };
+        let recs: Vec<PreparedRecord> = keys
+            .iter()
+            .map(|k| PreparedRecord {
+                key: k.clone(),
+                bins: Vec::new(),
+            })
+            .collect();
+        let mut outcomes = self.execute_batch_read(&recs, &dummy_params).await;
+        if let Some(requested_bins) = bins {
+            for outcome in &mut outcomes {
+                if let RecordReadOutcome::Found(map) = outcome {
+                    map.retain(|k, _| requested_bins.iter().any(|b| b == k));
+                }
+            }
+        }
+        outcomes
+    }
+
+    async fn scan_partition_range(
+        &self,
+        namespace: &str,
+        set_name: &str,
+        begin_partition: usize,
+        partition_count: usize,
+        bins: Option<Vec<String>>,
+        max_records: Option<u64>,
+    ) -> Result<mpsc::Receiver<Result<ScannedRecord>>> {
+        let _ = (
+            namespace,
+            set_name,
+            begin_partition,
+            partition_count,
+            bins,
+            max_records,
+        );
+        Err(ProxyError::Internal(
+            "scan_partition_range is not implemented for this sink".to_string(),
+        ))
+    }
+
     fn is_connected(&self) -> bool;
 }
 
@@ -133,9 +200,14 @@ impl AerospikeSink for RealAerospikeSink {
         match self.client.batch(&batch_policy, &mut batch_ops).await {
             Ok(()) => {
                 let mut outcomes = Vec::with_capacity(batch_ops.len());
-                for op in &batch_ops {
+                for (idx, op) in batch_ops.iter().enumerate() {
+                    let all_nil = !records[idx].bins.is_empty()
+                        && records[idx].bins.iter().all(|b| b.value == Value::Nil);
                     match op.result_code() {
                         Some(ResultCode::Ok) => outcomes.push(RecordWriteOutcome::Success),
+                        Some(ResultCode::KeyNotFoundError) if all_nil => {
+                            outcomes.push(RecordWriteOutcome::Success);
+                        }
                         rc => {
                             let outcome = classify_aerospike_failure(op.error(), rc);
                             outcomes.push(outcome);
@@ -149,8 +221,12 @@ impl AerospikeSink for RealAerospikeSink {
                 // answered with `ResultCode::Ok`. Check per-row state first!
                 let fallback_outcome = classify_aerospike_failure(Some(&call_err), None);
                 let mut outcomes = Vec::with_capacity(batch_ops.len());
-                for op in &batch_ops {
-                    if op.result_code() == Some(ResultCode::Ok) {
+                for (idx, op) in batch_ops.iter().enumerate() {
+                    let all_nil = !records[idx].bins.is_empty()
+                        && records[idx].bins.iter().all(|b| b.value == Value::Nil);
+                    if op.result_code() == Some(ResultCode::Ok)
+                        || (all_nil && op.result_code() == Some(ResultCode::KeyNotFoundError))
+                    {
                         outcomes.push(RecordWriteOutcome::Success);
                     } else if op.error().is_some() || op.result_code().is_some() {
                         outcomes.push(classify_aerospike_failure(op.error(), op.result_code()));
@@ -176,9 +252,18 @@ impl AerospikeSink for RealAerospikeSink {
         wp.expiration = params.expiration();
         wp.send_key = params.send_key;
 
+        let all_nil =
+            !record.bins.is_empty() && record.bins.iter().all(|b| b.value == Value::Nil);
+
         match self.client.put(&wp, &record.key, &record.bins).await {
             Ok(()) => RecordWriteOutcome::Success,
-            Err(err) => classify_aerospike_failure(Some(&err), None),
+            Err(err) => {
+                if all_nil && err.matches(&[ResultCode::KeyNotFoundError]) {
+                    RecordWriteOutcome::Success
+                } else {
+                    classify_aerospike_failure(Some(&err), None)
+                }
+            }
         }
     }
 
@@ -229,6 +314,108 @@ impl AerospikeSink for RealAerospikeSink {
                     .collect()
             }
         }
+    }
+
+    async fn execute_batch_read_keys(
+        &self,
+        keys: &[Key],
+        bins: Option<&[String]>,
+    ) -> Vec<RecordReadOutcome> {
+        if keys.is_empty() {
+            return Vec::new();
+        }
+
+        let mut batch_policy = BatchPolicy::default();
+        batch_policy.concurrency = Concurrency::Parallel;
+        batch_policy.respond_all_keys = true;
+        batch_policy.base_policy.socket_timeout = self.timeout_ms;
+        batch_policy.base_policy.total_timeout = self.timeout_ms;
+        batch_policy.base_policy.max_retries = 0;
+
+        let read_policy = BatchReadPolicy::default();
+        let as_bins = match bins {
+            None => Bins::All,
+            Some(list) if list.is_empty() => Bins::None,
+            Some(list) => Bins::Some(list.to_vec()),
+        };
+
+        let mut batch_ops: Vec<BatchOperation> = keys
+            .iter()
+            .map(|key| BatchOperation::read(&read_policy, key.clone(), as_bins.clone()))
+            .collect();
+
+        match self.client.batch(&batch_policy, &mut batch_ops).await {
+            Ok(()) => batch_ops.iter().map(classify_batch_read_op).collect(),
+            Err(call_err) => {
+                let fallback_write = classify_aerospike_failure(Some(&call_err), None);
+                let fallback_read = match fallback_write {
+                    RecordWriteOutcome::OverloadError(m) => RecordReadOutcome::OverloadError(m),
+                    RecordWriteOutcome::OtherError(_) | RecordWriteOutcome::Success => {
+                        RecordReadOutcome::OtherError(call_err.to_string())
+                    }
+                };
+                batch_ops
+                    .iter()
+                    .map(|op| {
+                        if op.result_code().is_some() || op.error().is_some() {
+                            classify_batch_read_op(op)
+                        } else {
+                            fallback_read.clone()
+                        }
+                    })
+                    .collect()
+            }
+        }
+    }
+
+    async fn scan_partition_range(
+        &self,
+        namespace: &str,
+        set_name: &str,
+        begin_partition: usize,
+        partition_count: usize,
+        bins: Option<Vec<String>>,
+        max_records: Option<u64>,
+    ) -> Result<mpsc::Receiver<Result<ScannedRecord>>> {
+        let pf = PartitionFilter::by_range(begin_partition, partition_count);
+        let mut qpolicy = QueryPolicy::default();
+        qpolicy.base_policy.socket_timeout = self.timeout_ms;
+        qpolicy.record_queue_size = 4096;
+        if let Some(max_rec) = max_records {
+            qpolicy.max_records = max_rec;
+        }
+
+        let as_bins = match bins {
+            None => Bins::All,
+            Some(ref list) if list.is_empty() => Bins::None,
+            Some(list) => Bins::Some(list),
+        };
+        let stmt = Statement::new(namespace, set_name, as_bins);
+        let rs = self
+            .client
+            .query(&qpolicy, pf, stmt)
+            .await
+            .map_err(ProxyError::from)?;
+
+        let (tx, rx) = mpsc::channel::<Result<ScannedRecord>>(4096);
+        tokio::spawn(async move {
+            let stream = rs.into_stream();
+            tokio::pin!(stream);
+            while let Some(res) = stream.next().await {
+                let item = match res {
+                    Ok(rec) => Ok(ScannedRecord {
+                        key: rec.key,
+                        bins: rec.bins,
+                    }),
+                    Err(e) => Err(ProxyError::from(e)),
+                };
+                if tx.send(item).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        Ok(rx)
     }
 
     fn is_connected(&self) -> bool {
@@ -465,6 +652,10 @@ impl MppWriteEngine {
             Self::merge_validation_stats(&mut stats, sub);
         }
 
+        self.metrics
+            .inc_records_validated(stats.rows_validated as u64);
+        self.metrics
+            .inc_validation_mismatches(stats.mismatched_rows as u64);
         self.metrics.inc_batches_processed();
         Ok(stats)
     }
@@ -503,7 +694,7 @@ impl MppWriteEngine {
         let res = self.execute_batch_read_with_retry(chunk, &params).await;
 
         let elapsed_micros = start.elapsed().as_micros() as u64;
-        self.metrics.observe_write_latency_micros(elapsed_micros);
+        self.metrics.observe_read_latency_micros(elapsed_micros);
         self.metrics.add_in_flight(-(num_records as i64));
 
         res
@@ -835,6 +1026,191 @@ impl MppWriteEngine {
             backoff_step = backoff_step.saturating_add(1);
             tokio::time::sleep(sleep_dur).await;
         }
+    }
+
+    /// Stream records from a contiguous range of Aerospike partitions `[begin_partition, begin_partition + partition_count)`.
+    pub async fn scan_partition_range(
+        &self,
+        namespace: &str,
+        set_name: &str,
+        begin_partition: usize,
+        partition_count: usize,
+        bins: Option<Vec<String>>,
+        max_records: Option<u64>,
+    ) -> Result<mpsc::Receiver<Result<ScannedRecord>>> {
+        self.sink
+            .scan_partition_range(
+                namespace,
+                set_name,
+                begin_partition,
+                partition_count,
+                bins,
+                max_records,
+            )
+            .await
+    }
+
+    /// Read a batch of keys from Aerospike in parallel sub-batches with overload/error retry,
+    /// preserving the exact input order of `keys`.
+    pub async fn read_keys(
+        &self,
+        keys: Vec<Key>,
+        bins: Option<Vec<String>>,
+    ) -> Result<Vec<RecordReadOutcome>> {
+        let total = keys.len();
+        if total == 0 {
+            return Ok(Vec::new());
+        }
+
+        let chunk_size = self.writer_config.batch_write_size.max(1);
+        let max_concurrency = self
+            .writer_config
+            .max_concurrent_subbatches_per_stream
+            .max(1);
+
+        let chunks: Vec<(usize, Vec<Key>)> = keys
+            .chunks(chunk_size)
+            .enumerate()
+            .map(|(chunk_idx, slice)| (chunk_idx, slice.to_vec()))
+            .collect();
+
+        let mut ordered_chunks: Vec<Option<Vec<RecordReadOutcome>>> = vec![None; chunks.len()];
+        let mut in_flight = FuturesUnordered::new();
+
+        for (chunk_idx, chunk_keys) in chunks {
+            while in_flight.len() >= max_concurrency {
+                let res: Result<(usize, Vec<RecordReadOutcome>)> = in_flight.next().await.unwrap();
+                let (done_idx, outcomes) = res?;
+                ordered_chunks[done_idx] = Some(outcomes);
+            }
+            let bins_clone = bins.clone();
+            in_flight.push(self.read_keys_subbatch(chunk_idx, chunk_keys, bins_clone));
+        }
+
+        while let Some(res) = in_flight.next().await {
+            let (done_idx, outcomes) = res?;
+            ordered_chunks[done_idx] = Some(outcomes);
+        }
+
+        let mut all_outcomes = Vec::with_capacity(total);
+        for chunk_opt in ordered_chunks {
+            if let Some(mut c) = chunk_opt {
+                all_outcomes.append(&mut c);
+            }
+        }
+        Ok(all_outcomes)
+    }
+
+    async fn read_keys_subbatch(
+        &self,
+        chunk_idx: usize,
+        keys: Vec<Key>,
+        bins: Option<Vec<String>>,
+    ) -> Result<(usize, Vec<RecordReadOutcome>)> {
+        let num_records = keys.len();
+        let permit_count = num_records.min(self.writer_config.max_in_flight_records.max(1)) as u32;
+
+        let _permit = self
+            .in_flight_semaphore
+            .acquire_many(permit_count)
+            .await
+            .map_err(|_| ProxyError::Internal("Backpressure semaphore closed".to_string()))?;
+
+        self.metrics.add_in_flight(num_records as i64);
+        let start = Instant::now();
+
+        let res = self.execute_key_reads_with_retry(keys, bins.as_deref()).await;
+
+        let elapsed_micros = start.elapsed().as_micros() as u64;
+        self.metrics.observe_read_latency_micros(elapsed_micros);
+        self.metrics.add_in_flight(-(num_records as i64));
+
+        res.map(|outcomes| (chunk_idx, outcomes))
+    }
+
+    async fn execute_key_reads_with_retry(
+        &self,
+        initial_keys: Vec<Key>,
+        bins: Option<&[String]>,
+    ) -> Result<Vec<RecordReadOutcome>> {
+        #[derive(Clone)]
+        struct PendingKeyItem {
+            orig_idx: usize,
+            key: Key,
+            overload_attempts: u32,
+            other_attempts: u32,
+        }
+
+        let total = initial_keys.len();
+        let mut results: Vec<Option<RecordReadOutcome>> = vec![None; total];
+        let mut pending: Vec<PendingKeyItem> = initial_keys
+            .into_iter()
+            .enumerate()
+            .map(|(orig_idx, key)| PendingKeyItem {
+                orig_idx,
+                key,
+                overload_attempts: 0,
+                other_attempts: 0,
+            })
+            .collect();
+
+        let mut backoff_step: u32 = 0;
+
+        while !pending.is_empty() {
+            let batch_keys: Vec<Key> = pending.iter().map(|p| p.key.clone()).collect();
+            let outcomes = self.sink.execute_batch_read_keys(&batch_keys, bins).await;
+
+            let mut next_pending = Vec::new();
+            let mut batch_overload_count: u64 = 0;
+            let mut batch_other_count: u64 = 0;
+
+            for (mut item, outcome) in pending.into_iter().zip(outcomes.into_iter()) {
+                match outcome {
+                    RecordReadOutcome::Found(_) | RecordReadOutcome::NotFound => {
+                        results[item.orig_idx] = Some(outcome);
+                    }
+                    RecordReadOutcome::OverloadError(_) => {
+                        item.overload_attempts = item.overload_attempts.saturating_add(1);
+                        batch_overload_count += 1;
+                        next_pending.push(item);
+                    }
+                    RecordReadOutcome::OtherError(err_msg) => {
+                        item.other_attempts = item.other_attempts.saturating_add(1);
+                        if item.other_attempts > self.retry_config.max_other_retries {
+                            self.metrics.inc_failed_records(1);
+                            return Err(ProxyError::WriteFailed {
+                                attempts: item.other_attempts,
+                                message: err_msg,
+                            });
+                        }
+                        batch_other_count += 1;
+                        next_pending.push(item);
+                    }
+                }
+            }
+
+            if next_pending.is_empty() {
+                break;
+            }
+
+            if batch_overload_count > 0 {
+                self.metrics.inc_overload_retries(batch_overload_count);
+            }
+            if batch_other_count > 0 {
+                self.metrics.inc_other_retries(batch_other_count);
+            }
+
+            let sleep_dur = compute_backoff_with_jitter(&self.retry_config, backoff_step);
+            backoff_step = backoff_step.saturating_add(1);
+            tokio::time::sleep(sleep_dur).await;
+
+            pending = next_pending;
+        }
+
+        Ok(results
+            .into_iter()
+            .map(|r| r.unwrap_or(RecordReadOutcome::NotFound))
+            .collect())
     }
 }
 

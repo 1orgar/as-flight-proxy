@@ -36,7 +36,16 @@ case class AerospikeFlightOptions(
     validateOnly: Boolean = false,
     batchSize: Int = 8192,
     writerThreads: Int = 4,
-    queueCapacity: Int = 8
+    queueCapacity: Int = 8,
+    maxBinNameLen: Int = 15,
+    maxBinsPerRecord: Int = 32767,
+    readNumPartitions: Int = 32,
+    readBatchSize: Int = 4096,
+    readSampleSize: Int = 1000,
+    readTypeMismatchMode: String = "fail",
+    readKeys: Option[String] = None,
+    lookupSourceView: Option[String] = None,
+    lookupJoinType: String = "left"
 ) extends Serializable {
 
   require(jobId.trim.nonEmpty, "'connector.jobId' cannot be empty")
@@ -44,10 +53,40 @@ case class AerospikeFlightOptions(
   require(batchSize > 0, s"'connector.batchSize' must be > 0 (got $batchSize)")
   require(writerThreads > 0, s"'connector.writerThreads' must be > 0 (got $writerThreads)")
   require(queueCapacity > 0, s"'connector.queueCapacity' must be > 0 (got $queueCapacity)")
+  require(
+    maxBinNameLen >= 1 && maxBinNameLen <= AerospikeSchemaValidator.AerospikeHardMaxBinNameBytes,
+    s"'aerospike.maxBinNameLen' must be between 1 and ${AerospikeSchemaValidator.AerospikeHardMaxBinNameBytes} bytes (got $maxBinNameLen)"
+  )
+  require(
+    maxBinsPerRecord >= 1 && maxBinsPerRecord <= AerospikeSchemaValidator.AerospikeHardMaxBinsPerRecord,
+    s"'aerospike.maxBinsPerRecord' must be between 1 and ${AerospikeSchemaValidator.AerospikeHardMaxBinsPerRecord} (got $maxBinsPerRecord)"
+  )
+  require(
+    readNumPartitions >= 1 && readNumPartitions <= 4096,
+    s"'aerospike.read.numPartitions' must be between 1 and 4096 (got $readNumPartitions)"
+  )
+  require(readBatchSize > 0, s"'aerospike.read.batchSize' must be > 0 (got $readBatchSize)")
+  require(readSampleSize > 0, s"'aerospike.read.sampleSize' must be > 0 (got $readSampleSize)")
 
   def validateWriteTarget(): Unit = {
     require(namespace.trim.nonEmpty, "'aerospike.namespace' cannot be empty")
     require(keyColumn.trim.nonEmpty, "'aerospike.keyColumn' cannot be empty")
+    AerospikeSchemaValidator.validateNamespaceAndSet(namespace, setName)
+  }
+
+  /**
+   * Returns `true` when null bins should NOT be sent as `Value::Nil` deletes:
+   * - when `ignoreNulls = true`, OR
+   * - when `writeMode` is `replace`, `replace_only`, or `create_only` (since replacing a record in
+   *   Aerospike automatically removes any bin not included in the write).
+   * In DQ validation mode (`validateOnly = true`), null bins are still checked unless `ignoreNulls = true`.
+   */
+  def shouldOmitNullsInFlight: Boolean = {
+    if (validateOnly) {
+      ignoreNulls
+    } else {
+      ignoreNulls || writeMode == "replace" || writeMode == "replace_only" || writeMode == "create_only"
+    }
   }
 
   /**
@@ -196,6 +235,52 @@ object AerospikeFlightOptions {
       .orElse(get("aerospike.queueCapacity"))
       .map(_.toInt)
       .getOrElse(math.max(writerThreads * 2, 4))
+    val maxBinNameLen = get("aerospike.maxBinNameLen")
+      .orElse(get("aerospike.max_bin_name_len"))
+      .map(_.toInt)
+      .getOrElse(AerospikeSchemaValidator.AerospikeHardMaxBinNameBytes)
+    val maxBinsPerRecord = get("aerospike.maxBinsPerRecord")
+      .orElse(get("aerospike.max_bins_per_record"))
+      .map(_.toInt)
+      .getOrElse(AerospikeSchemaValidator.AerospikeHardMaxBinsPerRecord)
+
+    val readNumPartitions = get("aerospike.read.numPartitions")
+      .orElse(get("aerospike.read.num_partitions"))
+      .map(_.toInt)
+      .getOrElse(32)
+    val readBatchSize = get("aerospike.read.batchSize")
+      .orElse(get("aerospike.read.batch_size"))
+      .map(_.toInt)
+      .getOrElse(4096)
+    val readSampleSize = get("aerospike.read.sampleSize")
+      .orElse(get("aerospike.read.sample_size"))
+      .map(_.toInt)
+      .getOrElse(1000)
+    val readTypeMismatchMode = get("aerospike.read.typeMismatchMode")
+      .orElse(get("aerospike.read.type_mismatch_mode"))
+      .getOrElse("fail")
+      .toLowerCase match {
+      case "fail" | "error" | "strict" => "fail"
+      case "null" | "ignore" | "permissive" => "null"
+      case other =>
+        throw new IllegalArgumentException(
+          s"Unsupported 'aerospike.read.typeMismatchMode' = '$other'. Allowed: fail, null"
+        )
+    }
+    val readKeys = get("aerospike.read.keys")
+    val lookupSourceView = get("aerospike.lookup.sourceView")
+      .orElse(get("aerospike.lookup.source_view"))
+    val lookupJoinType = get("aerospike.lookup.joinType")
+      .orElse(get("aerospike.lookup.join_type"))
+      .getOrElse("left")
+      .toLowerCase match {
+      case "left" | "left_outer" => "left"
+      case "inner" => "inner"
+      case other =>
+        throw new IllegalArgumentException(
+          s"Unsupported 'aerospike.lookup.joinType' = '$other'. Allowed: left, inner"
+        )
+    }
 
     AerospikeFlightOptions(
       jobId = jobId,
@@ -219,7 +304,16 @@ object AerospikeFlightOptions {
       validateOnly = validateOnly,
       batchSize = batchSize,
       writerThreads = writerThreads,
-      queueCapacity = queueCapacity
+      queueCapacity = queueCapacity,
+      maxBinNameLen = maxBinNameLen,
+      maxBinsPerRecord = maxBinsPerRecord,
+      readNumPartitions = readNumPartitions,
+      readBatchSize = readBatchSize,
+      readSampleSize = readSampleSize,
+      readTypeMismatchMode = readTypeMismatchMode,
+      readKeys = readKeys,
+      lookupSourceView = lookupSourceView,
+      lookupJoinType = lookupJoinType
     )
   }
 

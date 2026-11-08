@@ -26,5 +26,10 @@
 .vscode/
 *.iml
 
-# E2E downloaded / built binaries
+# E2E downloaded / built binaries & caches
 /e2e/artifacts/
+/e2e/.cache/
+/e2e/.sbt/
+/e2e/.ivy2/
+/spark_connector/spark-warehouse/
+spark-warehouse/

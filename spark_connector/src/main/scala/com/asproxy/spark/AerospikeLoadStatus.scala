@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.ObjectMapper
 import org.apache.arrow.flight.{Action, CallOption, CallOptions, FlightClient, Location}
 import org.apache.arrow.flight.grpc.CredentialCallOption
 import org.apache.arrow.memory.{BufferAllocator, RootAllocator}
+import org.apache.spark.internal.Logging
 import org.apache.spark.sql.connector.metric.{CustomMetric, CustomSumMetric}
 
 import java.io.FileInputStream
@@ -65,7 +66,7 @@ case class LoadJobSummary(
 /**
  * Driver-side registry and Arrow Flight RPC helper for querying load progress and Raft cluster status.
  */
-object AerospikeLoadStatus {
+object AerospikeLoadStatus extends Logging {
   private val summariesByJobId = new ConcurrentHashMap[String, LoadJobSummary]()
   private val latestSummaryRef = new AtomicReference[Option[LoadJobSummary]](None)
 
@@ -193,7 +194,11 @@ object AerospikeLoadStatus {
       val bytes = mapper.writeValueAsBytes(payload)
       Some(executeAction(options, actionType, bytes))
     } catch {
-      case _: Throwable => None
+      case t: Throwable =>
+        logDebug(
+          s"[Driver][RaftStatus] Could not execute Flight action '$actionType' for jobId='${options.jobId}' (Raft may be disabled): ${t.getMessage}"
+        )
+        None
     }
   }
 
@@ -325,6 +330,16 @@ class AerospikeMismatchedRowsMetric extends CustomSumMetric {
   override def description(): String = "Aerospike DQ mismatched rows"
 }
 
+class AerospikeRowsReadMetric extends CustomSumMetric {
+  override def name(): String = "as_rows_read"
+  override def description(): String = "Aerospike rows read via Arrow Flight"
+}
+
+class AerospikeBatchesReadMetric extends CustomSumMetric {
+  override def name(): String = "as_batches_read"
+  override def description(): String = "Arrow RecordBatches received from proxy_server"
+}
+
 object AerospikeCustomMetrics {
   def supportedMetrics: Array[CustomMetric] = Array(
     new AerospikeRowsWrittenMetric(),
@@ -334,5 +349,10 @@ object AerospikeCustomMetrics {
     new AerospikeRowsValidatedMetric(),
     new AerospikeMatchedRowsMetric(),
     new AerospikeMismatchedRowsMetric()
+  )
+
+  def supportedReadMetrics: Array[CustomMetric] = Array(
+    new AerospikeRowsReadMetric(),
+    new AerospikeBatchesReadMetric()
   )
 }

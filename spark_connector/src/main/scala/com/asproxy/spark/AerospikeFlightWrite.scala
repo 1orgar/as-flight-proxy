@@ -1,5 +1,6 @@
 package com.asproxy.spark
 
+import org.apache.spark.internal.Logging
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.connector.metric.CustomMetric
 import org.apache.spark.sql.connector.write._
@@ -15,6 +16,9 @@ class AerospikeFlightWriteBuilder(
 ) extends WriteBuilder
     with SupportsTruncate {
 
+  // Driver-side ФЛК (Schema, Bin Format & DataType Validation) on initialization
+  AerospikeSchemaValidator.validate(schema, options)
+
   override def truncate(): WriteBuilder = this
 
   override def build(): Write = new Write {
@@ -27,11 +31,22 @@ class AerospikeFlightWriteBuilder(
 class AerospikeFlightBatchWrite(
     schema: StructType,
     options: AerospikeFlightOptions
-) extends BatchWrite {
+) extends BatchWrite
+    with Logging {
 
   private val startTimeMs: Long = System.currentTimeMillis()
 
+  logInfo(
+    s"[Driver][Write] Initialized batch write jobId='${options.jobId}', " +
+      s"target='${options.namespace}.${options.setName}', writeMode='${options.writeMode}', " +
+      s"validateOnly=${options.validateOnly}, batchSize=${options.batchSize}, " +
+      s"writerThreads=${options.writerThreads}, hosts=[${options.hosts.map(h => s"${h.host}:${h.port}").mkString(", ")}]"
+  )
+
   override def createBatchWriterFactory(info: PhysicalWriteInfo): DataWriterFactory = {
+    logInfo(
+      s"[Driver][Write] Creating BatchWriterFactory for jobId='${options.jobId}', numPartitions=${info.numPartitions()}"
+    )
     new AerospikeFlightWriterFactory(schema, options)
   }
 
@@ -46,6 +61,23 @@ class AerospikeFlightBatchWrite(
       raftClusterStatusJson = raftStatusJson
     )
     AerospikeLoadStatus.recordSummary(summary)
+    val rps = if (summary.elapsedMs > 0) (summary.rowsWritten * 1000L) / summary.elapsedMs else summary.rowsWritten
+    if (options.validateOnly) {
+      logInfo(
+        s"[Driver][DQ-Validate] Completed jobId='${summary.jobId}' on '${summary.namespace}.${summary.setName}' " +
+          s"in ${summary.elapsedMs}ms (partitions=${summary.partitionsCount}): rowsValidated=${summary.rowsValidated}, " +
+          s"matchedRows=${summary.matchedRows}, mismatchedRows=${summary.mismatchedRows}, " +
+          s"missingKeys=${summary.missingKeys}, binMismatchRows=${summary.binMismatchRows}, " +
+          s"dqPassed=${summary.dqPassed.getOrElse(false)}, overloadRetries=${summary.overloadRetries}, otherRetries=${summary.otherRetries}"
+      )
+    } else {
+      logInfo(
+        s"[Driver][Write] Completed jobId='${summary.jobId}' on '${summary.namespace}.${summary.setName}' " +
+          s"in ${summary.elapsedMs}ms (~$rps rows/sec, partitions=${summary.partitionsCount}): " +
+          s"rowsWritten=${summary.rowsWritten}, batchesSent=${summary.batchesSent}, " +
+          s"overloadRetries=${summary.overloadRetries}, otherRetries=${summary.otherRetries}"
+      )
+    }
   }
 
   override def abort(messages: Array[WriterCommitMessage]): Unit = {
@@ -60,15 +92,25 @@ class AerospikeFlightBatchWrite(
       raftClusterStatusJson = raftStatusJson
     )
     AerospikeLoadStatus.recordSummary(summary)
+    logError(
+      s"[Driver][Write] Aborted jobId='${summary.jobId}' on '${summary.namespace}.${summary.setName}' " +
+        s"after ${summary.elapsedMs}ms (committedPartitions=${summary.partitionsCount}, " +
+        s"rowsWritten=${summary.rowsWritten}, overloadRetries=${summary.overloadRetries}, otherRetries=${summary.otherRetries})"
+    )
   }
 }
 
 class AerospikeFlightStreamingWrite(
     schema: StructType,
     options: AerospikeFlightOptions
-) extends StreamingWrite {
+) extends StreamingWrite
+    with Logging {
 
   override def createStreamingWriterFactory(info: PhysicalWriteInfo): StreamingDataWriterFactory = {
+    logInfo(
+      s"[Driver][StreamingWrite] Creating StreamingWriterFactory for jobId='${options.jobId}', " +
+        s"target='${options.namespace}.${options.setName}', numPartitions=${info.numPartitions()}"
+    )
     new AerospikeFlightWriterFactory(schema, options)
   }
 
@@ -83,6 +125,11 @@ class AerospikeFlightStreamingWrite(
       raftClusterStatusJson = raftStatusJson
     )
     AerospikeLoadStatus.recordSummary(summary)
+    logInfo(
+      s"[Driver][StreamingWrite] Committed epochId=$epochId, jobId='${summary.jobId}' on '${summary.namespace}.${summary.setName}' " +
+        s"in ${summary.elapsedMs}ms: rowsWritten=${summary.rowsWritten}, batchesSent=${summary.batchesSent}, " +
+        s"overloadRetries=${summary.overloadRetries}, otherRetries=${summary.otherRetries}"
+    )
   }
 
   override def abort(epochId: Long, messages: Array[WriterCommitMessage]): Unit = {
@@ -100,6 +147,9 @@ class AerospikeFlightStreamingWrite(
       raftClusterStatusJson = raftStatusJson
     )
     AerospikeLoadStatus.recordSummary(summary)
+    logError(
+      s"[Driver][StreamingWrite] Aborted epochId=$epochId, jobId='${summary.jobId}' on '${summary.namespace}.${summary.setName}'"
+    )
   }
 }
 
