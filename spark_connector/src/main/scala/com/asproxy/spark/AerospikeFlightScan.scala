@@ -539,6 +539,7 @@ class AerospikeFlightPartitionReader(
     map.put("type_mismatch_mode", options.readTypeMismatchMode)
     map.put("schema_ipc_base64", ArrowSchemaConverter.toArrowSchemaIpcBase64(wireSchema))
     map.put("compression", options.compression)
+    map.put("compression_level", Int.box(options.compressionLevel))
 
     val readModeMap = new util.LinkedHashMap[String, Any]()
     partition match {

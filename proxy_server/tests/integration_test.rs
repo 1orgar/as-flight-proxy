@@ -1519,6 +1519,7 @@ async fn test_flight_read_get_schema_do_get_and_do_exchange_lookup() {
             type_mismatch_mode: TypeMismatchMode::Fail,
             schema_ipc_base64: pruned_schema_b64.clone(),
             compression: None,
+            compression_level: None,
         })
         .unwrap();
 
@@ -1558,6 +1559,7 @@ async fn test_flight_read_get_schema_do_get_and_do_exchange_lookup() {
         type_mismatch_mode: TypeMismatchMode::Fail,
         schema_ipc_base64: encode_arrow_schema_ipc_base64(&write_schema).unwrap(),
         compression: None,
+        compression_level: None,
     })
     .unwrap();
 
@@ -1613,6 +1615,7 @@ async fn test_flight_read_get_schema_do_get_and_do_exchange_lookup() {
         type_mismatch_mode: TypeMismatchMode::Fail,
         bins_schema_ipc_base64: bins_schema_b64.clone(),
         compression: None,
+        compression_level: None,
     };
     let left_desc = FlightDescriptor::new_cmd(serde_json::to_vec(&left_params).unwrap());
     let left_req_stream = FlightDataEncoderBuilder::new()
@@ -1652,6 +1655,7 @@ async fn test_flight_read_get_schema_do_get_and_do_exchange_lookup() {
         type_mismatch_mode: TypeMismatchMode::Fail,
         bins_schema_ipc_base64: bins_schema_b64,
         compression: None,
+        compression_level: None,
     };
     let inner_desc = FlightDescriptor::new_cmd(serde_json::to_vec(&inner_params).unwrap());
     let inner_req_stream = FlightDataEncoderBuilder::new()
@@ -1828,6 +1832,7 @@ fn test_config_headers_validation_and_error_status_conversions() {
         type_mismatch_mode: TypeMismatchMode::Fail,
         schema_ipc_base64: "".to_string(),
         compression: None,
+        compression_level: None,
     };
     assert!(rt.validate().is_err());
     rt.namespace = "test".to_string();
@@ -1880,6 +1885,7 @@ fn test_config_headers_validation_and_error_status_conversions() {
         type_mismatch_mode: TypeMismatchMode::Fail,
         bins_schema_ipc_base64: "".into(),
         compression: None,
+        compression_level: None,
     }
     .validate()
     .is_err());
@@ -1891,6 +1897,7 @@ fn test_config_headers_validation_and_error_status_conversions() {
         type_mismatch_mode: TypeMismatchMode::Fail,
         bins_schema_ipc_base64: "".into(),
         compression: None,
+        compression_level: None,
     }
     .validate()
     .is_err());
@@ -2739,6 +2746,7 @@ async fn test_read_keys_and_dq_validate_retries_and_raft_actions() {
         type_mismatch_mode: TypeMismatchMode::Fail,
         schema_ipc_base64: schema_b64,
         compression: None,
+        compression_level: None,
     })
     .unwrap();
     let dg_stream = client
@@ -2860,6 +2868,7 @@ async fn test_read_keys_and_dq_validate_retries_and_raft_actions() {
         type_mismatch_mode: TypeMismatchMode::Fail,
         bins_schema_ipc_base64: encode_arrow_schema_ipc_base64(&bins_only).unwrap(),
         compression: None,
+        compression_level: None,
     };
     let ex_stream = FlightDataEncoderBuilder::new()
         .with_schema(miss_schema.clone())
@@ -2918,6 +2927,7 @@ async fn test_read_keys_and_dq_validate_retries_and_raft_actions() {
             type_mismatch_mode: TypeMismatchMode::Fail,
             schema_ipc_base64: mismatch_b64.clone(),
             compression: None,
+            compression_level: None,
         })
         .unwrap();
         let mut s = client
@@ -2948,6 +2958,7 @@ async fn test_read_keys_and_dq_validate_retries_and_raft_actions() {
             type_mismatch_mode: TypeMismatchMode::Fail,
             schema_ipc_base64: sc_b64,
             compression: None,
+            compression_level: None,
         })
         .unwrap();
         let mut s = client
@@ -2975,6 +2986,7 @@ async fn test_read_keys_and_dq_validate_retries_and_raft_actions() {
             type_mismatch_mode: TypeMismatchMode::Fail,
             bins_schema_ipc_base64: encode_arrow_schema_ipc_base64(&b_schema).unwrap(),
             compression: None,
+            compression_level: None,
         };
         let st = FlightDataEncoderBuilder::new()
             .with_schema(miss_schema.clone())
@@ -3243,11 +3255,33 @@ async fn test_flight_compression_modes_and_disableable_switch() {
 
     let mut hdrs = MetadataMap::new();
     assert_eq!(FlightCompression::from_headers(&hdrs).unwrap(), None);
-    hdrs.insert("x-as-compression", MetadataValue::from_static("lz4"));
+    assert_eq!(FlightCompression::level_from_headers(&hdrs).unwrap(), None);
+    hdrs.insert("x-as-compression", MetadataValue::from_static("zstd:5"));
     assert_eq!(
         FlightCompression::from_headers(&hdrs).unwrap(),
-        Some(FlightCompression::Lz4)
+        Some(FlightCompression::Zstd)
     );
+    assert_eq!(FlightCompression::level_from_headers(&hdrs).unwrap(), Some(5));
+    hdrs.insert("x-as-compression-level", MetadataValue::from_static("9"));
+    assert_eq!(FlightCompression::level_from_headers(&hdrs).unwrap(), Some(9));
+    hdrs.insert("x-as-compression-level", MetadataValue::from_static("bad_lvl"));
+    assert!(FlightCompression::level_from_headers(&hdrs).is_err());
+    hdrs.insert("x-as-compression-level", MetadataValue::from_static("99"));
+    assert!(FlightCompression::level_from_headers(&hdrs).is_err());
+
+    assert_eq!(FlightCompression::extract_inline_level("zstd:3").unwrap(), Some(3));
+    assert_eq!(FlightCompression::extract_inline_level("zstd").unwrap(), None);
+    assert!(FlightCompression::extract_inline_level("zstd:abc").is_err());
+    assert!(FlightCompression::extract_inline_level("zstd:50").is_err());
+
+    for lvl in 1..=9 {
+        assert!(FlightCompression::Zstd
+            .to_ipc_write_options_with_level(Some(lvl))
+            .is_ok());
+    }
+    assert!(FlightCompression::Zstd
+        .to_ipc_write_options_with_level(Some(99))
+        .is_err());
 
     assert_eq!(FlightCompression::None.to_tonic_encoding(), None);
     assert_eq!(
@@ -3388,6 +3422,7 @@ async fn test_flight_compression_modes_and_disableable_switch() {
             type_mismatch_mode: TypeMismatchMode::Fail,
             schema_ipc_base64: encode_arrow_schema_ipc_base64(&schema).unwrap(),
             compression: Some(mode),
+            compression_level: Some(3),
         })
         .unwrap();
 
@@ -3423,10 +3458,11 @@ async fn test_flight_compression_modes_and_disableable_switch() {
             type_mismatch_mode: TypeMismatchMode::Fail,
             bins_schema_ipc_base64: encode_arrow_schema_ipc_base64(&bins_only).unwrap(),
             compression: Some(mode),
+            compression_level: Some(6),
         };
         let ex_stream = FlightDataEncoderBuilder::new()
             .with_schema(in_schema)
-            .with_options(mode.to_ipc_write_options().unwrap())
+            .with_options(mode.to_ipc_write_options_with_level(Some(6)).unwrap())
             .with_flight_descriptor(Some(FlightDescriptor::new_cmd(
                 serde_json::to_vec(&ex_params).unwrap(),
             )))
@@ -3464,6 +3500,7 @@ async fn test_flight_compression_modes_and_disableable_switch() {
     ] {
         let svc = ProxyFlightService::new(auth.clone(), engine.clone(), metrics.clone(), 15)
             .with_compression(srv.compression_enabled, srv.compression)
+            .with_compression_level(srv.compression_level)
             .into_server(&srv);
         let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let a = l.local_addr().unwrap();
@@ -3496,6 +3533,7 @@ async fn test_flight_compression_modes_and_disableable_switch() {
             type_mismatch_mode: TypeMismatchMode::Fail,
             schema_ipc_base64: encode_arrow_schema_ipc_base64(&schema).unwrap(),
             compression: Some(FlightCompression::Zstd),
+            compression_level: Some(9),
         })
         .unwrap();
         let dg = cl

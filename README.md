@@ -151,6 +151,7 @@ http2_stream_window_size_mb = 16
 http2_connection_window_size_mb = 32
 compression_enabled = true                    # Master switch for Flight compression (false = disable all)
 compression = "zstd"                          # Default codec: "zstd", "lz4", "gzip", or "none"
+compression_level = 1                         # Default ZSTD compression level: 1..9 (or -7..22, default 1)
 
 [raft]
 enabled = true

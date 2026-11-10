@@ -96,6 +96,7 @@ pub struct ProxyFlightService {
     raft_node: Option<Arc<RaftNode>>,
     compression_enabled: bool,
     default_compression: FlightCompression,
+    default_compression_level: i32,
 }
 
 impl ProxyFlightService {
@@ -113,6 +114,7 @@ impl ProxyFlightService {
             raft_node: None,
             compression_enabled: true,
             default_compression: FlightCompression::default(),
+            default_compression_level: FlightCompression::DEFAULT_ZSTD_LEVEL,
         }
     }
 
@@ -135,9 +137,15 @@ impl ProxyFlightService {
         self
     }
 
+    pub fn with_compression_level(mut self, level: i32) -> Self {
+        self.default_compression_level = level;
+        self
+    }
+
     /// Wrap this service in a `FlightServiceServer` configured with message size limits
     /// and gRPC transport compression settings from `ServerConfig`.
-    pub fn into_server(self, server_cfg: &ServerConfig) -> FlightServiceServer<Self> {
+    pub fn into_server(mut self, server_cfg: &ServerConfig) -> FlightServiceServer<Self> {
+        self.default_compression_level = server_cfg.compression_level;
         let max_msg_bytes = server_cfg.max_decoding_message_size_mb * 1024 * 1024;
         let mut svc = FlightServiceServer::new(self)
             .max_decoding_message_size(max_msg_bytes)
@@ -170,11 +178,18 @@ impl ProxyFlightService {
     fn resolve_ipc_write_options(
         &self,
         client_override: Option<FlightCompression>,
+        client_level_override: Option<i32>,
         headers: &MetadataMap,
     ) -> Result<IpcWriteOptions, Status> {
         let header_override = FlightCompression::from_headers(headers).map_err(Status::from)?;
+        let header_level = FlightCompression::level_from_headers(headers).map_err(Status::from)?;
         let effective = self.resolve_effective_compression(client_override, header_override);
-        effective.to_ipc_write_options().map_err(Status::from)
+        let effective_level = client_level_override
+            .or(header_level)
+            .or(Some(self.default_compression_level));
+        effective
+            .to_ipc_write_options_with_level(effective_level)
+            .map_err(Status::from)
     }
 }
 
@@ -633,8 +648,11 @@ impl FlightService for ProxyFlightService {
         })?;
         read_ticket.validate().map_err(Status::from)?;
 
-        let ipc_write_options =
-            self.resolve_ipc_write_options(read_ticket.compression, &headers)?;
+        let ipc_write_options = self.resolve_ipc_write_options(
+            read_ticket.compression,
+            read_ticket.compression_level,
+            &headers,
+        )?;
 
         let target_schema = decode_arrow_schema_ipc_base64(&read_ticket.schema_ipc_base64)
             .map_err(Status::from)?;
@@ -882,8 +900,11 @@ impl FlightService for ProxyFlightService {
 
         let header_compression =
             FlightCompression::from_headers(request.metadata()).map_err(Status::from)?;
+        let header_compression_level =
+            FlightCompression::level_from_headers(request.metadata()).map_err(Status::from)?;
         let compression_enabled = self.compression_enabled;
         let default_compression = self.default_compression;
+        let default_compression_level = self.default_compression_level;
 
         let flight_data_stream = request.into_inner().map_err(FlightError::from);
         let mut decoder = FlightDataDecoder::new(flight_data_stream);
@@ -926,7 +947,14 @@ impl FlightService for ProxyFlightService {
                         .or(header_compression)
                         .unwrap_or(default_compression)
                 };
-                let ipc_opts = effective_comp.to_ipc_write_options().unwrap_or_default();
+                let effective_level = params_opt
+                    .as_ref()
+                    .and_then(|p| p.compression_level)
+                    .or(header_compression_level)
+                    .or(Some(default_compression_level));
+                let ipc_opts = effective_comp
+                    .to_ipc_write_options_with_level(effective_level)
+                    .unwrap_or_default();
                 let (btx, brx) =
                     mpsc::channel::<std::result::Result<RecordBatch, FlightError>>(8);
                 let handle = tokio::spawn(async move {

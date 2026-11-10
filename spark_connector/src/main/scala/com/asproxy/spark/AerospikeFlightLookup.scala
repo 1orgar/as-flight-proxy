@@ -404,6 +404,7 @@ object AerospikeFlightLookup extends Logging {
     map.put("type_mismatch_mode", options.readTypeMismatchMode)
     map.put("bins_schema_ipc_base64", ArrowSchemaConverter.toArrowSchemaIpcBase64(binsOnlySchema))
     map.put("compression", options.compression)
+    map.put("compression_level", Int.box(options.compressionLevel))
     AerospikeFlightOptions.SharedMapper.writeValueAsBytes(map)
   }
 }

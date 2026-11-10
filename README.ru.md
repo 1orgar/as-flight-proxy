@@ -151,6 +151,7 @@ http2_stream_window_size_mb = 16
 http2_connection_window_size_mb = 32
 compression_enabled = true                    # Мастер-переключатель компрессии Flight (false = отключить)
 compression = "zstd"                          # Алгоритм по умолчанию: "zstd", "lz4", "gzip" или "none"
+compression_level = 1                         # Уровень сжатия ZSTD по умолчанию: 1..9 (или -7..22, дефолт 1)
 
 [raft]
 enabled = true

@@ -58,6 +58,7 @@
 | `http2_connection_window_size_mb` | `u32` | `32` | HTTP/2 connection-level flow control window size in MiB |
 | `compression_enabled` | `bool` | `true` | **Master switch** for Arrow Flight compression. When `false`, disables all IPC and gRPC compression regardless of client request |
 | `compression` | `String` | `"zstd"` | Default compression algorithm when `compression_enabled = true` and the client does not specify one: `"zstd"`, `"lz4"`, `"gzip"`, or `"none"` |
+| `compression_level` | `i32` | `1` | Default ZSTD compression level for outbound server streams (`DoGet` / `DoExchange`): **`1..9`** standard range (`1` = fastest default), full range `-7..22` |
 
 ```toml
 [server]
@@ -69,6 +70,7 @@ http2_stream_window_size_mb = 16
 http2_connection_window_size_mb = 32
 compression_enabled = true
 compression = "zstd"
+compression_level = 1
 ```
 
 ---

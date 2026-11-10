@@ -306,6 +306,7 @@ object AerospikeLoadStatus extends Logging {
     }
     val headers = new FlightCallHeaders()
     headers.insert("x-as-compression", options.compression)
+    headers.insert("x-as-compression-level", options.compressionLevel.toString)
     opts += new HeaderCallOption(headers)
     FlightCompressionHelper.grpcCompressionCallOption(options.compression).foreach(opts += _)
     if (options.timeoutMs > 0) {

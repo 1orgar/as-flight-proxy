@@ -9,6 +9,8 @@ http2_connection_window_size_mb = 32
 compression_enabled = true
 # Default Flight compression algorithm: "zstd" (default), "lz4", "gzip", or "none"
 compression = "zstd"
+# Default ZSTD compression level: 1..9 (or full ZSTD range -7..22, default 1)
+compression_level = 1
 
 [raft]
 enabled = true

@@ -58,6 +58,7 @@
 | `http2_connection_window_size_mb` | `u32` | `32` | Размер окна управления потоком HTTP/2 на соединение (МБ) |
 | `compression_enabled` | `bool` | `true` | **Мастер-переключатель** компрессии Arrow Flight. При `false` полностью отключает сжатие IPC и gRPC независимо от настроек клиента |
 | `compression` | `String` | `"zstd"` | Алгоритм сжатия по умолчанию (если `compression_enabled = true` и клиент не передал свой): `"zstd"`, `"lz4"`, `"gzip"` или `"none"` |
+| `compression_level` | `i32` | `1` | Уровень сжатия ZSTD по умолчанию на стороне прокси (`DoGet` / `DoExchange`): **`1..9`** основной диапазон (`1` — максимальная скорость по умолчанию), полный диапазон `-7..22` |
 
 ```toml
 [server]
@@ -69,6 +70,7 @@ http2_stream_window_size_mb = 16
 http2_connection_window_size_mb = 32
 compression_enabled = true
 compression = "zstd"
+compression_level = 1
 ```
 
 ---

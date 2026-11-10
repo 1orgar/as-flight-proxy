@@ -151,6 +151,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         auth_enabled = cfg.auth.enabled,
         compression_enabled = cfg.server.compression_enabled,
         compression = ?cfg.server.compression,
+        compression_level = cfg.server.compression_level,
         use_batch_write = cfg.writer.use_batch_write,
         batch_write_size = cfg.writer.batch_write_size,
         max_in_flight_records = cfg.writer.max_in_flight_records,
@@ -228,7 +229,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         metrics,
         cfg.aerospike.max_bin_name_len,
     )
-    .with_compression(cfg.server.compression_enabled, cfg.server.compression);
+    .with_compression(cfg.server.compression_enabled, cfg.server.compression)
+    .with_compression_level(cfg.server.compression_level);
     if let Some(raft) = raft_node {
         flight_service = flight_service.with_raft_node(raft);
     }

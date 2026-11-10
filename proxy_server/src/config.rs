@@ -73,6 +73,9 @@ pub struct ServerConfig {
     /// does not override it (`"zstd"`, `"lz4"`, `"gzip"`, or `"none"`).
     #[serde(default)]
     pub compression: FlightCompression,
+    /// Default ZSTD compression level (`1..=9` standard range, `-7..=22` full range, default `1`).
+    #[serde(default = "default_compression_level")]
+    pub compression_level: i32,
 }
 
 impl Default for ServerConfig {
@@ -86,6 +89,7 @@ impl Default for ServerConfig {
             http2_connection_window_size_mb: default_conn_win_mb(),
             compression_enabled: true,
             compression: FlightCompression::default(),
+            compression_level: default_compression_level(),
         }
     }
 }
@@ -101,25 +105,35 @@ impl ServerConfig {
 }
 
 /// Configurable and disableable compression algorithm for Arrow Flight streams.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum FlightCompression {
     /// Compression disabled.
-    #[serde(alias = "off", alias = "false", alias = "disabled")]
     None,
     /// Zstandard compression (Arrow IPC ZSTD buffer compression + gRPC zstd support).
     #[default]
-    #[serde(alias = "zstandard", alias = "true")]
     Zstd,
     /// LZ4 Frame compression (Arrow IPC LZ4_FRAME buffer compression).
-    #[serde(alias = "lz4_frame", alias = "lz4frame")]
     Lz4,
     /// Gzip compression (gRPC transport-level gzip stream compression).
-    #[serde(alias = "gz")]
     Gzip,
 }
 
+impl<'de> Deserialize<'de> for FlightCompression {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        FlightCompression::from_str_insensitive(&s).map_err(serde::de::Error::custom)
+    }
+}
+
 impl FlightCompression {
+    pub const DEFAULT_ZSTD_LEVEL: i32 = 1;
+    pub const MIN_ZSTD_LEVEL: i32 = -7;
+    pub const MAX_ZSTD_LEVEL: i32 = 22;
+
     pub fn from_str_insensitive(s: &str) -> Result<Self> {
         let base = s
             .trim()
@@ -140,6 +154,31 @@ impl FlightCompression {
         }
     }
 
+    pub fn validate_zstd_level(level: i32) -> Result<i32> {
+        if !(Self::MIN_ZSTD_LEVEL..=Self::MAX_ZSTD_LEVEL).contains(&level) {
+            return Err(ProxyError::InvalidArgument(format!(
+                "Invalid ZSTD compression level {level}: expected 1..9 (or full ZSTD range {}..={})",
+                Self::MIN_ZSTD_LEVEL,
+                Self::MAX_ZSTD_LEVEL
+            )));
+        }
+        Ok(level)
+    }
+
+    pub fn extract_inline_level(s: &str) -> Result<Option<i32>> {
+        let trimmed = s.trim();
+        if let Some((_, lvl_str)) = trimmed.split_once(':') {
+            let lvl = lvl_str.trim().parse::<i32>().map_err(|e| {
+                ProxyError::InvalidArgument(format!(
+                    "Invalid inline compression level in '{trimmed}': {e}"
+                ))
+            })?;
+            Ok(Some(Self::validate_zstd_level(lvl)?))
+        } else {
+            Ok(None)
+        }
+    }
+
     pub fn from_headers(headers: &MetadataMap) -> Result<Option<Self>> {
         match headers.get("x-as-compression").and_then(|v| v.to_str().ok()) {
             Some(s) if !s.trim().is_empty() => Ok(Some(Self::from_str_insensitive(s)?)),
@@ -147,15 +186,60 @@ impl FlightCompression {
         }
     }
 
+    pub fn level_from_headers(headers: &MetadataMap) -> Result<Option<i32>> {
+        if let Some(s) = headers
+            .get("x-as-compression-level")
+            .and_then(|v| v.to_str().ok())
+        {
+            let trimmed = s.trim();
+            if !trimmed.is_empty() {
+                let lvl = trimmed.parse::<i32>().map_err(|e| {
+                    ProxyError::InvalidArgument(format!(
+                        "Invalid x-as-compression-level '{trimmed}': {e}"
+                    ))
+                })?;
+                return Ok(Some(Self::validate_zstd_level(lvl)?));
+            }
+        }
+        if let Some(s) = headers.get("x-as-compression").and_then(|v| v.to_str().ok()) {
+            if let Some(inline_lvl) = Self::extract_inline_level(s)? {
+                return Ok(Some(inline_lvl));
+            }
+        }
+        Ok(None)
+    }
+
     pub fn to_ipc_write_options(self) -> Result<arrow_ipc::writer::IpcWriteOptions> {
+        self.to_ipc_write_options_with_level(None)
+    }
+
+    pub fn to_ipc_write_options_with_level(
+        self,
+        level: Option<i32>,
+    ) -> Result<arrow_ipc::writer::IpcWriteOptions> {
         let opts = arrow_ipc::writer::IpcWriteOptions::default();
         match self {
             FlightCompression::None | FlightCompression::Gzip => Ok(opts),
-            FlightCompression::Zstd => opts
-                .try_with_compression(Some(arrow_ipc::CompressionType::ZSTD))
-                .map_err(|e| {
-                    ProxyError::Conversion(format!("Failed to configure ZSTD IPC compression: {e}"))
-                }),
+            FlightCompression::Zstd => {
+                let opts = opts
+                    .try_with_compression(Some(arrow_ipc::CompressionType::ZSTD))
+                    .map_err(|e| {
+                        ProxyError::Conversion(format!(
+                            "Failed to configure ZSTD IPC compression: {e}"
+                        ))
+                    })?;
+                if let Some(lvl) = level {
+                    let valid_lvl = Self::validate_zstd_level(lvl)?;
+                    opts.try_with_compression_level(Some(valid_lvl))
+                        .map_err(|e| {
+                            ProxyError::Conversion(format!(
+                                "Failed to configure ZSTD IPC compression level {valid_lvl}: {e}"
+                            ))
+                        })
+                } else {
+                    Ok(opts)
+                }
+            }
             FlightCompression::Lz4 => opts
                 .try_with_compression(Some(arrow_ipc::CompressionType::LZ4_FRAME))
                 .map_err(|e| {
@@ -660,6 +744,9 @@ pub struct ReadTicket {
     /// Optional Arrow Flight compression mode (`"none"`, `"zstd"`, `"lz4"`, `"gzip"`).
     #[serde(default)]
     pub compression: Option<FlightCompression>,
+    /// Optional ZSTD compression level (`1..=9` standard range, `-7..=22` full range).
+    #[serde(default)]
+    pub compression_level: Option<i32>,
 }
 
 impl ReadTicket {
@@ -732,6 +819,9 @@ pub struct LookupExchangeParams {
     /// Optional Arrow Flight compression mode (`"none"`, `"zstd"`, `"lz4"`, `"gzip"`).
     #[serde(default)]
     pub compression: Option<FlightCompression>,
+    /// Optional ZSTD compression level (`1..=9` standard range, `-7..=22` full range).
+    #[serde(default)]
+    pub compression_level: Option<i32>,
 }
 
 impl LookupExchangeParams {
@@ -846,4 +936,7 @@ fn default_max_backoff_ms() -> u64 {
 }
 fn default_backoff_multiplier() -> f64 {
     2.0
+}
+fn default_compression_level() -> i32 {
+    FlightCompression::DEFAULT_ZSTD_LEVEL
 }
