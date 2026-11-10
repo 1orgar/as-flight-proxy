@@ -127,6 +127,26 @@ impl ClusterMetadataState {
                         started_at_ms: *timestamp_ms,
                         updated_at_ms: *timestamp_ms,
                     });
+                if entry.state != JobState::Running {
+                    entry.namespace.clone_from(namespace);
+                    entry.set_name.clone_from(set_name);
+                    entry.is_dq_validation = *is_dq_validation;
+                    entry.state = JobState::Running;
+                    entry.total_rows_written = 0;
+                    entry.total_batches_processed = 0;
+                    entry.total_overload_retries = 0;
+                    entry.total_other_retries = 0;
+                    entry.total_rows_validated = 0;
+                    entry.total_matched_rows = 0;
+                    entry.total_mismatched_rows = 0;
+                    entry.total_missing_keys = 0;
+                    entry.total_bin_mismatch_rows = 0;
+                    entry.dq_passed = if *is_dq_validation { Some(true) } else { None };
+                    entry.dq_mismatch_samples.clear();
+                    entry.per_node_rows.clear();
+                    entry.error_message = None;
+                    entry.started_at_ms = *timestamp_ms;
+                }
                 if *is_dq_validation {
                     entry.is_dq_validation = true;
                 }
@@ -202,6 +222,39 @@ impl ClusterMetadataState {
                 }
                 entry.updated_at_ms = (*timestamp_ms).max(entry.updated_at_ms);
             }
+            MetadataCommand::ResetJob {
+                job_id,
+                namespace,
+                set_name,
+                is_dq_validation,
+                timestamp_ms,
+            } => {
+                self.jobs.insert(
+                    job_id.clone(),
+                    JobLoadStatus {
+                        job_id: job_id.clone(),
+                        namespace: namespace.clone(),
+                        set_name: set_name.clone(),
+                        is_dq_validation: *is_dq_validation,
+                        state: JobState::Running,
+                        total_rows_written: 0,
+                        total_batches_processed: 0,
+                        total_overload_retries: 0,
+                        total_other_retries: 0,
+                        total_rows_validated: 0,
+                        total_matched_rows: 0,
+                        total_mismatched_rows: 0,
+                        total_missing_keys: 0,
+                        total_bin_mismatch_rows: 0,
+                        dq_passed: if *is_dq_validation { Some(true) } else { None },
+                        dq_mismatch_samples: Vec::new(),
+                        per_node_rows: BTreeMap::new(),
+                        error_message: None,
+                        started_at_ms: *timestamp_ms,
+                        updated_at_ms: *timestamp_ms,
+                    },
+                );
+            }
             MetadataCommand::PurgeExpiredJobs { cutoff_ms } => {
                 self.jobs.retain(|_, job| job.updated_at_ms >= *cutoff_ms);
             }
@@ -212,6 +265,14 @@ impl ClusterMetadataState {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum MetadataCommand {
     UpsertNodeStatus(NodeStatusMeta),
+    ResetJob {
+        job_id: String,
+        namespace: String,
+        set_name: String,
+        #[serde(default)]
+        is_dq_validation: bool,
+        timestamp_ms: u64,
+    },
     RecordJobBatch {
         job_id: String,
         node_id: u64,
@@ -711,6 +772,7 @@ impl RaftNode {
         let mut votes_granted = 1usize; // voted for self
 
         let mut futs = Vec::with_capacity(remote_peers.len());
+        let vote_rpc_timeout_ms = self.config.election_timeout_min_ms.max(400);
         for peer in remote_peers {
             let req = RaftRpcRequest::RequestVote {
                 term,
@@ -718,7 +780,7 @@ impl RaftNode {
                 last_log_index,
                 last_log_term,
             };
-            futs.push(async move { send_rpc(&peer.raft_addr, &req, 200).await });
+            futs.push(async move { send_rpc(&peer.raft_addr, &req, vote_rpc_timeout_ms).await });
         }
 
         let responses = futures::future::join_all(futs).await;
@@ -811,7 +873,9 @@ impl RaftNode {
                 let prev_log_index = next_idx - 1;
                 let prev_log_term = core.term_at(prev_log_index).unwrap_or(0);
                 let entries: Vec<LogEntry> = if (next_idx as usize) <= core.log.len() {
-                    core.log[(next_idx as usize - 1)..].to_vec()
+                    let start_idx = next_idx as usize - 1;
+                    let end_idx = (start_idx + 128).min(core.log.len());
+                    core.log[start_idx..end_idx].to_vec()
                 } else {
                     Vec::new()
                 };
@@ -825,8 +889,9 @@ impl RaftNode {
                     leader_commit,
                 };
 
+                let append_rpc_timeout_ms = self.config.election_timeout_min_ms.max(500);
                 rpc_tasks.push(async move {
-                    let res = send_rpc(&peer.raft_addr, &req, 250).await;
+                    let res = send_rpc(&peer.raft_addr, &req, append_rpc_timeout_ms).await;
                     (peer.node_id, next_idx, res)
                 });
             }
@@ -856,8 +921,9 @@ impl RaftNode {
                     core.match_index.insert(peer_id, match_index);
                     core.next_index.insert(peer_id, match_index + 1);
                 } else {
-                    let decremented = attempted_next_idx.saturating_sub(1).max(1);
-                    core.next_index.insert(peer_id, decremented);
+                    let fallback = attempted_next_idx.saturating_sub(1).max(1);
+                    let fast_backtrack = (match_index + 1).min(fallback).max(1);
+                    core.next_index.insert(peer_id, fast_backtrack);
                 }
             }
         }

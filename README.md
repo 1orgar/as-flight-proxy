@@ -25,7 +25,8 @@ Detailed bilingual guides covering architecture, configuration, all parameters, 
 | **[1. Architecture & Internals](docs/en/architecture.md)** | **[Архитектура и устройство](docs/ru/architecture.md)** | Arrow Flight RPC flows (`DoPut`, `DoGet`, `DoExchange`, `GetSchema`, `DoAction`), dual-layer compression (`ZSTD` / `LZ4` / `GZIP`), zero-copy hot-path optimizations, type mapping, Raft, and per-key retry semantics. |
 | **[2. Proxy Server Configuration](docs/en/proxy-configuration.md)** | **[Конфигурация `proxy_server`](docs/ru/proxy-configuration.md)** | Full reference for `config.toml`, CLI flags, environment variables, TLS/mTLS setup, Aerospike connection pools, concurrency tuning, and Linux kernel tuning. |
 | **[3. Spark Connector Guide & Examples](docs/en/spark-connector.md)** | **[Справочник `spark_connector`](docs/ru/spark-connector.md)** | Complete `.format("aerospike-flight")` options reference, `AerospikeFlightLookup` (Scala + PySpark), `AerospikeLoadStatus`, and examples for Write, DQ, Read, and Python `pyarrow.flight`. |
-| **[4. Observability, Metrics & Logging](docs/en/observability.md)** | **[Мониторинг и логи](docs/ru/observability.md)** | Reference for all 21 Prometheus metrics, ready-to-use PromQL queries, Driver & Executor log guides, and troubleshooting playbook. |
+| **[4. Direct Flight Operations (Python)](docs/en/flight-operations.md)** | **[Прямые вызовы Flight из Python](docs/ru/flight-operations.md)** | Calling Arrow Flight methods directly from Python (`pyarrow.flight`): querying Raft cluster & job status, resetting jobs, reading into `pyarrow.Table` / `pandas`, `DoExchange` lookup, and `DoPut`. |
+| **[5. Observability, Metrics & Logging](docs/en/observability.md)** | **[Мониторинг и логи](docs/ru/observability.md)** | Reference for all 21 Prometheus metrics, ready-to-use PromQL queries, Driver & Executor log guides, and troubleshooting playbook. |
 
 ---
 
@@ -229,10 +230,11 @@ Data source format: `.format("aerospike-flight")`.
 | `aerospike.read.keys` | No | — | Explicit primary keys (CSV or JSON array) for direct `BatchGet` reads |
 | `aerospike.lookup.sourceView` | No | — | Temporary view name containing keys for distributed `DoExchange` Lookup |
 | `aerospike.lookup.joinType` | No | `"left"` | Join semantics for `DoExchange` Lookup: `"left"` or `"inner"` |
-| `connector.jobId` | No | Auto `UUID` | Unique job identifier for querying status in Raft |
+| `connector.jobId` | **Yes** | — | Unique job identifier for tracking status in Raft (starting a job with an existing `jobId` overwrites its metadata in Raft) |
 | `connector.batchSize` | No | `"8192"` | Number of rows per Arrow `RecordBatch` on the write path |
 | `connector.writerThreads` | No | `"4"` | Parallel Arrow Flight `DoPut` streams per Spark task |
 | `connector.queueCapacity` | No | `writerThreads * 2` | Bounded queue capacity of prepared `RecordBatch`es per task |
+| `connector.autoConvertStrings` | No | `"false"` | Automatically convert string bin values (`"1" -> Int`, `"1.0" -> Double`, fallback `String`) |
 
 ---
 
@@ -359,7 +361,7 @@ sbt "set ThisBuild / coverageEnabled := false" assembly
 On every push to `main` and `v*` tag, [`.github/workflows/ci.yml`](.github/workflows/ci.yml) enforces `>= 85%` test coverage and publishes 3 release artifacts:
 1. `as_proxy_server-linux-x86_64.zip` — ZIP archive containing the stripped `as_proxy_server` binary for Linux `x86_64` and `config.example.toml`.
 2. `as_proxy_server-linux-arm64.zip` — ZIP archive containing the stripped `as_proxy_server` binary for Linux `ARM64` (`aarch64`) and `config.example.toml`.
-3. `spark-aerospike-flight-connector-assembly-0.1.0.jar` — Shaded Fat-JAR connector for Apache Spark 3.5 (Scala 2.12).
+3. `spark-aerospike-flight-connector-assembly-0.4.0.jar` — Shaded Fat-JAR connector for Apache Spark 3.5 (Scala 2.12).
 
 ### Running the Full E2E Benchmark & Verification Suite (Docker Compose)
 ```bash
@@ -369,7 +371,7 @@ curl -sL "https://github.com/1orgar/as-flight-proxy/releases/latest/download/as_
 unzip -o e2e/artifacts/proxy.zip -d e2e/artifacts/
 mv "e2e/artifacts/as_proxy_server-linux-${ARCH}" e2e/artifacts/as_proxy_server
 chmod +x e2e/artifacts/as_proxy_server
-curl -sL "https://github.com/1orgar/as-flight-proxy/releases/latest/download/spark-aerospike-flight-connector-assembly-0.1.0.jar" -o e2e/artifacts/spark-aerospike-flight-connector-assembly-0.1.0.jar
+curl -sL "https://github.com/1orgar/as-flight-proxy/releases/latest/download/spark-aerospike-flight-connector-assembly-0.4.0.jar" -o e2e/artifacts/spark-aerospike-flight-connector-assembly-0.4.0.jar
 
 docker compose -f docker-compose.e2e.yml up --abort-on-container-exit --exit-code-from spark-e2e
 docker compose -f docker-compose.e2e.yml down

@@ -352,6 +352,7 @@ fn test_convert_all_types_and_null_modes() {
         use_batch_write: Some(true),
         validate_only: false,
         compression: None,
+        auto_convert_strings: false,
     };
 
     let records = convert_record_batch(&batch, &params_update_nil, 64).unwrap();
@@ -487,6 +488,7 @@ fn test_null_primary_key_and_bin_name_length_validation() {
         use_batch_write: None,
         validate_only: false,
         compression: None,
+        auto_convert_strings: false,
     };
 
     // Null key must fail immediately
@@ -648,6 +650,7 @@ async fn test_infinite_overload_retry_and_partial_batch_retry() {
         use_batch_write: Some(true),
         validate_only: false,
         compression: None,
+        auto_convert_strings: false,
     };
 
     let stats = engine.write_records(records, &params).await.unwrap();
@@ -702,6 +705,7 @@ async fn test_single_put_fallback_mode_with_overload_retry() {
         use_batch_write: Some(false),
         validate_only: false,
         compression: None,
+        auto_convert_strings: false,
     };
 
     let stats = engine.write_records(records, &params).await.unwrap();
@@ -748,6 +752,7 @@ async fn test_non_overload_error_terminates_after_n_retries() {
         use_batch_write: Some(true),
         validate_only: false,
         compression: None,
+        auto_convert_strings: false,
     };
 
     let err = engine.write_records(records, &params).await.unwrap_err();
@@ -861,6 +866,7 @@ async fn test_end_to_end_flight_handshake_and_do_put_stream() {
         use_batch_write: Some(true),
         validate_only: false,
         compression: None,
+        auto_convert_strings: false,
     };
     let descriptor = FlightDescriptor::new_cmd(serde_json::to_vec(&write_params).unwrap());
 
@@ -1027,6 +1033,7 @@ async fn test_three_node_raft_cluster_metadata_and_distributed_job_status() {
             use_batch_write: Some(true),
             validate_only: false,
             compression: None,
+            auto_convert_strings: false,
         };
         let desc = FlightDescriptor::new_cmd(serde_json::to_vec(&params).unwrap());
         let stream_data = FlightDataEncoderBuilder::new()
@@ -1289,6 +1296,7 @@ async fn test_dq_validation_with_nan_equality_and_mismatch_detection() {
         use_batch_write: Some(true),
         validate_only: true,
         compression: None,
+        auto_convert_strings: false,
     };
     let desc = FlightDescriptor::new_cmd(serde_json::to_vec(&dq_params).unwrap());
     let stream_data = FlightDataEncoderBuilder::new()
@@ -1458,6 +1466,7 @@ async fn test_flight_read_get_schema_do_get_and_do_exchange_lookup() {
         use_batch_write: Some(true),
         validate_only: false,
         compression: None,
+        auto_convert_strings: false,
     };
 
     let desc = FlightDescriptor::new_cmd(serde_json::to_vec(&w_params).unwrap());
@@ -2348,6 +2357,7 @@ fn test_converter_all_read_write_types_and_mismatch_modes() {
         use_batch_write: Some(true),
         validate_only: false,
         compression: None,
+        auto_convert_strings: false,
     };
     let prep = convert_record_batch(&ext_rb, &wp_ext, 15).unwrap();
     assert_eq!(prep.len(), 1);
@@ -2483,7 +2493,7 @@ async fn test_flight_service_actions_and_error_paths() {
         .try_collect()
         .await
         .unwrap();
-    assert_eq!(actions.len(), 4);
+    assert_eq!(actions.len(), 5);
 
     assert!(client.list_flights(Request::new(Criteria { expression: Bytes::new() })).await.is_err());
     assert!(client.get_flight_info(Request::new(FlightDescriptor::new_cmd(vec![]))).await.is_err());
@@ -2567,6 +2577,7 @@ async fn test_read_keys_and_dq_validate_retries_and_raft_actions() {
         use_batch_write: Some(true),
         validate_only: true,
         compression: None,
+        auto_convert_strings: false,
     };
     let dq_stats = engine
         .validate_records(
@@ -2774,6 +2785,7 @@ async fn test_read_keys_and_dq_validate_retries_and_raft_actions() {
         use_batch_write: Some(true),
         validate_only: false,
         compression: None,
+        auto_convert_strings: false,
     };
     let bad_put_stream = FlightDataEncoderBuilder::new()
         .with_schema(nullable_pk_schema)
@@ -2809,6 +2821,7 @@ async fn test_read_keys_and_dq_validate_retries_and_raft_actions() {
             use_batch_write: Some(true),
             validate_only: val_only,
             compression: None,
+            auto_convert_strings: false,
         };
         let fatal_stream = FlightDataEncoderBuilder::new()
             .with_schema(schema.clone())
@@ -2996,6 +3009,7 @@ fn test_converter_remaining_key_and_value_types_and_dq_branches() {
         use_batch_write: None,
         validate_only: false,
         compression: None,
+        auto_convert_strings: false,
     };
 
     // 1. Empty batch (0 rows) -> Ok(vec![])
@@ -3345,6 +3359,7 @@ async fn test_flight_compression_modes_and_disableable_switch() {
             use_batch_write: Some(true),
             validate_only: false,
             compression: Some(mode),
+            auto_convert_strings: false,
         };
         let put_ipc_opts = mode.to_ipc_write_options().unwrap();
         let put_stream = FlightDataEncoderBuilder::new()
@@ -3501,4 +3516,329 @@ async fn test_flight_compression_modes_and_disableable_switch() {
         assert_eq!(rows, 20);
     }
 }
+
+#[tokio::test]
+async fn test_raft_init_job_overwrites_existing_job_metadata_and_wide_batch_slicing() {
+    use as_proxy_server::config::{FlightCompression, ServerConfig};
+
+    let sink = Arc::new(MockAerospikeSink::new(HashMap::new(), HashMap::new()));
+    let metrics = ProxyMetrics::new();
+    let engine = Arc::new(MppWriteEngine::new(
+        sink.clone(),
+        WriterConfig {
+            use_batch_write: true,
+            batch_write_size: 32,
+            max_in_flight_records: 128,
+            max_concurrent_subbatches_per_stream: 4,
+        },
+        RetryConfig::default(),
+        metrics.clone(),
+    ));
+    let auth = Arc::new(Authenticator::new(AuthConfig {
+        enabled: false,
+        ..AuthConfig::default()
+    }));
+    let raft_node = RaftNode::new(RaftConfig {
+        enabled: true,
+        node_id: 1,
+        listen_addr: "127.0.0.1:0".into(),
+        peers: vec![],
+        ..RaftConfig::default()
+    });
+    raft_node.start().await.unwrap();
+
+    let svc = ProxyFlightService::new(auth, engine, metrics, 15)
+        .with_raft_node(raft_node.clone())
+        .into_server(&ServerConfig::default());
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        Server::builder()
+            .add_service(svc)
+            .serve_with_incoming(TcpListenerStream::new(listener))
+            .await
+            .unwrap();
+    });
+
+    let channel = tonic::transport::Endpoint::from_shared(format!("http://{addr}"))
+        .unwrap()
+        .connect()
+        .await
+        .unwrap();
+    let mut client = FlightServiceClient::new(channel);
+
+    // 1. Build a wide 50-column RecordBatch (pk + 50 bins) with 40 rows
+    let mut fields = vec![Field::new("pk", DataType::Utf8, false)];
+    for c in 0..50 {
+        fields.push(Field::new(format!("bin_{c}"), DataType::Int64, true));
+    }
+    let wide_schema = Arc::new(Schema::new(fields));
+
+    let mut cols: Vec<Arc<dyn Array>> = Vec::with_capacity(51);
+    let mut pk_b = StringBuilder::new();
+    for i in 0..40 {
+        pk_b.append_value(format!("wide-k-{i}"));
+    }
+    cols.push(Arc::new(pk_b.finish()));
+    for c in 0..50 {
+        let mut int_b = Int64Builder::new();
+        for i in 0..40 {
+            int_b.append_value((i * 100 + c) as i64);
+        }
+        cols.push(Arc::new(int_b.finish()));
+    }
+    let wide_batch = RecordBatch::try_new(wide_schema.clone(), cols).unwrap();
+
+    // 2. Initialize job "wide-job-1" via DoAction("init_job")
+    let init_payload = serde_json::json!({
+        "job_id": "wide-job-1",
+        "namespace": "test",
+        "set_name": "wide_set",
+        "is_dq_validation": false
+    });
+    let mut init_stream = client
+        .do_action(Request::new(Action {
+            r#type: "init_job".into(),
+            body: Bytes::from(serde_json::to_vec(&init_payload).unwrap()),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    let init_res = init_stream.try_next().await.unwrap().unwrap();
+    let init_status: JobLoadStatus = serde_json::from_slice(&init_res.body).unwrap();
+    assert_eq!(init_status.job_id, "wide-job-1");
+    assert_eq!(init_status.total_rows_written, 0);
+    assert_eq!(init_status.state, JobState::Running);
+
+    // 3. Stream the wide batch via DoPut (write mode) and then DQ mode
+    for validate_only in [false, true] {
+        let wp = WriteParameters {
+            job_id: Some("wide-job-1".into()),
+            namespace: "test".into(),
+            set_name: "wide_set".into(),
+            key_column: "pk".into(),
+            write_mode: WriteMode::Replace,
+            ttl_seconds: None,
+            send_key: true,
+            ignore_nulls: false,
+            use_batch_write: Some(true),
+            validate_only,
+            compression: Some(FlightCompression::None),
+            auto_convert_strings: false,
+        };
+        let desc = FlightDescriptor::new_cmd(serde_json::to_vec(&wp).unwrap());
+        let stream = FlightDataEncoderBuilder::new()
+            .with_schema(wide_schema.clone())
+            .with_flight_descriptor(Some(desc))
+            .build(stream::iter(vec![Ok(wide_batch.clone())]))
+            .map(|r| r.unwrap());
+        let mut resp = client
+            .do_put(Request::new(stream))
+            .await
+            .unwrap()
+            .into_inner();
+        let ack_msg = resp.try_next().await.unwrap().unwrap();
+        let ack: PutBatchAck = serde_json::from_slice(&ack_msg.app_metadata).unwrap();
+        if validate_only {
+            assert_eq!(ack.rows_validated, 40);
+            assert_eq!(ack.matched_rows, 40);
+        } else {
+            assert_eq!(ack.rows_written, 40);
+        }
+    }
+
+    // Complete job "wide-job-1"
+    client
+        .do_action(Request::new(Action {
+            r#type: "complete_job".into(),
+            body: Bytes::from("wide-job-1"),
+        }))
+        .await
+        .unwrap();
+
+    let before_reset = raft_node.get_job_status("wide-job-1").await.unwrap();
+    assert_eq!(before_reset.total_rows_written, 40);
+    assert_eq!(before_reset.state, JobState::Completed);
+
+    // 4. Re-initialize the SAME job_id ("wide-job-1") via DoAction("init_job") -> must overwrite metadata in Raft!
+    let mut reset_stream = client
+        .do_action(Request::new(Action {
+            r#type: "init_job".into(),
+            body: Bytes::from(serde_json::to_vec(&init_payload).unwrap()),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    let reset_res = reset_stream.try_next().await.unwrap().unwrap();
+    let reset_status: JobLoadStatus = serde_json::from_slice(&reset_res.body).unwrap();
+    assert_eq!(reset_status.job_id, "wide-job-1");
+    assert_eq!(reset_status.total_rows_written, 0);
+    assert_eq!(reset_status.total_batches_processed, 0);
+    assert_eq!(reset_status.state, JobState::Running);
+}
+
+#[test]
+fn test_auto_convert_strings_option() {
+    use arrow_array::{LargeStringArray, StringViewArray};
+    use as_proxy_server::converter::parse_string_auto;
+
+    // 1. Direct unit tests for parse_string_auto
+    assert_eq!(parse_string_auto("1", false), Value::String("1".into()));
+    assert_eq!(parse_string_auto("1.0", false), Value::String("1.0".into()));
+
+    assert_eq!(parse_string_auto("1", true), Value::Int(1));
+    assert_eq!(parse_string_auto("-42", true), Value::Int(-42));
+    assert_eq!(parse_string_auto("+7", true), Value::Int(7));
+    assert_eq!(parse_string_auto(" 100 ", true), Value::Int(100));
+    assert_eq!(
+        parse_string_auto("1.0", true),
+        Value::Float(FloatValue::from(1.0))
+    );
+    assert_eq!(
+        parse_string_auto("-3.14", true),
+        Value::Float(FloatValue::from(-3.14))
+    );
+    assert_eq!(
+        parse_string_auto(".5", true),
+        Value::Float(FloatValue::from(0.5))
+    );
+    assert_eq!(
+        parse_string_auto("1e5", true),
+        Value::Float(FloatValue::from(100_000.0))
+    );
+    assert_eq!(
+        parse_string_auto("hello", true),
+        Value::String("hello".into())
+    );
+    assert_eq!(parse_string_auto("", true), Value::String("".into()));
+    assert_eq!(parse_string_auto("   ", true), Value::String("   ".into()));
+    assert_eq!(parse_string_auto("NaN", true), Value::String("NaN".into()));
+    assert_eq!(
+        parse_string_auto("Infinity", true),
+        Value::String("Infinity".into())
+    );
+
+    // 2. RecordBatch conversion with Utf8, LargeUtf8, Utf8View, and nested List/Struct/Map
+    let struct_fields = Fields::from(vec![Field::new("nested_num", DataType::Utf8, true)]);
+    let mut pk_b = StringBuilder::new();
+    let mut s_int_b = StringBuilder::new();
+    let mut s_flt_b = StringBuilder::new();
+    let mut s_txt_b = StringBuilder::new();
+    let mut list_b = ListBuilder::new(StringBuilder::new());
+    let mut struct_b = StructBuilder::new(
+        struct_fields.clone(),
+        vec![Box::new(StringBuilder::new())],
+    );
+
+    // Row 0: numeric strings ("1", "1.0") and non-numeric ("abc"), plus primary key "100" (PK stays String!)
+    pk_b.append_value("100");
+    s_int_b.append_value("1");
+    s_flt_b.append_value("1.0");
+    s_txt_b.append_value("abc");
+    list_b.values().append_value("42");
+    list_b.values().append_value("2.5");
+    list_b.values().append_value("raw");
+    list_b.append(true);
+    struct_b
+        .field_builder::<StringBuilder>(0)
+        .unwrap()
+        .append_value("99.9");
+    struct_b.append(true);
+
+    let list_arr = list_b.finish();
+    let struct_arr = struct_b.finish();
+    let large_arr = LargeStringArray::from(vec![Some("777")]);
+    let view_arr = StringViewArray::from(vec![Some("8.25")]);
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("pk", DataType::Utf8, false),
+        Field::new("c_int", DataType::Utf8, true),
+        Field::new("c_flt", DataType::Utf8, true),
+        Field::new("c_txt", DataType::Utf8, true),
+        Field::new("c_list", list_arr.data_type().clone(), true),
+        Field::new("c_struct", DataType::Struct(struct_fields), true),
+        Field::new("c_large", DataType::LargeUtf8, true),
+        Field::new("c_view", DataType::Utf8View, true),
+    ]));
+
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(pk_b.finish()),
+            Arc::new(s_int_b.finish()),
+            Arc::new(s_flt_b.finish()),
+            Arc::new(s_txt_b.finish()),
+            Arc::new(list_arr),
+            Arc::new(struct_arr),
+            Arc::new(large_arr),
+            Arc::new(view_arr),
+        ],
+    )
+    .unwrap();
+
+    // Default auto_convert_strings = false -> all string bins remain Value::String
+    let params_false = WriteParameters {
+        namespace: "test".into(),
+        set_name: "users".into(),
+        key_column: "pk".into(),
+        auto_convert_strings: false,
+        ..WriteParameters::default()
+    };
+    let recs_false = convert_record_batch(&batch, &params_false, 15).unwrap();
+    assert_eq!(recs_false[0].bins[0], Bin::new("c_int", Value::String("1".into())));
+    assert_eq!(
+        recs_false[0].bins[1],
+        Bin::new("c_flt", Value::String("1.0".into()))
+    );
+
+    // auto_convert_strings = true -> "1" -> Int(1), "1.0" -> Float(1.0), "abc" -> String("abc")
+    let mut headers = MetadataMap::new();
+    headers.insert("x-as-auto-convert-strings", MetadataValue::from_static("true"));
+    let cmd_bytes = serde_json::to_vec(&params_false).unwrap();
+    let params_true =
+        WriteParameters::from_descriptor_or_headers(Some(&cmd_bytes), &headers).unwrap();
+    assert!(params_true.auto_convert_strings);
+
+    let recs_true = convert_record_batch(&batch, &params_true, 15).unwrap();
+    let r = &recs_true[0];
+    // Primary key stays String("100") because pk column is DataType::Utf8
+    assert_eq!(
+        r.key,
+        Key::new("test", "users", Value::String("100".into())).unwrap()
+    );
+    assert_eq!(r.bins[0], Bin::new("c_int", Value::Int(1)));
+    assert_eq!(
+        r.bins[1],
+        Bin::new("c_flt", Value::Float(FloatValue::from(1.0)))
+    );
+    assert_eq!(
+        r.bins[2],
+        Bin::new("c_txt", Value::String("abc".into()))
+    );
+    assert_eq!(
+        r.bins[3],
+        Bin::new(
+            "c_list",
+            Value::List(vec![
+                Value::Int(42),
+                Value::Float(FloatValue::from(2.5)),
+                Value::String("raw".into()),
+            ])
+        )
+    );
+    let mut exp_struct = IndexMap::new();
+    exp_struct.insert(
+        Value::String("nested_num".into()),
+        Value::Float(FloatValue::from(99.9)),
+    );
+    assert_eq!(r.bins[4], Bin::new("c_struct", Value::OrderedMap(exp_struct)));
+    assert_eq!(r.bins[5], Bin::new("c_large", Value::Int(777)));
+    assert_eq!(
+        r.bins[6],
+        Bin::new("c_view", Value::Float(FloatValue::from(8.25)))
+    );
+}
+
+
 

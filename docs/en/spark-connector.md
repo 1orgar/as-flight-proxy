@@ -26,12 +26,12 @@
 
 ## 1. Installation & Spark Submit
 
-Use the shaded assembly Fat-JAR `spark-aerospike-flight-connector-assembly-0.1.0.jar` with **Apache Spark 3.5.x** (Scala 2.12, Java 11/17):
+Use the shaded assembly Fat-JAR `spark-aerospike-flight-connector-assembly-0.4.0.jar` with **Apache Spark 3.5.x** (Scala 2.12, Java 11/17):
 
 ```bash
 # PySpark shell or spark-submit
 pyspark \
-  --jars /path/to/spark-aerospike-flight-connector-assembly-0.1.0.jar \
+  --jars /path/to/spark-aerospike-flight-connector-assembly-0.4.0.jar \
   --conf "spark.driver.extraJavaOptions=--add-opens=java.base/java.nio=ALL-UNNAMED" \
   --conf "spark.executor.extraJavaOptions=--add-opens=java.base/java.nio=ALL-UNNAMED"
 ```
@@ -76,7 +76,7 @@ Data source format short name: **`"aerospike-flight"`** (or full class name `"co
 
 | Option | Aliases | Default | Description |
 | :--- | :--- | :---: | :--- |
-| `connector.jobId` | `aerospike.jobId`, `aerospike.job_id`, `job.id` | Auto `as-load-<UUID>` | Unique job identifier used to track progress and DQ results in Raft |
+| `connector.jobId` | `aerospike.jobId`, `aerospike.job_id`, `job.id` | **Required** | Unique job identifier used to track progress and DQ results in Raft (starting a job with an existing `jobId` automatically overwrites its metadata in Raft) |
 | `aerospike.writeMode` | `aerospike.write_mode` | `"update"` | Write mode: `"update"`, `"replace"`, `"update_only"`, `"replace_only"`, `"create_only"`, `"validate"` (`"dq"`, `"verify"`) |
 | `aerospike.dq` | `aerospike.validateOnly`, `aerospike.validate_only`, `connector.dq` | `"false"` | When `"true"`, runs in read-only Data Quality validation mode (`BatchRead` comparison against Aerospike) |
 | `aerospike.ignoreNulls` | `aerospike.ignore_nulls` | `"false"` | When `"false"` (default), `NULL` bins in `update` mode emit `Value::Nil` to delete the bin in Aerospike. When `"true"`, `NULL` bins are omitted |
@@ -86,6 +86,7 @@ Data source format short name: **`"aerospike-flight"`** (or full class name `"co
 | `connector.batchSize` | `aerospike.batchSize`, `aerospike.batch_size` | `"8192"` | Number of rows per Arrow `RecordBatch` on write |
 | `connector.writerThreads` | `aerospike.writerThreads`, `aerospike.writer_threads` | `"4"` | Number of concurrent `DoPut` sender threads per Spark task |
 | `connector.queueCapacity` | `aerospike.queueCapacity`, `aerospike.queue_capacity` | `max(writerThreads * 2, 4)` | Capacity of the per-task bounded `RecordBatch` queue |
+| `connector.autoConvertStrings` | `aerospike.autoConvertStrings`, `connector.auto_convert_strings`, `aerospike.auto_convert_strings` | `"false"` | Automatic string bin conversion on write: `"1" -> Int(1)`, `"1.0" -> Double(1.0)`, non-numeric strings remain `String` |
 
 ---
 
@@ -119,7 +120,7 @@ Data source format short name: **`"aerospike-flight"`** (or full class name `"co
 | `ByteType`, `ShortType`, `IntegerType`, `LongType` | `Int8`, `Int16`, `Int32`, `Int64` | `Value::Int(i64)` | Widened to signed 64-bit integer on write; range-checked on read |
 | `FloatType`, `DoubleType` | `Float32`, `Float64` | `Value::Float(FloatValue)` | IEEE-754 64-bit float; **`NaN == NaN` is `true` in DQ validation** |
 | `DecimalType(p, s)` | `Decimal128(p, s)` | `Value::String(String)` | Exact scale-preserving decimal string (e.g. `"12345.67"`) |
-| `StringType` | `Utf8` | `Value::String(String)` | UTF-8 string |
+| `StringType` | `Utf8` | `Value::String(String)` (or `Int`/`Float` when `connector.autoConvertStrings=true`) | UTF-8 string; when `connector.autoConvertStrings=true`, `"1"` is stored as `Int(1)` and `"1.0"` as `Float(1.0)` |
 | `BinaryType` | `Binary` | `Value::Blob(Vec<u8>)` | Raw byte array |
 | `DateType` | `Date32` (days) | `Value::Int(i64)` | Stored as **UTC epoch milliseconds** (`days * 86_400_000`) |
 | `TimestampType` | `Timestamp(Microsecond, "UTC")` | `Value::Int(i64)` | Stored as **UTC epoch milliseconds** (`micros / 1_000`) |

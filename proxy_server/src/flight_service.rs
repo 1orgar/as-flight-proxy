@@ -27,9 +27,9 @@ use crate::config::{
     ReadTicket, ServerConfig, WriteParameters,
 };
 use crate::converter::{
-    ScannedRecord, build_lookup_record_batch, convert_record_batch,
-    decode_arrow_schema_ipc_base64, encode_arrow_schema_to_result, extract_keys_from_batch,
-    infer_arrow_schema_from_records, records_to_record_batch,
+    ScannedRecord, build_lookup_record_batch, decode_arrow_schema_ipc_base64,
+    encode_arrow_schema_to_result, extract_keys_from_batch, infer_arrow_schema_from_records,
+    records_to_record_batch,
 };
 use crate::error::ProxyError;
 use crate::metrics::ProxyMetrics;
@@ -64,6 +64,8 @@ struct JobStateActionPayload {
     pub namespace: String,
     #[serde(default)]
     pub set_name: String,
+    #[serde(default)]
+    pub is_dq_validation: bool,
     #[serde(default)]
     pub error: Option<String>,
 }
@@ -312,31 +314,14 @@ impl FlightService for ProxyFlightService {
                         }
 
                         let params = write_params.as_ref().expect("write_params initialized");
-                        let prepared =
-                            match convert_record_batch(&batch, params, max_bin_name_len) {
-                                Ok(records) => records,
-                                Err(err) => {
-                                    error!("RecordBatch conversion error: {err}");
-                                    if let (Some(raft), Some(job_id)) =
-                                        (&raft_node, &params.job_id)
-                                    {
-                                        let _ = raft
-                                            .propose(MetadataCommand::SetJobState {
-                                                job_id: job_id.clone(),
-                                                namespace: params.namespace.clone(),
-                                                set_name: params.set_name.clone(),
-                                                state: JobState::Failed,
-                                                error_message: Some(err.to_string()),
-                                                timestamp_ms: now_ms(),
-                                            })
-                                            .await;
-                                    }
-                                    let _ = tx.send(Err(err.into())).await;
-                                    return;
-                                }
-                            };
+                        let write_res = write_engine
+                            .write_record_batch(&batch, params, max_bin_name_len)
+                            .await;
+                        // Drop the Arrow RecordBatch immediately after Aerospike execution so its buffers
+                        // are not held in memory while proposing batch stats to Raft.
+                        drop(batch);
 
-                        let stats = match write_engine.write_records(prepared, params).await {
+                        let stats = match write_res {
                             Ok(s) => s,
                             Err(err) => {
                                 error!("MPP write engine error on batch {batch_index}: {err}");
@@ -457,6 +442,23 @@ impl FlightService for ProxyFlightService {
                     .map_err(|e| Status::internal(format!("JSON serialize error: {e}")))?
             }
 
+            "init_job" | "reset_job" => {
+                let payload = parse_job_state_payload(&action.body)?;
+                raft.propose(MetadataCommand::ResetJob {
+                    job_id: payload.job_id.clone(),
+                    namespace: payload.namespace,
+                    set_name: payload.set_name,
+                    is_dq_validation: payload.is_dq_validation,
+                    timestamp_ms: now_ms(),
+                })
+                .await
+                .map_err(Status::from)?;
+
+                let updated = raft.get_job_status(&payload.job_id).await;
+                serde_json::to_vec(&updated)
+                    .map_err(|e| Status::internal(format!("JSON serialize error: {e}")))?
+            }
+
             "complete_job" => {
                 let payload = parse_job_state_payload(&action.body)?;
                 raft.propose(MetadataCommand::SetJobState {
@@ -495,7 +497,7 @@ impl FlightService for ProxyFlightService {
 
             other => {
                 return Err(Status::invalid_argument(format!(
-                    "Unsupported action type '{other}'. Supported: get_job_status, get_cluster_status, complete_job, fail_job"
+                    "Unsupported action type '{other}'. Supported: init_job, reset_job, get_job_status, get_cluster_status, complete_job, fail_job"
                 )));
             }
         };
@@ -512,6 +514,10 @@ impl FlightService for ProxyFlightService {
         _request: Request<Empty>,
     ) -> Result<Response<Self::ListActionsStream>, Status> {
         let actions = vec![
+            Ok(ActionType {
+                r#type: "init_job".to_string(),
+                description: "Initialize or reset Raft-replicated metadata for a Spark job_id".to_string(),
+            }),
             Ok(ActionType {
                 r#type: "get_job_status".to_string(),
                 description: "Get Raft-replicated load status for a Spark job_id".to_string(),
@@ -1176,6 +1182,7 @@ fn parse_job_state_payload(body: &[u8]) -> Result<JobStateActionPayload, Status>
         job_id,
         namespace: String::new(),
         set_name: String::new(),
+        is_dq_validation: false,
         error: None,
     })
 }

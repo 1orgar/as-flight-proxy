@@ -161,7 +161,12 @@ pub fn convert_record_batch(
                     bins.push(Bin::new(bin_name.clone(), Value::Nil));
                 }
             } else {
-                let val = extract_value(*col_array, row, !emit_nil_for_nulls)?;
+                let val = extract_value_with_options(
+                    *col_array,
+                    row,
+                    !emit_nil_for_nulls,
+                    params.auto_convert_strings,
+                )?;
                 bins.push(Bin::new(bin_name.clone(), val));
             }
         }
@@ -392,10 +397,47 @@ fn extract_key_value(array: &dyn Array, row: usize, col_name: &str) -> Result<Va
     }
 }
 
+/// Convert a string slice into `Value::Int(i64)` or `Value::Float(FloatValue)` when
+/// `auto_convert_strings` is enabled, falling back to `Value::String`.
+/// Mirrors Python's `auto_type_convert(val, int, float)`:
+/// 1. Try parsing as `i64` (`"1"` -> `Value::Int(1)`).
+/// 2. Try parsing as finite `f64` (`"1.0"` -> `Value::Float(1.0)`).
+/// 3. Fallback to `Value::String(s.to_string())`.
+#[inline]
+pub fn parse_string_auto(s: &str, auto_convert_strings: bool) -> Value {
+    if auto_convert_strings {
+        let trimmed = s.trim();
+        if let Some(&first_byte) = trimmed.as_bytes().first() {
+            if matches!(first_byte, b'0'..=b'9' | b'+' | b'-' | b'.') {
+                if let Ok(i) = trimmed.parse::<i64>() {
+                    return Value::Int(i);
+                }
+                if let Ok(f) = trimmed.parse::<f64>() {
+                    if f.is_finite() {
+                        return Value::Float(FloatValue::from(f));
+                    }
+                }
+            }
+        }
+    }
+    Value::String(s.to_string())
+}
+
 /// Extract an Aerospike `Value` from any supported Arrow `Array` at `row`.
 /// Assumes `array.is_null(row)` has already been checked by the caller if needed,
 /// though nested calls handle nulls by returning `Value::Nil`.
 pub fn extract_value(array: &dyn Array, row: usize, ignore_nulls: bool) -> Result<Value> {
+    extract_value_with_options(array, row, ignore_nulls, false)
+}
+
+/// Extract an Aerospike `Value` from any supported Arrow `Array` at `row`, optionally
+/// auto-converting string values (`"1"` -> `Int(1)`, `"1.0"` -> `Float(1.0)`).
+pub fn extract_value_with_options(
+    array: &dyn Array,
+    row: usize,
+    ignore_nulls: bool,
+    auto_convert_strings: bool,
+) -> Result<Value> {
     if array.is_null(row) {
         return Ok(Value::Nil);
     }
@@ -460,21 +502,21 @@ pub fn extract_value(array: &dyn Array, row: usize, ignore_nulls: bool) -> Resul
                 .as_any()
                 .downcast_ref::<StringArray>()
                 .ok_or_else(|| ProxyError::Conversion("Failed to downcast Utf8".into()))?;
-            Ok(Value::String(arr.value(row).to_string()))
+            Ok(parse_string_auto(arr.value(row), auto_convert_strings))
         }
         DataType::LargeUtf8 => {
             let arr = array
                 .as_any()
                 .downcast_ref::<LargeStringArray>()
                 .ok_or_else(|| ProxyError::Conversion("Failed to downcast LargeUtf8".into()))?;
-            Ok(Value::String(arr.value(row).to_string()))
+            Ok(parse_string_auto(arr.value(row), auto_convert_strings))
         }
         DataType::Utf8View => {
             let arr = array
                 .as_any()
                 .downcast_ref::<StringViewArray>()
                 .ok_or_else(|| ProxyError::Conversion("Failed to downcast Utf8View".into()))?;
-            Ok(Value::String(arr.value(row).to_string()))
+            Ok(parse_string_auto(arr.value(row), auto_convert_strings))
         }
         DataType::Binary => {
             let arr = array
@@ -541,7 +583,12 @@ pub fn extract_value(array: &dyn Array, row: usize, ignore_nulls: bool) -> Resul
             let slice = list_arr.value(row);
             let mut items = Vec::with_capacity(slice.len());
             for i in 0..slice.len() {
-                items.push(extract_value(slice.as_ref(), i, ignore_nulls)?);
+                items.push(extract_value_with_options(
+                    slice.as_ref(),
+                    i,
+                    ignore_nulls,
+                    auto_convert_strings,
+                )?);
             }
             Ok(Value::List(items))
         }
@@ -555,7 +602,12 @@ pub fn extract_value(array: &dyn Array, row: usize, ignore_nulls: bool) -> Resul
             let slice = list_arr.value(row);
             let mut items = Vec::with_capacity(slice.len());
             for i in 0..slice.len() {
-                items.push(extract_value(slice.as_ref(), i, ignore_nulls)?);
+                items.push(extract_value_with_options(
+                    slice.as_ref(),
+                    i,
+                    ignore_nulls,
+                    auto_convert_strings,
+                )?);
             }
             Ok(Value::List(items))
         }
@@ -569,7 +621,12 @@ pub fn extract_value(array: &dyn Array, row: usize, ignore_nulls: bool) -> Resul
             let slice = list_arr.value(row);
             let mut items = Vec::with_capacity(slice.len());
             for i in 0..slice.len() {
-                items.push(extract_value(slice.as_ref(), i, ignore_nulls)?);
+                items.push(extract_value_with_options(
+                    slice.as_ref(),
+                    i,
+                    ignore_nulls,
+                    auto_convert_strings,
+                )?);
             }
             Ok(Value::List(items))
         }
@@ -589,8 +646,13 @@ pub fn extract_value(array: &dyn Array, row: usize, ignore_nulls: bool) -> Resul
                         "Null map key encountered in MapArray at row {row}, entry {i}"
                     )));
                 }
-                let k = extract_value(keys_col.as_ref(), i, ignore_nulls)?;
-                let v = extract_value(vals_col.as_ref(), i, ignore_nulls)?;
+                let k = extract_value_with_options(keys_col.as_ref(), i, ignore_nulls, false)?;
+                let v = extract_value_with_options(
+                    vals_col.as_ref(),
+                    i,
+                    ignore_nulls,
+                    auto_convert_strings,
+                )?;
                 map.insert(k, v);
             }
             Ok(Value::OrderedMap(map))
@@ -607,7 +669,12 @@ pub fn extract_value(array: &dyn Array, row: usize, ignore_nulls: bool) -> Resul
                 if child_col.is_null(row) && ignore_nulls {
                     continue;
                 }
-                let val = extract_value(child_col.as_ref(), row, ignore_nulls)?;
+                let val = extract_value_with_options(
+                    child_col.as_ref(),
+                    row,
+                    ignore_nulls,
+                    auto_convert_strings,
+                )?;
                 map.insert(Value::String(field.name().clone()), val);
             }
             Ok(Value::OrderedMap(map))

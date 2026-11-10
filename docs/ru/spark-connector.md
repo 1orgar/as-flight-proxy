@@ -26,12 +26,12 @@
 
 ## 1. Подключение Fat-JAR в Spark и PySpark
 
-Используйте собранный Fat-JAR `spark-aerospike-flight-connector-assembly-0.1.0.jar` с **Apache Spark 3.5.x** (Scala 2.12, Java 11/17):
+Используйте собранный Fat-JAR `spark-aerospike-flight-connector-assembly-0.4.0.jar` с **Apache Spark 3.5.x** (Scala 2.12, Java 11/17):
 
 ```bash
 # Запуск PySpark или spark-submit
 pyspark \
-  --jars /path/to/spark-aerospike-flight-connector-assembly-0.1.0.jar \
+  --jars /path/to/spark-aerospike-flight-connector-assembly-0.4.0.jar \
   --conf "spark.driver.extraJavaOptions=--add-opens=java.base/java.nio=ALL-UNNAMED" \
   --conf "spark.executor.extraJavaOptions=--add-opens=java.base/java.nio=ALL-UNNAMED"
 ```
@@ -76,7 +76,7 @@ pyspark \
 
 | Опция | Алиасы | По умолчанию | Описание |
 | :--- | :--- | :---: | :--- |
-| `connector.jobId` | `aerospike.jobId`, `aerospike.job_id`, `job.id` | Авто `as-load-<UUID>` | Уникальный ID джоба для агрегации прогресса и результата DQ в Raft |
+| `connector.jobId` | `aerospike.jobId`, `aerospike.job_id`, `job.id` | **Обязательна** | Уникальный ID джоба для агрегации прогресса и результата DQ в Raft (при повторном старте джобы с тем же `jobId` её мета в Raft автоматически перезатирается) |
 | `aerospike.writeMode` | `aerospike.write_mode` | `"update"` | Режим записи: `"update"`, `"replace"`, `"update_only"`, `"replace_only"`, `"create_only"`, `"validate"` (`"dq"`, `"verify"`) |
 | `aerospike.dq` | `aerospike.validateOnly`, `aerospike.validate_only`, `connector.dq` | `"false"` | При `"true"` включает режим проверки качества данных (чтение `BatchRead` и побиновая сверка без модификации БД) |
 | `aerospike.ignoreNulls` | `aerospike.ignore_nulls` | `"false"` | При `"false"` (по умолчанию) `NULL` в режиме `update` отправляет `Value::Nil` для удаления бина. При `"true"` `NULL`-значения пропускаются |
@@ -86,6 +86,7 @@ pyspark \
 | `connector.batchSize` | `aerospike.batchSize`, `aerospike.batch_size` | `"8192"` | Количество строк в одном Arrow `RecordBatch` при записи |
 | `connector.writerThreads` | `aerospike.writerThreads`, `aerospike.writer_threads` | `"4"` | Количество параллельных потоков отправки `DoPut` внутри каждой задачи Spark |
 | `connector.queueCapacity` | `aerospike.queueCapacity`, `aerospike.queue_capacity` | `max(writerThreads * 2, 4)` | Размер очереди готовых `RecordBatch` между конвертером и потоками отправки |
+| `connector.autoConvertStrings` | `aerospike.autoConvertStrings`, `connector.auto_convert_strings`, `aerospike.auto_convert_strings` | `"false"` | Автоконвертация строковых колонок (бинов) при записи: `"1" -> Int(1)`, `"1.0" -> Double(1.0)`, нечисловые строки остаются `String` |
 
 ---
 
@@ -119,7 +120,7 @@ pyspark \
 | `ByteType`, `ShortType`, `IntegerType`, `LongType` | `Int8`, `Int16`, `Int32`, `Int64` | `Value::Int(i64)` | При записи расширяется до `i64`; при чтении проверяется переполнение |
 | `FloatType`, `DoubleType` | `Float32`, `Float64` | `Value::Float(FloatValue)` | IEEE-754 64-bit float; **в режиме DQ `NaN == NaN` считается `true`** |
 | `DecimalType(p, s)` | `Decimal128(p, s)` | `Value::String(String)` | Строковое представление с точным сохранением масштаба (например, `"12345.67"`) |
-| `StringType` | `Utf8` | `Value::String(String)` | UTF-8 строка |
+| `StringType` | `Utf8` | `Value::String(String)` (или `Int`/`Float` при `connector.autoConvertStrings=true`) | UTF-8 строка; при `connector.autoConvertStrings=true` значения вида `"1"` сохраняются как `Int(1)`, `"1.0"` — как `Float(1.0)` |
 | `BinaryType` | `Binary` | `Value::Blob(Vec<u8>)` | Массив байт |
 | `DateType` | `Date32` (дни) | `Value::Int(i64)` | Хранится как **UTC миллисекунды** (`days * 86_400_000`) |
 | `TimestampType` | `Timestamp(Microsecond, "UTC")` | `Value::Int(i64)` | Хранится как **UTC миллисекунды** (`micros / 1_000`) |

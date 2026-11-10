@@ -16,10 +16,12 @@ use tracing::{debug, warn};
 
 use crate::config::{RetryConfig, WriteParameters, WriterConfig};
 use crate::converter::{
-    PreparedRecord, RecordDqResult, ScannedRecord, validate_record_against_bins,
+    PreparedRecord, RecordDqResult, ScannedRecord, convert_record_batch,
+    validate_record_against_bins,
 };
 use crate::error::{ProxyError, Result};
 use crate::metrics::ProxyMetrics;
+use arrow_array::RecordBatch;
 
 /// Outcome of attempting to write a single record to Aerospike.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -112,6 +114,7 @@ pub trait AerospikeSink: Send + Sync + 'static {
             use_batch_write: Some(true),
             validate_only: true,
             compression: None,
+            auto_convert_strings: false,
         };
         let recs: Vec<PreparedRecord> = keys
             .iter()
@@ -547,6 +550,224 @@ impl MppWriteEngine {
 
     pub fn is_connected(&self) -> bool {
         self.sink.is_connected()
+    }
+
+    /// Stream-friendly zero-copy `RecordBatch` writer that slices wide batches into sub-batches
+    /// and acquires backpressure permits (weighted by bin column count) *before* allocating
+    /// `PreparedRecord` structs on the heap.
+    pub async fn write_record_batch(
+        &self,
+        batch: &RecordBatch,
+        params: &WriteParameters,
+        max_bin_name_len: usize,
+    ) -> Result<BatchWriteStats> {
+        let total_rows = batch.num_rows();
+        if total_rows == 0 {
+            return Ok(BatchWriteStats::default());
+        }
+
+        if params.is_validate_mode() {
+            return self
+                .validate_record_batch(batch, params, max_bin_name_len)
+                .await;
+        }
+
+        let num_bins = batch.num_columns().saturating_sub(1).max(1);
+        let bin_weight = ((num_bins + 9) / 10).max(1);
+        let base_chunk_size = self.writer_config.batch_write_size.max(1);
+        let chunk_size = (base_chunk_size / bin_weight).max(16).min(base_chunk_size);
+
+        let use_batch = params
+            .use_batch_write
+            .unwrap_or(self.writer_config.use_batch_write);
+        let max_concurrency = self
+            .writer_config
+            .max_concurrent_subbatches_per_stream
+            .max(1);
+
+        let mut in_flight_futures = FuturesUnordered::new();
+        let mut stats = BatchWriteStats::default();
+        let mut offset = 0usize;
+
+        while offset < total_rows {
+            let len = (total_rows - offset).min(chunk_size);
+            let slice = batch.slice(offset, len);
+            offset += len;
+
+            while in_flight_futures.len() >= max_concurrency {
+                let sub_stats: Result<(usize, u64, u64)> = in_flight_futures.next().await.unwrap();
+                let (written, ov_ret, oth_ret) = sub_stats?;
+                stats.rows_written += written;
+                stats.overload_retries += ov_ret;
+                stats.other_retries += oth_ret;
+                tokio::task::yield_now().await;
+            }
+
+            let fut = self.write_subbatch_slice(
+                slice,
+                params.clone(),
+                use_batch,
+                max_bin_name_len,
+                bin_weight,
+            );
+            in_flight_futures.push(fut);
+        }
+
+        while let Some(res) = in_flight_futures.next().await {
+            let (written, ov_ret, oth_ret) = res?;
+            stats.rows_written += written;
+            stats.overload_retries += ov_ret;
+            stats.other_retries += oth_ret;
+            tokio::task::yield_now().await;
+        }
+
+        self.metrics.inc_records_written(stats.rows_written as u64);
+        self.metrics.inc_batches_processed();
+
+        Ok(stats)
+    }
+
+    /// Stream-friendly zero-copy `RecordBatch` DQ validator that slices wide batches and
+    /// acquires bin-weighted backpressure permits *before* allocating `PreparedRecord` structs.
+    pub async fn validate_record_batch(
+        &self,
+        batch: &RecordBatch,
+        params: &WriteParameters,
+        max_bin_name_len: usize,
+    ) -> Result<BatchWriteStats> {
+        let total_rows = batch.num_rows();
+        if total_rows == 0 {
+            return Ok(BatchWriteStats::default());
+        }
+
+        let num_bins = batch.num_columns().saturating_sub(1).max(1);
+        let bin_weight = ((num_bins + 9) / 10).max(1);
+        let base_chunk_size = self.writer_config.batch_write_size.max(1);
+        let chunk_size = (base_chunk_size / bin_weight).max(16).min(base_chunk_size);
+        let max_concurrency = self
+            .writer_config
+            .max_concurrent_subbatches_per_stream
+            .max(1);
+
+        let mut in_flight_futures = FuturesUnordered::new();
+        let mut stats = BatchWriteStats::default();
+        let mut offset = 0usize;
+
+        while offset < total_rows {
+            let len = (total_rows - offset).min(chunk_size);
+            let slice = batch.slice(offset, len);
+            offset += len;
+
+            while in_flight_futures.len() >= max_concurrency {
+                let sub_stats: Result<BatchWriteStats> = in_flight_futures.next().await.unwrap();
+                let sub = sub_stats?;
+                stats.rows_validated += sub.rows_validated;
+                Self::merge_validation_stats(&mut stats, sub);
+                tokio::task::yield_now().await;
+            }
+
+            let fut =
+                self.validate_subbatch_slice(slice, params.clone(), max_bin_name_len, bin_weight);
+            in_flight_futures.push(fut);
+        }
+
+        while let Some(res) = in_flight_futures.next().await {
+            let sub = res?;
+            stats.rows_validated += sub.rows_validated;
+            Self::merge_validation_stats(&mut stats, sub);
+            tokio::task::yield_now().await;
+        }
+
+        self.metrics
+            .inc_records_validated(stats.rows_validated as u64);
+        self.metrics
+            .inc_validation_mismatches(stats.mismatched_rows as u64);
+        self.metrics.inc_batches_processed();
+        Ok(stats)
+    }
+
+    async fn write_subbatch_slice(
+        &self,
+        slice: RecordBatch,
+        params: WriteParameters,
+        use_batch: bool,
+        max_bin_name_len: usize,
+        bin_weight: usize,
+    ) -> Result<(usize, u64, u64)> {
+        let slice_rows = slice.num_rows();
+        let weighted_permits = slice_rows
+            .saturating_mul(bin_weight)
+            .min(self.writer_config.max_in_flight_records.max(1))
+            .max(1) as u32;
+
+        // 1. Acquire backpressure permits BEFORE converting the RecordBatch slice into heap-allocated Bins
+        let _permit = self
+            .in_flight_semaphore
+            .acquire_many(weighted_permits)
+            .await
+            .map_err(|_| ProxyError::Internal("Backpressure semaphore closed".to_string()))?;
+
+        // 2. Convert only this small slice while holding the semaphore permit, then drop the slice reference
+        let chunk = convert_record_batch(&slice, &params, max_bin_name_len)?;
+        drop(slice);
+        let num_records = chunk.len();
+        if num_records == 0 {
+            return Ok((0, 0, 0));
+        }
+
+        self.metrics.add_in_flight(num_records as i64);
+        let start = Instant::now();
+
+        let res = if use_batch {
+            self.execute_batch_with_retry(chunk, &params).await
+        } else {
+            self.execute_single_puts_with_retry(chunk, &params).await
+        };
+
+        let elapsed_micros = start.elapsed().as_micros() as u64;
+        self.metrics.observe_write_latency_micros(elapsed_micros);
+        self.metrics.add_in_flight(-(num_records as i64));
+
+        let (ov_ret, oth_ret) = res?;
+        Ok((num_records, ov_ret, oth_ret))
+    }
+
+    async fn validate_subbatch_slice(
+        &self,
+        slice: RecordBatch,
+        params: WriteParameters,
+        max_bin_name_len: usize,
+        bin_weight: usize,
+    ) -> Result<BatchWriteStats> {
+        let slice_rows = slice.num_rows();
+        let weighted_permits = slice_rows
+            .saturating_mul(bin_weight)
+            .min(self.writer_config.max_in_flight_records.max(1))
+            .max(1) as u32;
+
+        let _permit = self
+            .in_flight_semaphore
+            .acquire_many(weighted_permits)
+            .await
+            .map_err(|_| ProxyError::Internal("Backpressure semaphore closed".to_string()))?;
+
+        let chunk = convert_record_batch(&slice, &params, max_bin_name_len)?;
+        drop(slice);
+        let num_records = chunk.len();
+        if num_records == 0 {
+            return Ok(BatchWriteStats::default());
+        }
+
+        self.metrics.add_in_flight(num_records as i64);
+        let start = Instant::now();
+
+        let res = self.execute_batch_read_with_retry(chunk, &params).await;
+
+        let elapsed_micros = start.elapsed().as_micros() as u64;
+        self.metrics.observe_read_latency_micros(elapsed_micros);
+        self.metrics.add_in_flight(-(num_records as i64));
+
+        res
     }
 
     /// Write or validate a vector of `PreparedRecord`s concurrently in MPP sub-batches.

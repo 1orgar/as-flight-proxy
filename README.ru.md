@@ -25,7 +25,8 @@
 | **[1. Архитектура и внутреннее устройство](docs/ru/architecture.md)** | **[Architecture & Internals](docs/en/architecture.md)** | Протокол Arrow Flight (`DoPut`, `DoGet`, `DoExchange`, `GetSchema`, `DoAction`), двухуровневое сжатие (`ZSTD` / `LZ4` / `GZIP`), горячий путь zero-copy, маппинг типов, Raft и политика ретраев. |
 | **[2. Конфигурация `proxy_server`](docs/ru/proxy-configuration.md)** | **[Proxy Server Configuration](docs/en/proxy-configuration.md)** | Полный справочник `config.toml`, аргументов CLI, переменных окружения, настройки TLS/mTLS, пулов соединений Aerospike и тюнинга Linux. |
 | **[3. Справочник `spark_connector` и примеры](docs/ru/spark-connector.md)** | **[Spark Connector Guide & Examples](docs/en/spark-connector.md)** | Все опции `.format("aerospike-flight")`, `AerospikeFlightLookup` (Scala + PySpark), `AerospikeLoadStatus`, примеры для записи, DQ, чтения и Python `pyarrow.flight`. |
-| **[4. Мониторинг, логи и траблшутинг](docs/ru/observability.md)** | **[Observability, Metrics & Logging](docs/en/observability.md)** | Справочник из 21 метрики Prometheus, готовые PromQL-запросы, примеры логов Driver / Executor и решение типовых проблем. |
+| **[4. Прямые вызовы Flight из Python](docs/ru/flight-operations.md)** | **[Direct Flight Operations (Python)](docs/en/flight-operations.md)** | Как напрямую из Python (`pyarrow.flight`) проверять статус Raft и джобов, сбрасывать мету, вычитывать данные в `pyarrow.Table` / `pandas`, делать `DoExchange` Lookup и `DoPut`. |
+| **[5. Мониторинг, логи и траблшутинг](docs/ru/observability.md)** | **[Observability, Metrics & Logging](docs/en/observability.md)** | Справочник из 21 метрики Prometheus, готовые PromQL-запросы, примеры логов Driver / Executor и решение типовых проблем. |
 
 ---
 
@@ -229,10 +230,11 @@ backoff_multiplier = 2.0
 | `aerospike.read.keys` | Нет | — | Список PK (CSV или JSON-массив) для прямого `BatchGet` чтения |
 | `aerospike.lookup.sourceView` | Нет | — | Имя временного View с ключами для распределённого `DoExchange` обогащения |
 | `aerospike.lookup.joinType` | Нет | `"left"` | Тип обогащения при `DoExchange` Lookup: `"left"` или `"inner"` |
-| `connector.jobId` | Нет | Авто `UUID` | Уникальный идентификатор выгрузки для отслеживания статуса в Raft |
+| `connector.jobId` | **Да** | — | Уникальный идентификатор джобы в Raft (при повторном запуске с тем же `jobId` мета в Raft автоматически перезатирается) |
 | `connector.batchSize` | Нет | `"8192"` | Число строк в одном Arrow `RecordBatch` на запись |
 | `connector.writerThreads` | Нет | `"4"` | Число параллельных потоков отправки Arrow Flight внутри каждой Spark-задачи |
 | `connector.queueCapacity` | Нет | `writerThreads * 2` | Размер очереди подготовленных `RecordBatch` внутри задачи |
+| `connector.autoConvertStrings` | Нет | `"false"` | Автоконвертация строковых колонок при записи (`"1" -> Int`, `"1.0" -> Double`, иначе `String`) |
 
 ---
 
@@ -359,7 +361,7 @@ sbt "set ThisBuild / coverageEnabled := false" assembly
 При каждом пуше в `main` и создании тега `v*` workflow [`.github/workflows/ci.yml`](.github/workflows/ci.yml) автоматически проверяет покрытие (`>= 85%`) и публикует 3 релизных артефакта:
 1. `as_proxy_server-linux-x86_64.zip` — ZIP-архив с бинарником `as_proxy_server` для Linux `x86_64` и примером конфигурации `config.example.toml`.
 2. `as_proxy_server-linux-arm64.zip` — ZIP-архив с бинарником `as_proxy_server` для Linux `ARM64` (`aarch64`) и `config.example.toml`.
-3. `spark-aerospike-flight-connector-assembly-0.1.0.jar` — Fat-JAR коннектора для Spark 3.5 (Scala 2.12).
+3. `spark-aerospike-flight-connector-assembly-0.4.0.jar` — Fat-JAR коннектора для Spark 3.5 (Scala 2.12).
 
 ### Запуск полного E2E-стенда (Docker Compose)
 ```bash
@@ -369,7 +371,7 @@ curl -sL "https://github.com/1orgar/as-flight-proxy/releases/latest/download/as_
 unzip -o e2e/artifacts/proxy.zip -d e2e/artifacts/
 mv "e2e/artifacts/as_proxy_server-linux-${ARCH}" e2e/artifacts/as_proxy_server
 chmod +x e2e/artifacts/as_proxy_server
-curl -sL "https://github.com/1orgar/as-flight-proxy/releases/latest/download/spark-aerospike-flight-connector-assembly-0.1.0.jar" -o e2e/artifacts/spark-aerospike-flight-connector-assembly-0.1.0.jar
+curl -sL "https://github.com/1orgar/as-flight-proxy/releases/latest/download/spark-aerospike-flight-connector-assembly-0.4.0.jar" -o e2e/artifacts/spark-aerospike-flight-connector-assembly-0.4.0.jar
 
 docker compose -f docker-compose.e2e.yml up --abort-on-container-exit --exit-code-from spark-e2e
 docker compose -f docker-compose.e2e.yml down

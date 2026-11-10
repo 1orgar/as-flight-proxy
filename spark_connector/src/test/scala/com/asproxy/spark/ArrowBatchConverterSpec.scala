@@ -226,6 +226,7 @@ class ArrowBatchConverterSpec extends AnyFunSuite {
   private def defaultTestOptions(extra: Map[String, String] = Map.empty): AerospikeFlightOptions = {
     AerospikeFlightOptions.fromMap(
       Map(
+        "connector.jobId" -> "default-test-job",
         "aerospike.namespace" -> "test",
         "aerospike.set" -> "users",
         "aerospike.keyColumn" -> "pk"
@@ -841,11 +842,22 @@ class ArrowBatchConverterSpec extends AnyFunSuite {
     assert(opts.shouldOmitNullsInFlight)
     assert(opts.readTypeMismatchMode == "null")
     assert(opts.lookupJoinType == "inner")
+    assert(!opts.autoConvertStrings)
+    val defaultDescJson = new String(opts.toFlightDescriptorJsonBytes, "UTF-8")
+    assert(defaultDescJson.contains("\"auto_convert_strings\":false"))
+
+    val autoConvertOpts = AerospikeFlightOptions.fromMap(raw + ("connector.autoConvertStrings" -> "true"))
+    assert(autoConvertOpts.autoConvertStrings)
+    val autoConvertDescJson = new String(autoConvertOpts.toFlightDescriptorJsonBytes, "UTF-8")
+    assert(autoConvertDescJson.contains("\"auto_convert_strings\":true"))
     opts.validateWriteTarget()
 
     val statusOpts = AerospikeFlightOptions.forStatusQuery(Map("flight.hosts" -> "localhost:8815"))
     assert(statusOpts.namespace.isEmpty)
 
+    intercept[IllegalArgumentException] {
+      AerospikeFlightOptions.fromMap(raw - "aerospike.job_id")
+    }
     intercept[IllegalArgumentException] {
       AerospikeFlightOptions.fromMap(raw.updated("aerospike.write_mode", "bad_mode"))
     }
@@ -1234,7 +1246,7 @@ class ArrowBatchConverterSpec extends AnyFunSuite {
           listener: FlightProducer.StreamListener[Result]
       ): Unit = {
         val respJson = action.getType match {
-          case "complete_job" | "fail_job" =>
+          case "init_job" | "reset_job" | "complete_job" | "fail_job" =>
             s"""{"action":"${action.getType}","status":"ok"}"""
           case "get_job_status" =>
             val jid = new String(action.getBody, StandardCharsets.UTF_8)
@@ -1280,6 +1292,7 @@ class ArrowBatchConverterSpec extends AnyFunSuite {
       AerospikeLoadStatus.clear()
 
       val baseOpts = Map(
+        "connector.jobId" -> "base-test-job",
         "flight.hosts" -> hostPort,
         "flight.username" -> "spark_user",
         "flight.password" -> "spark_pass",

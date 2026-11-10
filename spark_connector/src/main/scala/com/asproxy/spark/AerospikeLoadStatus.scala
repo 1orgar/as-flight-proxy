@@ -185,7 +185,18 @@ object AerospikeLoadStatus extends Logging {
   }
 
   /**
-   * Notify the `proxy_server` Raft cluster that a Spark job has completed or failed.
+   * Initialize or reset Raft-replicated metadata for `options.jobId` at the start of a Spark job,
+   * overwriting any previous job metadata with the same `jobId`.
+   */
+  def initJob(options: AerospikeFlightOptions): Option[String] = {
+    if (options.jobId != null && options.jobId.trim.nonEmpty) {
+      summariesByJobId.remove(options.jobId)
+    }
+    notifyJobState(options, "init_job")
+  }
+
+  /**
+   * Notify the `proxy_server` Raft cluster that a Spark job has initialized, completed, or failed.
    */
   def notifyJobState(
       options: AerospikeFlightOptions,
@@ -197,6 +208,7 @@ object AerospikeLoadStatus extends Logging {
       payload.put("job_id", options.jobId)
       payload.put("namespace", options.namespace)
       payload.put("set_name", options.setName)
+      payload.put("is_dq_validation", Boolean.box(options.validateOnly))
       errorMsg.foreach(e => payload.put("error", e))
       val bytes = AerospikeFlightOptions.SharedMapper.writeValueAsBytes(payload)
       Some(executeAction(options, actionType, bytes))

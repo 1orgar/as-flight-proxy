@@ -46,7 +46,8 @@ case class AerospikeFlightOptions(
     readKeys: Option[String] = None,
     lookupSourceView: Option[String] = None,
     lookupJoinType: String = "left",
-    compression: String = "zstd"
+    compression: String = "zstd",
+    autoConvertStrings: Boolean = false
 ) extends Serializable {
 
   require(jobId.trim.nonEmpty, "'connector.jobId' cannot be empty")
@@ -70,6 +71,7 @@ case class AerospikeFlightOptions(
   require(readSampleSize > 0, s"'aerospike.read.sampleSize' must be > 0 (got $readSampleSize)")
 
   def validateWriteTarget(): Unit = {
+    require(jobId.trim.nonEmpty, "'connector.jobId' cannot be empty")
     require(namespace.trim.nonEmpty, "'aerospike.namespace' cannot be empty")
     require(keyColumn.trim.nonEmpty, "'aerospike.keyColumn' cannot be empty")
     AerospikeSchemaValidator.validateNamespaceAndSet(namespace, setName)
@@ -116,6 +118,7 @@ case class AerospikeFlightOptions(
     useBatchWrite.foreach(ub => payload.put("use_batch_write", Boolean.box(ub)))
     payload.put("validate_only", Boolean.box(validateOnly))
     payload.put("compression", compression)
+    payload.put("auto_convert_strings", Boolean.box(autoConvertStrings))
     AerospikeFlightOptions.SharedMapper.writeValueAsBytes(payload)
   }
 }
@@ -150,11 +153,23 @@ object AerospikeFlightOptions {
     def getRequired(key: String): String =
       get(key).getOrElse(throw new IllegalArgumentException(s"Missing required option '$key'"))
 
-    val jobId = get("connector.jobId")
-      .orElse(get("aerospike.job_id"))
-      .orElse(get("aerospike.jobId"))
-      .orElse(get("job.id"))
-      .getOrElse(s"as-load-${UUID.randomUUID().toString}")
+    val jobId = if (requireWriteTarget) {
+      get("connector.jobId")
+        .orElse(get("aerospike.job_id"))
+        .orElse(get("aerospike.jobId"))
+        .orElse(get("job.id"))
+        .getOrElse(
+          throw new IllegalArgumentException(
+            "Missing required option 'connector.jobId' (or 'aerospike.jobId')"
+          )
+        )
+    } else {
+      get("connector.jobId")
+        .orElse(get("aerospike.job_id"))
+        .orElse(get("aerospike.jobId"))
+        .orElse(get("job.id"))
+        .getOrElse("status-query")
+    }
 
     val rawHosts = get("flight.hosts")
       .orElse(get("aerospike.flight.endpoint"))
@@ -296,6 +311,15 @@ object AerospikeFlightOptions {
       .getOrElse("zstd")
     val compression = FlightCompressionHelper.normalizeCompression(rawCompression, compressionEnabled)
 
+    val autoConvertStrings = get("connector.autoConvertStrings")
+      .orElse(get("connector.auto_convert_strings"))
+      .orElse(get("aerospike.autoConvertStrings"))
+      .orElse(get("aerospike.auto_convert_strings"))
+      .orElse(get("connector.autoTypeConvert"))
+      .orElse(get("aerospike.autoTypeConvert"))
+      .getOrElse("false")
+      .toBoolean
+
     AerospikeFlightOptions(
       jobId = jobId,
       hosts = hosts,
@@ -328,7 +352,8 @@ object AerospikeFlightOptions {
       readKeys = readKeys,
       lookupSourceView = lookupSourceView,
       lookupJoinType = lookupJoinType,
-      compression = compression
+      compression = compression,
+      autoConvertStrings = autoConvertStrings
     )
   }
 

@@ -400,6 +400,29 @@ pub struct WriteParameters {
     /// Optional per-stream Arrow Flight compression mode (`"none"`, `"zstd"`, `"lz4"`, `"gzip"`).
     #[serde(default)]
     pub compression: Option<FlightCompression>,
+    /// Automatically convert string bin values into `Value::Int(i64)` or `Value::Float(f64)`
+    /// when they can be parsed as integer or finite floating-point numbers (default `false`).
+    #[serde(default, alias = "autoConvertStrings", alias = "auto_type_convert")]
+    pub auto_convert_strings: bool,
+}
+
+impl Default for WriteParameters {
+    fn default() -> Self {
+        Self {
+            job_id: None,
+            namespace: String::new(),
+            set_name: String::new(),
+            key_column: String::new(),
+            write_mode: WriteMode::Update,
+            ttl_seconds: None,
+            send_key: true,
+            ignore_nulls: false,
+            use_batch_write: None,
+            validate_only: false,
+            compression: None,
+            auto_convert_strings: false,
+        }
+    }
 }
 
 impl WriteParameters {
@@ -419,6 +442,14 @@ impl WriteParameters {
                 })?;
                 if params.compression.is_none() {
                     params.compression = FlightCompression::from_headers(headers)?;
+                }
+                if !params.auto_convert_strings {
+                    if let Some(v) = headers
+                        .get("x-as-auto-convert-strings")
+                        .and_then(|h| h.to_str().ok())
+                    {
+                        params.auto_convert_strings = v.eq_ignore_ascii_case("true") || v == "1";
+                    }
                 }
                 params.validate()?;
                 return Ok(params);
@@ -467,6 +498,9 @@ impl WriteParameters {
             .map(|s| s.eq_ignore_ascii_case("true") || s == "1")
             .unwrap_or(write_mode == WriteMode::Validate);
         let compression = FlightCompression::from_headers(headers)?;
+        let auto_convert_strings = get_str("x-as-auto-convert-strings")
+            .map(|s| s.eq_ignore_ascii_case("true") || s == "1")
+            .unwrap_or(false);
 
         let params = Self {
             job_id,
@@ -480,6 +514,7 @@ impl WriteParameters {
             use_batch_write,
             validate_only,
             compression,
+            auto_convert_strings,
         };
         params.validate()?;
         Ok(params)

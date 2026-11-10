@@ -36,6 +36,9 @@ class AerospikeFlightBatchWrite(
 
   private val startTimeMs: Long = System.currentTimeMillis()
 
+  // Overwrite / reset any previous Raft metadata for this connector.jobId when the job starts
+  AerospikeLoadStatus.initJob(options)
+
   logInfo(
     s"[Driver][Write] Initialized batch write jobId='${options.jobId}', " +
       s"target='${options.namespace}.${options.setName}', writeMode='${options.writeMode}', " +
@@ -107,6 +110,7 @@ class AerospikeFlightStreamingWrite(
     with Logging {
 
   override def createStreamingWriterFactory(info: PhysicalWriteInfo): StreamingDataWriterFactory = {
+    AerospikeLoadStatus.initJob(options)
     logInfo(
       s"[Driver][StreamingWrite] Creating StreamingWriterFactory for jobId='${options.jobId}', " +
         s"target='${options.namespace}.${options.setName}', numPartitions=${info.numPartitions()}"

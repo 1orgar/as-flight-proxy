@@ -299,6 +299,7 @@ def main():
     print(f"\n=== [Step 5] Reading {total_rows} rows back into Spark DataFrame (Partition Scan, inferSchema, & PK Pushdown) ===")
 
     common_read_opts = {
+        "connector.jobId": "e2e-read-job-001",
         "flight.hosts": ",".join(PROXY_ENDPOINTS),
         "flight.username": USERNAME,
         "flight.password": PASSWORD,
