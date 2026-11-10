@@ -1,5 +1,4 @@
 use aerospike::{AuthMode, Client, ClientPolicy};
-use arrow_flight::flight_service_server::FlightServiceServer;
 use clap::Parser;
 use std::fs;
 use std::net::SocketAddr;
@@ -150,6 +149,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         aerospike_hosts = %cfg.aerospike.hosts,
         tls_enabled = cfg.tls.enabled,
         auth_enabled = cfg.auth.enabled,
+        compression_enabled = cfg.server.compression_enabled,
+        compression = ?cfg.server.compression,
         use_batch_write = cfg.writer.use_batch_write,
         batch_write_size = cfg.writer.batch_write_size,
         max_in_flight_records = cfg.writer.max_in_flight_records,
@@ -226,15 +227,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         write_engine,
         metrics,
         cfg.aerospike.max_bin_name_len,
-    );
+    )
+    .with_compression(cfg.server.compression_enabled, cfg.server.compression);
     if let Some(raft) = raft_node {
         flight_service = flight_service.with_raft_node(raft);
     }
 
-    let max_msg_bytes = cfg.server.max_decoding_message_size_mb * 1024 * 1024;
-    let svc = FlightServiceServer::new(flight_service)
-        .max_decoding_message_size(max_msg_bytes)
-        .max_encoding_message_size(max_msg_bytes);
+    let svc = flight_service.into_server(&cfg.server);
 
     let addr: SocketAddr = cfg.server.listen_addr.parse()?;
     let mut server_builder = configure_server_builder(&cfg)?;

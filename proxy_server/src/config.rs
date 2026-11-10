@@ -65,6 +65,14 @@ pub struct ServerConfig {
     pub http2_stream_window_size_mb: u32,
     #[serde(default = "default_conn_win_mb")]
     pub http2_connection_window_size_mb: u32,
+    /// Master switch to enable or disable Arrow Flight compression on the server.
+    /// When `false`, both gRPC transport compression and Arrow IPC buffer compression are disabled.
+    #[serde(default = "default_true")]
+    pub compression_enabled: bool,
+    /// Default Flight compression algorithm when `compression_enabled = true` and the client
+    /// does not override it (`"zstd"`, `"lz4"`, `"gzip"`, or `"none"`).
+    #[serde(default)]
+    pub compression: FlightCompression,
 }
 
 impl Default for ServerConfig {
@@ -76,6 +84,85 @@ impl Default for ServerConfig {
             tcp_nodelay: true,
             http2_stream_window_size_mb: default_stream_win_mb(),
             http2_connection_window_size_mb: default_conn_win_mb(),
+            compression_enabled: true,
+            compression: FlightCompression::default(),
+        }
+    }
+}
+
+impl ServerConfig {
+    /// Resolve the effective compression mode for a stream given an optional client override.
+    pub fn effective_compression(&self, client_override: Option<FlightCompression>) -> FlightCompression {
+        if !self.compression_enabled {
+            return FlightCompression::None;
+        }
+        client_override.unwrap_or(self.compression)
+    }
+}
+
+/// Configurable and disableable compression algorithm for Arrow Flight streams.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum FlightCompression {
+    /// Compression disabled.
+    #[serde(alias = "off", alias = "false", alias = "disabled")]
+    None,
+    /// Zstandard compression (Arrow IPC ZSTD buffer compression + gRPC zstd support).
+    #[default]
+    #[serde(alias = "zstandard", alias = "true")]
+    Zstd,
+    /// LZ4 Frame compression (Arrow IPC LZ4_FRAME buffer compression).
+    #[serde(alias = "lz4_frame", alias = "lz4frame")]
+    Lz4,
+    /// Gzip compression (gRPC transport-level gzip stream compression).
+    #[serde(alias = "gz")]
+    Gzip,
+}
+
+impl FlightCompression {
+    pub fn from_str_insensitive(s: &str) -> Result<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "" | "none" | "off" | "false" | "disabled" | "0" => Ok(FlightCompression::None),
+            "zstd" | "zstandard" | "true" | "1" => Ok(FlightCompression::Zstd),
+            "lz4" | "lz4_frame" | "lz4-frame" | "lz4frame" => Ok(FlightCompression::Lz4),
+            "gzip" | "gz" => Ok(FlightCompression::Gzip),
+            other => Err(ProxyError::InvalidArgument(format!(
+                "Unsupported compression '{other}'. Expected 'none', 'zstd', 'lz4', or 'gzip'"
+            ))),
+        }
+    }
+
+    pub fn from_headers(headers: &MetadataMap) -> Result<Option<Self>> {
+        match headers.get("x-as-compression").and_then(|v| v.to_str().ok()) {
+            Some(s) if !s.trim().is_empty() => Ok(Some(Self::from_str_insensitive(s)?)),
+            _ => Ok(None),
+        }
+    }
+
+    pub fn to_ipc_write_options(self) -> Result<arrow_ipc::writer::IpcWriteOptions> {
+        let opts = arrow_ipc::writer::IpcWriteOptions::default();
+        match self {
+            FlightCompression::None | FlightCompression::Gzip => Ok(opts),
+            FlightCompression::Zstd => opts
+                .try_with_compression(Some(arrow_ipc::CompressionType::ZSTD))
+                .map_err(|e| {
+                    ProxyError::Conversion(format!("Failed to configure ZSTD IPC compression: {e}"))
+                }),
+            FlightCompression::Lz4 => opts
+                .try_with_compression(Some(arrow_ipc::CompressionType::LZ4_FRAME))
+                .map_err(|e| {
+                    ProxyError::Conversion(format!(
+                        "Failed to configure LZ4_FRAME IPC compression: {e}"
+                    ))
+                }),
+        }
+    }
+
+    pub fn to_tonic_encoding(self) -> Option<tonic::codec::CompressionEncoding> {
+        match self {
+            FlightCompression::Gzip => Some(tonic::codec::CompressionEncoding::Gzip),
+            FlightCompression::Zstd => Some(tonic::codec::CompressionEncoding::Zstd),
+            FlightCompression::None | FlightCompression::Lz4 => None,
         }
     }
 }
@@ -310,6 +397,9 @@ pub struct WriteParameters {
     /// Aerospike and compare them with the incoming Spark batch (treating `NaN == NaN` as `true`).
     #[serde(default, alias = "dq")]
     pub validate_only: bool,
+    /// Optional per-stream Arrow Flight compression mode (`"none"`, `"zstd"`, `"lz4"`, `"gzip"`).
+    #[serde(default)]
+    pub compression: Option<FlightCompression>,
 }
 
 impl WriteParameters {
@@ -322,11 +412,14 @@ impl WriteParameters {
     ) -> Result<Self> {
         if let Some(cmd) = descriptor_cmd {
             if !cmd.is_empty() {
-                let params: WriteParameters = serde_json::from_slice(cmd).map_err(|e| {
+                let mut params: WriteParameters = serde_json::from_slice(cmd).map_err(|e| {
                     ProxyError::InvalidArgument(format!(
                         "Failed to parse WriteParameters JSON from FlightDescriptor.cmd: {e}"
                     ))
                 })?;
+                if params.compression.is_none() {
+                    params.compression = FlightCompression::from_headers(headers)?;
+                }
                 params.validate()?;
                 return Ok(params);
             }
@@ -373,6 +466,7 @@ impl WriteParameters {
             .or_else(|| get_str("x-as-dq"))
             .map(|s| s.eq_ignore_ascii_case("true") || s == "1")
             .unwrap_or(write_mode == WriteMode::Validate);
+        let compression = FlightCompression::from_headers(headers)?;
 
         let params = Self {
             job_id,
@@ -385,6 +479,7 @@ impl WriteParameters {
             ignore_nulls,
             use_batch_write,
             validate_only,
+            compression,
         };
         params.validate()?;
         Ok(params)
@@ -519,6 +614,9 @@ pub struct ReadTicket {
     pub type_mismatch_mode: TypeMismatchMode,
     /// Base64-encoded Arrow IPC Schema bytes representing the exact output schema expected by Spark.
     pub schema_ipc_base64: String,
+    /// Optional Arrow Flight compression mode (`"none"`, `"zstd"`, `"lz4"`, `"gzip"`).
+    #[serde(default)]
+    pub compression: Option<FlightCompression>,
 }
 
 impl ReadTicket {
@@ -588,6 +686,9 @@ pub struct LookupExchangeParams {
     pub type_mismatch_mode: TypeMismatchMode,
     /// Base64-encoded Arrow IPC Schema bytes for the bins to fetch from Aerospike.
     pub bins_schema_ipc_base64: String,
+    /// Optional Arrow Flight compression mode (`"none"`, `"zstd"`, `"lz4"`, `"gzip"`).
+    #[serde(default)]
+    pub compression: Option<FlightCompression>,
 }
 
 impl LookupExchangeParams {

@@ -58,22 +58,25 @@ jobs:
           cat coverage-rust.txt >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
 
-      - name: Build release binary (${{ matrix.arch }})
+      - name: Build and package release binary (${{ matrix.arch }})
         run: |
           cargo build --release --target ${{ matrix.target }}
           cp target/${{ matrix.target }}/release/as_proxy_server ./${{ matrix.artifact_name }}
           strip ./${{ matrix.artifact_name }}
+          zip -9 "${{ matrix.artifact_name }}.zip" "./${{ matrix.artifact_name }}" ./config.example.toml
 
-      - name: Upload Proxy Server binary artifact (${{ matrix.arch }})
+      - name: Upload Proxy Server binary ZIP artifact (${{ matrix.arch }})
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.artifact_name }}
-          path: proxy_server/${{ matrix.artifact_name }}
+          name: ${{ matrix.artifact_name }}-zip
+          path: proxy_server/${{ matrix.artifact_name }}.zip
           if-no-files-found: error
 
   spark-connector:
     name: Spark Connector (Test & Fat-JAR)
     runs-on: ubuntu-24.04
+    env:
+      SBT_OPTS: "--add-opens=java.base/java.nio=ALL-UNNAMED --add-opens=java.base/sun.nio.ch=ALL-UNNAMED --add-opens=java.base/sun.security.action=ALL-UNNAMED --add-opens=java.base/java.lang=ALL-UNNAMED --add-opens=java.base/java.util=ALL-UNNAMED"
     defaults:
       run:
         working-directory: spark_connector
@@ -136,5 +139,5 @@ jobs:
           if gh release view "$TAG_NAME" >/dev/null 2>&1; then
             gh release upload "$TAG_NAME" dist/* --clobber
           else
-            gh release create "$TAG_NAME" dist/* --title "as-flight-proxy $TAG_NAME" --generate-notes
+            gh release create "$TAG_NAME" dist/* --title "as-flight-proxy $TAG_NAME" --notes-from-tag
           fi

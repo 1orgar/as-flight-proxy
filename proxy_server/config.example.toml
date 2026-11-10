@@ -5,6 +5,10 @@ max_decoding_message_size_mb = 64
 tcp_nodelay = true
 http2_stream_window_size_mb = 16
 http2_connection_window_size_mb = 32
+# Master switch for Arrow Flight compression (set to false to disable all Flight compression)
+compression_enabled = true
+# Default Flight compression algorithm: "zstd" (default), "lz4", "gzip", or "none"
+compression = "zstd"
 
 [raft]
 enabled = true

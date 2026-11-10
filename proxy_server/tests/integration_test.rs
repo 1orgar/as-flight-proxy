@@ -351,6 +351,7 @@ fn test_convert_all_types_and_null_modes() {
         ignore_nulls: false,
         use_batch_write: Some(true),
         validate_only: false,
+        compression: None,
     };
 
     let records = convert_record_batch(&batch, &params_update_nil, 64).unwrap();
@@ -485,6 +486,7 @@ fn test_null_primary_key_and_bin_name_length_validation() {
         ignore_nulls: false,
         use_batch_write: None,
         validate_only: false,
+        compression: None,
     };
 
     // Null key must fail immediately
@@ -645,6 +647,7 @@ async fn test_infinite_overload_retry_and_partial_batch_retry() {
         ignore_nulls: false,
         use_batch_write: Some(true),
         validate_only: false,
+        compression: None,
     };
 
     let stats = engine.write_records(records, &params).await.unwrap();
@@ -698,6 +701,7 @@ async fn test_single_put_fallback_mode_with_overload_retry() {
         ignore_nulls: false,
         use_batch_write: Some(false),
         validate_only: false,
+        compression: None,
     };
 
     let stats = engine.write_records(records, &params).await.unwrap();
@@ -743,6 +747,7 @@ async fn test_non_overload_error_terminates_after_n_retries() {
         ignore_nulls: false,
         use_batch_write: Some(true),
         validate_only: false,
+        compression: None,
     };
 
     let err = engine.write_records(records, &params).await.unwrap_err();
@@ -855,6 +860,7 @@ async fn test_end_to_end_flight_handshake_and_do_put_stream() {
         ignore_nulls: false,
         use_batch_write: Some(true),
         validate_only: false,
+        compression: None,
     };
     let descriptor = FlightDescriptor::new_cmd(serde_json::to_vec(&write_params).unwrap());
 
@@ -1020,6 +1026,7 @@ async fn test_three_node_raft_cluster_metadata_and_distributed_job_status() {
             ignore_nulls: false,
             use_batch_write: Some(true),
             validate_only: false,
+            compression: None,
         };
         let desc = FlightDescriptor::new_cmd(serde_json::to_vec(&params).unwrap());
         let stream_data = FlightDataEncoderBuilder::new()
@@ -1281,6 +1288,7 @@ async fn test_dq_validation_with_nan_equality_and_mismatch_detection() {
         ignore_nulls: false,
         use_batch_write: Some(true),
         validate_only: true,
+        compression: None,
     };
     let desc = FlightDescriptor::new_cmd(serde_json::to_vec(&dq_params).unwrap());
     let stream_data = FlightDataEncoderBuilder::new()
@@ -1449,6 +1457,7 @@ async fn test_flight_read_get_schema_do_get_and_do_exchange_lookup() {
         ignore_nulls: false,
         use_batch_write: Some(true),
         validate_only: false,
+        compression: None,
     };
 
     let desc = FlightDescriptor::new_cmd(serde_json::to_vec(&w_params).unwrap());
@@ -1500,6 +1509,7 @@ async fn test_flight_read_get_schema_do_get_and_do_exchange_lookup() {
             batch_size: 2,
             type_mismatch_mode: TypeMismatchMode::Fail,
             schema_ipc_base64: pruned_schema_b64.clone(),
+            compression: None,
         })
         .unwrap();
 
@@ -1538,6 +1548,7 @@ async fn test_flight_read_get_schema_do_get_and_do_exchange_lookup() {
         batch_size: 10,
         type_mismatch_mode: TypeMismatchMode::Fail,
         schema_ipc_base64: encode_arrow_schema_ipc_base64(&write_schema).unwrap(),
+        compression: None,
     })
     .unwrap();
 
@@ -1592,6 +1603,7 @@ async fn test_flight_read_get_schema_do_get_and_do_exchange_lookup() {
         join_type: LookupJoinType::Left,
         type_mismatch_mode: TypeMismatchMode::Fail,
         bins_schema_ipc_base64: bins_schema_b64.clone(),
+        compression: None,
     };
     let left_desc = FlightDescriptor::new_cmd(serde_json::to_vec(&left_params).unwrap());
     let left_req_stream = FlightDataEncoderBuilder::new()
@@ -1630,6 +1642,7 @@ async fn test_flight_read_get_schema_do_get_and_do_exchange_lookup() {
         join_type: LookupJoinType::Inner,
         type_mismatch_mode: TypeMismatchMode::Fail,
         bins_schema_ipc_base64: bins_schema_b64,
+        compression: None,
     };
     let inner_desc = FlightDescriptor::new_cmd(serde_json::to_vec(&inner_params).unwrap());
     let inner_req_stream = FlightDataEncoderBuilder::new()
@@ -1805,6 +1818,7 @@ fn test_config_headers_validation_and_error_status_conversions() {
         batch_size: 100,
         type_mismatch_mode: TypeMismatchMode::Fail,
         schema_ipc_base64: "".to_string(),
+        compression: None,
     };
     assert!(rt.validate().is_err());
     rt.namespace = "test".to_string();
@@ -1856,6 +1870,7 @@ fn test_config_headers_validation_and_error_status_conversions() {
         join_type: LookupJoinType::Left,
         type_mismatch_mode: TypeMismatchMode::Fail,
         bins_schema_ipc_base64: "".into(),
+        compression: None,
     }
     .validate()
     .is_err());
@@ -1866,6 +1881,7 @@ fn test_config_headers_validation_and_error_status_conversions() {
         join_type: LookupJoinType::Left,
         type_mismatch_mode: TypeMismatchMode::Fail,
         bins_schema_ipc_base64: "".into(),
+        compression: None,
     }
     .validate()
     .is_err());
@@ -2331,6 +2347,7 @@ fn test_converter_all_read_write_types_and_mismatch_modes() {
         ignore_nulls: false,
         use_batch_write: Some(true),
         validate_only: false,
+        compression: None,
     };
     let prep = convert_record_batch(&ext_rb, &wp_ext, 15).unwrap();
     assert_eq!(prep.len(), 1);
@@ -2549,6 +2566,7 @@ async fn test_read_keys_and_dq_validate_retries_and_raft_actions() {
         ignore_nulls: false,
         use_batch_write: Some(true),
         validate_only: true,
+        compression: None,
     };
     let dq_stats = engine
         .validate_records(
@@ -2709,6 +2727,7 @@ async fn test_read_keys_and_dq_validate_retries_and_raft_actions() {
         batch_size: 3,
         type_mismatch_mode: TypeMismatchMode::Fail,
         schema_ipc_base64: schema_b64,
+        compression: None,
     })
     .unwrap();
     let dg_stream = client
@@ -2754,6 +2773,7 @@ async fn test_read_keys_and_dq_validate_retries_and_raft_actions() {
         ignore_nulls: false,
         use_batch_write: Some(true),
         validate_only: false,
+        compression: None,
     };
     let bad_put_stream = FlightDataEncoderBuilder::new()
         .with_schema(nullable_pk_schema)
@@ -2788,6 +2808,7 @@ async fn test_read_keys_and_dq_validate_retries_and_raft_actions() {
             ignore_nulls: false,
             use_batch_write: Some(true),
             validate_only: val_only,
+            compression: None,
         };
         let fatal_stream = FlightDataEncoderBuilder::new()
             .with_schema(schema.clone())
@@ -2825,6 +2846,7 @@ async fn test_read_keys_and_dq_validate_retries_and_raft_actions() {
         join_type: LookupJoinType::Inner,
         type_mismatch_mode: TypeMismatchMode::Fail,
         bins_schema_ipc_base64: encode_arrow_schema_ipc_base64(&bins_only).unwrap(),
+        compression: None,
     };
     let ex_stream = FlightDataEncoderBuilder::new()
         .with_schema(miss_schema.clone())
@@ -2882,6 +2904,7 @@ async fn test_read_keys_and_dq_validate_retries_and_raft_actions() {
             batch_size: bs,
             type_mismatch_mode: TypeMismatchMode::Fail,
             schema_ipc_base64: mismatch_b64.clone(),
+            compression: None,
         })
         .unwrap();
         let mut s = client
@@ -2911,6 +2934,7 @@ async fn test_read_keys_and_dq_validate_retries_and_raft_actions() {
             batch_size: 10,
             type_mismatch_mode: TypeMismatchMode::Fail,
             schema_ipc_base64: sc_b64,
+            compression: None,
         })
         .unwrap();
         let mut s = client
@@ -2937,6 +2961,7 @@ async fn test_read_keys_and_dq_validate_retries_and_raft_actions() {
             join_type: LookupJoinType::Left,
             type_mismatch_mode: TypeMismatchMode::Fail,
             bins_schema_ipc_base64: encode_arrow_schema_ipc_base64(&b_schema).unwrap(),
+            compression: None,
         };
         let st = FlightDataEncoderBuilder::new()
             .with_schema(miss_schema.clone())
@@ -2970,6 +2995,7 @@ fn test_converter_remaining_key_and_value_types_and_dq_branches() {
         ignore_nulls: false,
         use_batch_write: None,
         validate_only: false,
+        compression: None,
     };
 
     // 1. Empty batch (0 rows) -> Ok(vec![])
@@ -3175,3 +3201,304 @@ fn test_converter_remaining_key_and_value_types_and_dq_branches() {
         RecordDqResult::BinMismatch(_)
     ));
 }
+
+#[tokio::test]
+async fn test_flight_compression_modes_and_disableable_switch() {
+    use arrow_flight::decode::{DecodedPayload, FlightDataDecoder};
+    use arrow_flight::Ticket;
+    use as_proxy_server::config::{FlightCompression, ServerConfig};
+    use tonic::codec::CompressionEncoding;
+
+    // 1. Unit tests for FlightCompression parsing, headers, IPC options, and master switch
+    for (raw, expected) in [
+        ("none", FlightCompression::None),
+        ("off", FlightCompression::None),
+        ("false", FlightCompression::None),
+        ("disabled", FlightCompression::None),
+        ("0", FlightCompression::None),
+        ("zstd", FlightCompression::Zstd),
+        ("ZSTD", FlightCompression::Zstd),
+        ("lz4", FlightCompression::Lz4),
+        ("lz4_frame", FlightCompression::Lz4),
+        ("lz4-frame", FlightCompression::Lz4),
+        ("gzip", FlightCompression::Gzip),
+    ] {
+        assert_eq!(FlightCompression::from_str_insensitive(raw).unwrap(), expected);
+    }
+    assert!(FlightCompression::from_str_insensitive("brotli").is_err());
+
+    let mut hdrs = MetadataMap::new();
+    assert_eq!(FlightCompression::from_headers(&hdrs).unwrap(), None);
+    hdrs.insert("x-as-compression", MetadataValue::from_static("lz4"));
+    assert_eq!(
+        FlightCompression::from_headers(&hdrs).unwrap(),
+        Some(FlightCompression::Lz4)
+    );
+
+    assert_eq!(FlightCompression::None.to_tonic_encoding(), None);
+    assert_eq!(
+        FlightCompression::Zstd.to_tonic_encoding(),
+        Some(CompressionEncoding::Zstd)
+    );
+    assert_eq!(FlightCompression::Lz4.to_tonic_encoding(), None);
+    assert_eq!(
+        FlightCompression::Gzip.to_tonic_encoding(),
+        Some(CompressionEncoding::Gzip)
+    );
+
+    for comp in [
+        FlightCompression::None,
+        FlightCompression::Zstd,
+        FlightCompression::Lz4,
+        FlightCompression::Gzip,
+    ] {
+        assert!(comp.to_ipc_write_options().is_ok());
+    }
+
+    let mut srv_cfg = ServerConfig::default();
+    assert!(srv_cfg.compression_enabled);
+    assert_eq!(srv_cfg.effective_compression(None), FlightCompression::Zstd);
+    assert_eq!(
+        srv_cfg.effective_compression(Some(FlightCompression::Lz4)),
+        FlightCompression::Lz4
+    );
+    srv_cfg.compression_enabled = false;
+    assert_eq!(
+        srv_cfg.effective_compression(Some(FlightCompression::Zstd)),
+        FlightCompression::None
+    );
+
+    // 2. End-to-end DoPut, DoGet, and DoExchange across Zstd, Lz4, Gzip, and None compression modes
+    let sink = Arc::new(MockAerospikeSink::new(HashMap::new(), HashMap::new()));
+    let metrics = ProxyMetrics::new();
+    let engine = Arc::new(MppWriteEngine::new(
+        sink.clone(),
+        WriterConfig::default(),
+        RetryConfig::default(),
+        metrics.clone(),
+    ));
+    let auth = Arc::new(Authenticator::new(AuthConfig {
+        enabled: false,
+        ..AuthConfig::default()
+    }));
+
+    let enabled_srv_cfg = ServerConfig {
+        compression_enabled: true,
+        compression: FlightCompression::Zstd,
+        ..ServerConfig::default()
+    };
+    let flight_svc = ProxyFlightService::new(auth.clone(), engine.clone(), metrics.clone(), 15)
+        .with_compression(enabled_srv_cfg.compression_enabled, enabled_srv_cfg.compression)
+        .into_server(&enabled_srv_cfg);
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        Server::builder()
+            .add_service(flight_svc)
+            .serve_with_incoming(TcpListenerStream::new(listener))
+            .await
+            .unwrap();
+    });
+
+    let channel = tonic::transport::Endpoint::from_shared(format!("http://{addr}"))
+        .unwrap()
+        .connect()
+        .await
+        .unwrap();
+    let mut client = FlightServiceClient::new(channel)
+        .accept_compressed(CompressionEncoding::Gzip)
+        .accept_compressed(CompressionEncoding::Zstd);
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("pk", DataType::Utf8, false),
+        Field::new("payload", DataType::Utf8, true),
+    ]));
+    let mut pk_b = StringBuilder::new();
+    let mut pay_b = StringBuilder::new();
+    for i in 0..20 {
+        pk_b.append_value(format!("comp_k_{i}"));
+        pay_b.append_value(" repetitive_compressible_string_payload ".repeat(8));
+    }
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(pk_b.finish()), Arc::new(pay_b.finish())],
+    )
+    .unwrap();
+
+    for mode in [
+        FlightCompression::Zstd,
+        FlightCompression::Lz4,
+        FlightCompression::Gzip,
+        FlightCompression::None,
+    ] {
+        // 2a. Compressed DoPut
+        let wp = WriteParameters {
+            job_id: None,
+            namespace: "test".into(),
+            set_name: "comp_set".into(),
+            key_column: "pk".into(),
+            write_mode: WriteMode::Update,
+            ttl_seconds: None,
+            send_key: true,
+            ignore_nulls: false,
+            use_batch_write: Some(true),
+            validate_only: false,
+            compression: Some(mode),
+        };
+        let put_ipc_opts = mode.to_ipc_write_options().unwrap();
+        let put_stream = FlightDataEncoderBuilder::new()
+            .with_schema(schema.clone())
+            .with_options(put_ipc_opts)
+            .with_flight_descriptor(Some(FlightDescriptor::new_cmd(
+                serde_json::to_vec(&wp).unwrap(),
+            )))
+            .build(stream::iter(vec![Ok(batch.clone())]))
+            .map(|r| r.unwrap());
+
+        let mut put_resp = client.do_put(Request::new(put_stream)).await.unwrap().into_inner();
+        while (put_resp.try_next().await.unwrap()).is_some() {}
+
+        // 2b. Compressed DoGet
+        let ticket_bytes = serde_json::to_vec(&ReadTicket {
+            namespace: "test".into(),
+            set_name: "comp_set".into(),
+            key_column: "pk".into(),
+            bins: vec!["payload".into()],
+            read_mode: ReadModeSpec::PartitionRange {
+                begin_partition: 0,
+                partition_count: 4096,
+            },
+            batch_size: 10,
+            type_mismatch_mode: TypeMismatchMode::Fail,
+            schema_ipc_base64: encode_arrow_schema_ipc_base64(&schema).unwrap(),
+            compression: Some(mode),
+        })
+        .unwrap();
+
+        let dg_stream = client
+            .do_get(Request::new(Ticket {
+                ticket: Bytes::from(ticket_bytes),
+            }))
+            .await
+            .unwrap()
+            .into_inner()
+            .map_err(arrow_flight::error::FlightError::from);
+        let mut dg_dec = FlightDataDecoder::new(dg_stream);
+        let mut read_rows = 0;
+        while let Some(msg) = dg_dec.try_next().await.unwrap() {
+            if let DecodedPayload::RecordBatch(rb) = msg.payload {
+                read_rows += rb.num_rows();
+            }
+        }
+        assert_eq!(read_rows, 20);
+
+        // 2c. Compressed DoExchange
+        let in_schema = Arc::new(Schema::new(vec![Field::new("pk", DataType::Utf8, false)]));
+        let mut lk_b = StringBuilder::new();
+        lk_b.append_value("comp_k_0");
+        lk_b.append_value("comp_k_19");
+        let in_rb = RecordBatch::try_new(in_schema.clone(), vec![Arc::new(lk_b.finish())]).unwrap();
+        let bins_only = Arc::new(Schema::new(vec![Field::new("payload", DataType::Utf8, true)]));
+        let ex_params = LookupExchangeParams {
+            namespace: "test".into(),
+            set_name: "comp_set".into(),
+            key_column: "pk".into(),
+            join_type: LookupJoinType::Inner,
+            type_mismatch_mode: TypeMismatchMode::Fail,
+            bins_schema_ipc_base64: encode_arrow_schema_ipc_base64(&bins_only).unwrap(),
+            compression: Some(mode),
+        };
+        let ex_stream = FlightDataEncoderBuilder::new()
+            .with_schema(in_schema)
+            .with_options(mode.to_ipc_write_options().unwrap())
+            .with_flight_descriptor(Some(FlightDescriptor::new_cmd(
+                serde_json::to_vec(&ex_params).unwrap(),
+            )))
+            .build(stream::iter(vec![Ok(in_rb)]))
+            .map(|r| r.unwrap());
+
+        let ex_resp = client
+            .do_exchange(Request::new(ex_stream))
+            .await
+            .unwrap()
+            .into_inner()
+            .map_err(arrow_flight::error::FlightError::from);
+        let mut ex_dec = FlightDataDecoder::new(ex_resp);
+        let mut ex_rows = 0;
+        while let Some(msg) = ex_dec.try_next().await.unwrap() {
+            if let DecodedPayload::RecordBatch(rb) = msg.payload {
+                ex_rows += rb.num_rows();
+            }
+        }
+        assert_eq!(ex_rows, 2);
+    }
+
+    // 3. Test master switch `compression_enabled = false` on server (and Gzip default server config)
+    for srv in [
+        ServerConfig {
+            compression_enabled: false,
+            compression: FlightCompression::Zstd,
+            ..ServerConfig::default()
+        },
+        ServerConfig {
+            compression_enabled: true,
+            compression: FlightCompression::Gzip,
+            ..ServerConfig::default()
+        },
+    ] {
+        let svc = ProxyFlightService::new(auth.clone(), engine.clone(), metrics.clone(), 15)
+            .with_compression(srv.compression_enabled, srv.compression)
+            .into_server(&srv);
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let a = l.local_addr().unwrap();
+        tokio::spawn(async move {
+            Server::builder()
+                .add_service(svc)
+                .serve_with_incoming(TcpListenerStream::new(l))
+                .await
+                .unwrap();
+        });
+        let ch = tonic::transport::Endpoint::from_shared(format!("http://{a}"))
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
+        let mut cl = FlightServiceClient::new(ch)
+            .accept_compressed(CompressionEncoding::Gzip)
+            .accept_compressed(CompressionEncoding::Zstd);
+
+        let t_bytes = serde_json::to_vec(&ReadTicket {
+            namespace: "test".into(),
+            set_name: "comp_set".into(),
+            key_column: "pk".into(),
+            bins: vec!["payload".into()],
+            read_mode: ReadModeSpec::PartitionRange {
+                begin_partition: 0,
+                partition_count: 4096,
+            },
+            batch_size: 20,
+            type_mismatch_mode: TypeMismatchMode::Fail,
+            schema_ipc_base64: encode_arrow_schema_ipc_base64(&schema).unwrap(),
+            compression: Some(FlightCompression::Zstd),
+        })
+        .unwrap();
+        let dg = cl
+            .do_get(Request::new(Ticket {
+                ticket: Bytes::from(t_bytes),
+            }))
+            .await
+            .unwrap()
+            .into_inner()
+            .map_err(arrow_flight::error::FlightError::from);
+        let mut dec = FlightDataDecoder::new(dg);
+        let mut rows = 0;
+        while let Some(msg) = dec.try_next().await.unwrap() {
+            if let DecodedPayload::RecordBatch(rb) = msg.payload {
+                rows += rb.num_rows();
+            }
+        }
+        assert_eq!(rows, 20);
+    }
+}
+

@@ -211,7 +211,7 @@ object AerospikeFlightLookup extends Logging {
         logInfo(
           s"[Executor][Lookup] Opened DoExchange stream for partition=$partitionIndex on endpoint=$connectedEndpointStr, " +
             s"target='${options.namespace}.${options.setName}', joinType='${options.lookupJoinType}', " +
-            s"lookupBins=[${binsOnlySchema.fields.map(_.name).mkString(", ")}]"
+            s"compression='${options.compression}', lookupBins=[${binsOnlySchema.fields.map(_.name).mkString(", ")}]"
         )
       } catch {
         case t: Throwable =>
@@ -259,12 +259,18 @@ object AerospikeFlightLookup extends Logging {
 
     val writer = exchange.getWriter
     val reader = exchange.getReader
+    FlightCompressionHelper.enableStreamDecompression(reader)
 
     val senderThread = new Thread(
       new Runnable {
         override def run(): Unit = {
           try {
             writer.start(inputRoot)
+            FlightCompressionHelper.configureOutboundStream(
+              writer,
+              inputRoot,
+              options.compression
+            )
             batchConverter.reset()
             while (inputRows.hasNext) {
               val row = inputRows.next()
@@ -389,7 +395,6 @@ object AerospikeFlightLookup extends Logging {
       binsOnlySchema: StructType,
       options: AerospikeFlightOptions
   ): Array[Byte] = {
-    val mapper = new ObjectMapper()
     val map = new util.LinkedHashMap[String, Any]()
     map.put("namespace", options.namespace)
     map.put("set_name", options.setName)
@@ -397,6 +402,7 @@ object AerospikeFlightLookup extends Logging {
     map.put("join_type", options.lookupJoinType)
     map.put("type_mismatch_mode", options.readTypeMismatchMode)
     map.put("bins_schema_ipc_base64", ArrowSchemaConverter.toArrowSchemaIpcBase64(binsOnlySchema))
-    mapper.writeValueAsString(map).getBytes(StandardCharsets.UTF_8)
+    map.put("compression", options.compression)
+    AerospikeFlightOptions.SharedMapper.writeValueAsBytes(map)
   }
 }

@@ -36,6 +36,7 @@ class AerospikeFlightDataWriter(
     validateOnly = options.validateOnly
   )
   private val stagingRoot: VectorSchemaRoot = VectorSchemaRoot.create(arrowSchema, rootAllocator)
+  private val stagingUnloader: VectorUnloader = new VectorUnloader(stagingRoot)
   private val batchConverter = new ArrowBatchConverter(
     sparkSchema = sparkSchema,
     keyColumn = options.keyColumn,
@@ -84,7 +85,8 @@ class AerospikeFlightDataWriter(
     s"[Executor][Write] Initialized writer for partition=$partitionId, task=$taskId, " +
       s"jobId='${options.jobId}', target='${options.namespace}.${options.setName}', " +
       s"writeMode='${options.writeMode}', validateOnly=${options.validateOnly}, " +
-      s"writerThreads=${options.writerThreads}, batchSize=${options.batchSize}, endpoints=[$assignedEndpointsStr]"
+      s"compression='${options.compression}', writerThreads=${options.writerThreads}, " +
+      s"batchSize=${options.batchSize}, endpoints=[$assignedEndpointsStr]"
   )
 
   batchConverter.reset()
@@ -188,8 +190,7 @@ class AerospikeFlightDataWriter(
   private def flushCurrentBatch(): Unit = {
     val count = batchConverter.finishBatch()
     if (count > 0) {
-      val unloader = new VectorUnloader(stagingRoot)
-      val recordBatch = unloader.getRecordBatch
+      val recordBatch = stagingUnloader.getRecordBatch
       enqueueWithFailureCheck(Some(recordBatch))
       if (!options.validateOnly) {
         rowsWrittenCounter.addAndGet(count.toLong)
@@ -217,7 +218,7 @@ class AerospikeFlightDataWriter(
   }
 
   private def runSenderLoop(threadIdx: Int): Unit = {
-    val mapper = new ObjectMapper()
+    val mapper = AerospikeFlightOptions.SharedMapper
     val workerAllocator = rootAllocator.newChildAllocator(
       s"worker-$threadIdx",
       0L,
@@ -241,6 +242,11 @@ class AerospikeFlightDataWriter(
         workerRoot,
         putListener,
         callOptions: _*
+      )
+      FlightCompressionHelper.configureOutboundStream(
+        streamListener,
+        workerRoot,
+        options.compression
       )
 
       try {

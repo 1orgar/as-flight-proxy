@@ -1022,6 +1022,7 @@ class ArrowBatchConverterSpec extends AnyFunSuite {
           flightStream: FlightStream,
           ackStream: FlightProducer.StreamListener[PutResult]
       ): Runnable = {
+        FlightCompressionHelper.enableStreamDecompression(flightStream)
         new Runnable {
           override def run(): Unit = {
             try {
@@ -1132,7 +1133,9 @@ class ArrowBatchConverterSpec extends AnyFunSuite {
 
         val root = VectorSchemaRoot.create(arrowSchema, allocator)
         try {
+          val comp = if (node.has("compression")) node.get("compression").asText("zstd") else "zstd"
           listener.start(root)
+          FlightCompressionHelper.configureOutboundStream(listener, root, comp)
           val conv = new ArrowBatchConverter(wireSparkSchema, keyCol, root, ignoreNulls = false, validateOnly = true)
           conv.reset()
           matchingEntries.foreach { case (pk, bins) =>
@@ -1161,10 +1164,12 @@ class ArrowBatchConverterSpec extends AnyFunSuite {
           reader: FlightStream,
           writer: FlightProducer.ServerStreamListener
       ): Unit = {
+        FlightCompressionHelper.enableStreamDecompression(reader)
         val descBytes = reader.getDescriptor.getCommand
         val node = mapper.readTree(descBytes)
         val keyCol = node.get("key_column").asText("pk")
         val joinType = node.get("join_type").asText("left")
+        val comp = if (node.has("compression")) node.get("compression").asText("zstd") else "zstd"
         val binsB64 = node.get("bins_schema_ipc_base64").asText()
         val binsArrowSchema = MessageSerializer.deserializeSchema(
           new ReadChannel(Channels.newChannel(new ByteArrayInputStream(Base64.getDecoder.decode(binsB64))))
@@ -1186,6 +1191,7 @@ class ArrowBatchConverterSpec extends AnyFunSuite {
               outSparkSchema = AerospikeFlightLookup.buildOutputSchema(inSparkSchema, binsSparkSchema, keyCol, joinType)
               outRoot = VectorSchemaRoot.create(ArrowSchemaConverter.toArrowSchema(outSparkSchema), allocator)
               writer.start(outRoot)
+              FlightCompressionHelper.configureOutboundStream(writer, outRoot, comp)
               outConv = new ArrowBatchConverter(outSparkSchema, keyCol, outRoot, ignoreNulls = false, validateOnly = true)
             }
 
@@ -1434,9 +1440,113 @@ class ArrowBatchConverterSpec extends AnyFunSuite {
       writer.close()
       sw.commit(0L, Array.empty)
       sw.abort(0L, Array.empty)
+
+      // 8. Verify all Flight compression modes ("zstd", "lz4", "gzip", "none") and disableable switch
+      for (compMode <- Seq("zstd", "lz4", "gzip", "none")) {
+        val compOpts = baseOpts + (
+          "connector.jobId" -> s"job-comp-$compMode",
+          "flight.compression" -> compMode
+        )
+        writeDf.write
+          .format("com.asproxy.spark.AerospikeFlightDataSource")
+          .options(compOpts)
+          .mode("append")
+          .save()
+
+        val readCompRows = spark.read
+          .format("com.asproxy.spark.AerospikeFlightDataSource")
+          .schema(explicitSchema)
+          .options(compOpts)
+          .load()
+          .collect()
+        assert(readCompRows.length == 4)
+
+        val lookupCompRows = AerospikeFlightLookup
+          .lookup(keysDf, "age INT, score DOUBLE", compOpts)
+          .collect()
+        assert(lookupCompRows.length == 3)
+      }
+
+      // Also verify `flight.compression.enabled = "false"` disables compression even if `flight.compression = "zstd"`
+      val disabledCompOpts = baseOpts + (
+        "connector.jobId" -> "job-comp-disabled",
+        "flight.compression" -> "zstd",
+        "flight.compression.enabled" -> "false"
+      )
+      assert(AerospikeFlightOptions.fromMap(disabledCompOpts).compression == "none")
+      writeDf.write
+        .format("com.asproxy.spark.AerospikeFlightDataSource")
+        .options(disabledCompOpts)
+        .mode("append")
+        .save()
     } finally {
       spark.stop()
       server.close()
+      allocator.close()
+    }
+  }
+
+  test("ArrowCompressionCodecs & FlightCompressionHelper: ZSTD, LZ4_FRAME, Gzip, and disableable compression") {
+    import org.apache.arrow.vector.compression.{CompressionUtil, NoCompressionCodec}
+
+    val allocator = new RootAllocator(Long.MaxValue)
+    try {
+      // 1. FlightCompressionHelper.normalizeCompression
+      assert(FlightCompressionHelper.normalizeCompression("zstd", enabled = true) == "zstd")
+      assert(FlightCompressionHelper.normalizeCompression("ZSTANDARD", enabled = true) == "zstd")
+      assert(FlightCompressionHelper.normalizeCompression("true", enabled = true) == "zstd")
+      assert(FlightCompressionHelper.normalizeCompression("lz4", enabled = true) == "lz4")
+      assert(FlightCompressionHelper.normalizeCompression("LZ4_FRAME", enabled = true) == "lz4")
+      assert(FlightCompressionHelper.normalizeCompression("gzip", enabled = true) == "gzip")
+      assert(FlightCompressionHelper.normalizeCompression("none", enabled = true) == "none")
+      assert(FlightCompressionHelper.normalizeCompression("off", enabled = true) == "none")
+      assert(FlightCompressionHelper.normalizeCompression("false", enabled = true) == "none")
+      assert(FlightCompressionHelper.normalizeCompression("disabled", enabled = true) == "none")
+      assert(FlightCompressionHelper.normalizeCompression("zstd", enabled = false) == "none")
+      intercept[IllegalArgumentException] {
+        FlightCompressionHelper.normalizeCompression("brotli", enabled = true)
+      }
+
+      // 2. grpcCompressionCallOption
+      assert(FlightCompressionHelper.grpcCompressionCallOption("gzip").isDefined)
+      assert(FlightCompressionHelper.grpcCompressionCallOption("zstd").isEmpty)
+      assert(FlightCompressionHelper.grpcCompressionCallOption("none").isEmpty)
+
+      // 3. ArrowCompressionCodecFactory & direct ZSTD / LZ4_FRAME buffer round-trip
+      val zstdCodec = ArrowCompressionCodecFactory.createCodec(CompressionUtil.CodecType.ZSTD)
+      val lz4Codec = ArrowCompressionCodecFactory.createCodec(CompressionUtil.CodecType.LZ4_FRAME)
+      assert(zstdCodec.getCodecType == CompressionUtil.CodecType.ZSTD)
+      assert(lz4Codec.getCodecType == CompressionUtil.CodecType.LZ4_FRAME)
+      assert(NoCompressionCodec.Factory.INSTANCE != null)
+
+      val payloadBytes = ("aerospike-arrow-flight-high-speed-compression-test-" * 64).getBytes("UTF-8")
+      for (codec <- Seq(zstdCodec, lz4Codec)) {
+        val rawBuf = allocator.buffer(payloadBytes.length)
+        rawBuf.writeBytes(payloadBytes)
+        // compress() closes rawBuf and returns compressedBuf
+        val compressedBuf = codec.compress(allocator, rawBuf)
+        assert(compressedBuf.readableBytes() < payloadBytes.length)
+
+        // decompress() closes compressedBuf and returns decompressedBuf
+        val decompressedBuf = codec.decompress(allocator, compressedBuf)
+        assert(decompressedBuf.readableBytes() == payloadBytes.length)
+        val outBytes = new Array[Byte](payloadBytes.length)
+        decompressedBuf.getBytes(0, outBytes)
+        assert(java.util.Arrays.equals(payloadBytes, outBytes))
+        decompressedBuf.close()
+
+        // Also test tiny incompressible buffer (AbstractCompressionCodec uncompressed fallback path)
+        val tinyBytes = Array[Byte](1, 2, 3)
+        val tinyBuf = allocator.buffer(tinyBytes.length)
+        tinyBuf.writeBytes(tinyBytes)
+        val tinyComp = codec.compress(allocator, tinyBuf)
+        val tinyDecomp = codec.decompress(allocator, tinyComp)
+        val tinyOut = new Array[Byte](tinyBytes.length)
+        tinyDecomp.getBytes(0, tinyOut)
+        assert(java.util.Arrays.equals(tinyBytes, tinyOut))
+        tinyDecomp.close()
+      }
+    } finally {
       allocator.close()
     }
   }

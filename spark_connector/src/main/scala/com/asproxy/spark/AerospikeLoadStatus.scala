@@ -1,7 +1,15 @@
 package com.asproxy.spark
 
 import com.fasterxml.jackson.databind.ObjectMapper
-import org.apache.arrow.flight.{Action, CallOption, CallOptions, FlightClient, Location}
+import org.apache.arrow.flight.{
+  Action,
+  CallOption,
+  CallOptions,
+  FlightCallHeaders,
+  FlightClient,
+  HeaderCallOption,
+  Location
+}
 import org.apache.arrow.flight.grpc.CredentialCallOption
 import org.apache.arrow.memory.{BufferAllocator, RootAllocator}
 import org.apache.spark.internal.Logging
@@ -39,7 +47,7 @@ case class LoadJobSummary(
 ) extends Serializable {
 
   def toJson: String = {
-    val mapper = new ObjectMapper()
+    val mapper = AerospikeFlightOptions.SharedMapper
     val map = new util.LinkedHashMap[String, Any]()
     map.put("job_id", jobId)
     map.put("namespace", namespace)
@@ -185,13 +193,12 @@ object AerospikeLoadStatus extends Logging {
       errorMsg: Option[String] = None
   ): Option[String] = {
     try {
-      val mapper = new ObjectMapper()
       val payload = new util.LinkedHashMap[String, Any]()
       payload.put("job_id", options.jobId)
       payload.put("namespace", options.namespace)
       payload.put("set_name", options.setName)
       errorMsg.foreach(e => payload.put("error", e))
-      val bytes = mapper.writeValueAsBytes(payload)
+      val bytes = AerospikeFlightOptions.SharedMapper.writeValueAsBytes(payload)
       Some(executeAction(options, actionType, bytes))
     } catch {
       case t: Throwable =>
@@ -285,6 +292,10 @@ object AerospikeLoadStatus extends Logging {
         })
       opts += credOpt
     }
+    val headers = new FlightCallHeaders()
+    headers.insert("x-as-compression", options.compression)
+    opts += new HeaderCallOption(headers)
+    FlightCompressionHelper.grpcCompressionCallOption(options.compression).foreach(opts += _)
     if (options.timeoutMs > 0) {
       opts += CallOptions.timeout(options.timeoutMs, TimeUnit.MILLISECONDS)
     }

@@ -1437,6 +1437,10 @@ pub fn build_array_from_values(
             let mut nulls: Vec<bool> = Vec::with_capacity(len);
             let mut per_field_vals: Vec<Vec<Option<&Value>>> =
                 vec![Vec::with_capacity(len); fields.len()];
+            let lookup_keys: Vec<Value> = fields
+                .iter()
+                .map(|f| Value::String(f.name().clone()))
+                .collect();
 
             for (row, val_opt) in values.iter().enumerate() {
                 match val_opt {
@@ -1448,9 +1452,8 @@ pub fn build_array_from_values(
                     }
                     Some(Value::OrderedMap(entries)) => {
                         nulls.push(true);
-                        for (f_idx, f) in fields.iter().enumerate() {
-                            let lookup_key = Value::String(f.name().clone());
-                            match entries.get(&lookup_key) {
+                        for (f_idx, lookup_key) in lookup_keys.iter().enumerate() {
+                            match entries.get(lookup_key) {
                                 None | Some(Value::Nil) => per_field_vals[f_idx].push(None),
                                 Some(v) => per_field_vals[f_idx].push(Some(v)),
                             }
@@ -1458,9 +1461,8 @@ pub fn build_array_from_values(
                     }
                     Some(Value::HashMap(entries)) => {
                         nulls.push(true);
-                        for (f_idx, f) in fields.iter().enumerate() {
-                            let lookup_key = Value::String(f.name().clone());
-                            match entries.get(&lookup_key) {
+                        for (f_idx, lookup_key) in lookup_keys.iter().enumerate() {
+                            match entries.get(lookup_key) {
                                 None | Some(Value::Nil) => per_field_vals[f_idx].push(None),
                                 Some(v) => per_field_vals[f_idx].push(Some(v)),
                             }

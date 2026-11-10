@@ -81,8 +81,7 @@ object KeyLiteralSpec {
     val trimmed = rawKeys.trim
     if (trimmed.isEmpty) return Seq.empty
     if (trimmed.startsWith("[")) {
-      val mapper = new ObjectMapper()
-      val node = mapper.readTree(trimmed)
+      val node = AerospikeFlightOptions.SharedMapper.readTree(trimmed)
       if (node != null && node.isArray) {
         val buf = ArrayBuffer.empty[KeyLiteralSpec]
         val it = node.elements()
@@ -114,13 +113,12 @@ object AerospikeFlightSchemaInferrer extends Logging {
   def inferSchema(options: AerospikeFlightOptions): StructType = {
     options.validateWriteTarget()
     val startMs = System.currentTimeMillis()
-    val mapper = new ObjectMapper()
     val reqMap = new util.LinkedHashMap[String, Any]()
     reqMap.put("namespace", options.namespace)
     reqMap.put("set_name", options.setName)
     reqMap.put("key_column", options.keyColumn)
     reqMap.put("sample_size", Int.box(options.readSampleSize))
-    val cmdBytes = mapper.writeValueAsBytes(reqMap)
+    val cmdBytes = AerospikeFlightOptions.SharedMapper.writeValueAsBytes(reqMap)
 
     var lastErr: Throwable = null
     var idx = 0
@@ -504,13 +502,14 @@ class AerospikeFlightPartitionReader(
         flightClient = AerospikeLoadStatus.createFlightClient(allocator, endpoint, options)
         val callOptions = AerospikeLoadStatus.buildCallOptions(flightClient, options)
         flightStream = flightClient.getStream(ticket, callOptions: _*)
+        FlightCompressionHelper.enableStreamDecompression(flightStream)
         val root = flightStream.getRoot
         rowReader = new ArrowRowReader(readSchema, root)
         connectedEndpointStr = s"${endpoint.host}:${endpoint.port}"
         logInfo(
           s"[Executor][Read] Opened DoGet stream for partition=${partition.partitionIndex} ($modeDesc) " +
             s"on endpoint=$connectedEndpointStr, target='${options.namespace}.${options.setName}', " +
-            s"requestedBins=[${requestedBins.mkString(", ")}]"
+            s"compression='${options.compression}', requestedBins=[${requestedBins.mkString(", ")}]"
         )
         return
       } catch {
@@ -531,7 +530,6 @@ class AerospikeFlightPartitionReader(
   }
 
   private def buildTicketJsonBytes(): Array[Byte] = {
-    val mapper = new ObjectMapper()
     val map = new util.LinkedHashMap[String, Any]()
     map.put("namespace", options.namespace)
     map.put("set_name", options.setName)
@@ -540,6 +538,7 @@ class AerospikeFlightPartitionReader(
     map.put("batch_size", Int.box(options.readBatchSize))
     map.put("type_mismatch_mode", options.readTypeMismatchMode)
     map.put("schema_ipc_base64", ArrowSchemaConverter.toArrowSchemaIpcBase64(wireSchema))
+    map.put("compression", options.compression)
 
     val readModeMap = new util.LinkedHashMap[String, Any]()
     partition match {
@@ -554,7 +553,7 @@ class AerospikeFlightPartitionReader(
         throw new IllegalStateException("AerospikeLookupViewInputPartition uses AerospikeFlightLookupPartitionReader")
     }
     map.put("read_mode", readModeMap)
-    mapper.writeValueAsString(map).getBytes(StandardCharsets.UTF_8)
+    AerospikeFlightOptions.SharedMapper.writeValueAsBytes(map)
   }
 
   override def next(): Boolean = {

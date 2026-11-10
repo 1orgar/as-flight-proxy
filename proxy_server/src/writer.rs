@@ -111,6 +111,7 @@ pub trait AerospikeSink: Send + Sync + 'static {
             ignore_nulls: false,
             use_batch_write: Some(true),
             validate_only: true,
+            compression: None,
         };
         let recs: Vec<PreparedRecord> = keys
             .iter()
@@ -572,10 +573,7 @@ impl MppWriteEngine {
             .max_concurrent_subbatches_per_stream
             .max(1);
 
-        let chunks: Vec<Vec<PreparedRecord>> = records
-            .chunks(chunk_size)
-            .map(|c| c.to_vec())
-            .collect();
+        let chunks = split_into_chunks(records, chunk_size);
 
         let mut in_flight_futures = FuturesUnordered::new();
         let mut stats = BatchWriteStats {
@@ -625,10 +623,7 @@ impl MppWriteEngine {
             .max_concurrent_subbatches_per_stream
             .max(1);
 
-        let chunks: Vec<Vec<PreparedRecord>> = records
-            .chunks(chunk_size)
-            .map(|c| c.to_vec())
-            .collect();
+        let chunks = split_into_chunks(records, chunk_size);
 
         let mut in_flight_futures = FuturesUnordered::new();
         let mut stats = BatchWriteStats {
@@ -705,41 +700,34 @@ impl MppWriteEngine {
         initial_records: Vec<PreparedRecord>,
         params: &WriteParameters,
     ) -> Result<BatchWriteStats> {
-        #[derive(Clone)]
-        struct PendingReadItem {
-            record: PreparedRecord,
-            overload_attempts: u32,
-            other_attempts: u32,
-        }
-
-        let mut pending: Vec<PendingReadItem> = initial_records
-            .into_iter()
-            .map(|record| PendingReadItem {
-                record,
-                overload_attempts: 0,
-                other_attempts: 0,
-            })
-            .collect();
+        let mut pending_records: Vec<PreparedRecord> = initial_records;
+        let mut pending_attempts: Vec<(u32, u32)> = vec![(0, 0); pending_records.len()];
 
         let mut stats = BatchWriteStats {
-            rows_validated: pending.len(),
+            rows_validated: pending_records.len(),
             ..BatchWriteStats::default()
         };
         let mut backoff_step: u32 = 0;
 
-        while !pending.is_empty() {
-            let batch_slice: Vec<PreparedRecord> =
-                pending.iter().map(|p| p.record.clone()).collect();
-            let outcomes = self.sink.execute_batch_read(&batch_slice, params).await;
+        while !pending_records.is_empty() {
+            let outcomes = self
+                .sink
+                .execute_batch_read(&pending_records, params)
+                .await;
 
-            let mut next_pending = Vec::new();
+            let mut next_records = Vec::new();
+            let mut next_attempts = Vec::new();
             let mut batch_overload_count: u64 = 0;
             let mut batch_other_count: u64 = 0;
 
-            for (mut item, outcome) in pending.into_iter().zip(outcomes.into_iter()) {
+            for ((record, (mut ov_att, mut oth_att)), outcome) in pending_records
+                .into_iter()
+                .zip(pending_attempts.into_iter())
+                .zip(outcomes.into_iter())
+            {
                 match outcome {
                     RecordReadOutcome::Found(actual_bins) => {
-                        match validate_record_against_bins(&item.record, Some(&actual_bins)) {
+                        match validate_record_against_bins(&record, Some(&actual_bins)) {
                             RecordDqResult::Matched => {
                                 stats.matched_rows += 1;
                             }
@@ -748,7 +736,7 @@ impl MppWriteEngine {
                                 stats.mismatched_rows += 1;
                                 if stats.mismatch_samples.len() < 20 {
                                     stats.mismatch_samples.push(DqMismatchSample {
-                                        key: format!("{:?}", item.record.key),
+                                        key: format!("{:?}", record.key),
                                         reason: "key_not_found".to_string(),
                                     });
                                 }
@@ -758,7 +746,7 @@ impl MppWriteEngine {
                                 stats.mismatched_rows += 1;
                                 if stats.mismatch_samples.len() < 20 {
                                     stats.mismatch_samples.push(DqMismatchSample {
-                                        key: format!("{:?}", item.record.key),
+                                        key: format!("{:?}", record.key),
                                         reason,
                                     });
                                 }
@@ -770,38 +758,40 @@ impl MppWriteEngine {
                         stats.mismatched_rows += 1;
                         if stats.mismatch_samples.len() < 20 {
                             stats.mismatch_samples.push(DqMismatchSample {
-                                key: format!("{:?}", item.record.key),
+                                key: format!("{:?}", record.key),
                                 reason: "key_not_found".to_string(),
                             });
                         }
                     }
                     RecordReadOutcome::OverloadError(err_msg) => {
-                        item.overload_attempts = item.overload_attempts.saturating_add(1);
+                        ov_att = ov_att.saturating_add(1);
                         batch_overload_count += 1;
                         debug!(
-                            key = ?item.record.key,
-                            overload_attempt = item.overload_attempts,
+                            key = ?record.key,
+                            overload_attempt = ov_att,
                             error = %err_msg,
                             "Overload error on DQ batch read; scheduling infinite backoff retry"
                         );
-                        next_pending.push(item);
+                        next_records.push(record);
+                        next_attempts.push((ov_att, oth_att));
                     }
                     RecordReadOutcome::OtherError(err_msg) => {
-                        item.other_attempts = item.other_attempts.saturating_add(1);
-                        if item.other_attempts > self.retry_config.max_other_retries {
+                        oth_att = oth_att.saturating_add(1);
+                        if oth_att > self.retry_config.max_other_retries {
                             self.metrics.inc_failed_records(1);
                             return Err(ProxyError::WriteFailed {
-                                attempts: item.other_attempts,
+                                attempts: oth_att,
                                 message: err_msg,
                             });
                         }
                         batch_other_count += 1;
-                        next_pending.push(item);
+                        next_records.push(record);
+                        next_attempts.push((ov_att, oth_att));
                     }
                 }
             }
 
-            if next_pending.is_empty() {
+            if next_records.is_empty() {
                 break;
             }
 
@@ -818,7 +808,8 @@ impl MppWriteEngine {
             backoff_step = backoff_step.saturating_add(1);
             tokio::time::sleep(sleep_dur).await;
 
-            pending = next_pending;
+            pending_records = next_records;
+            pending_attempts = next_attempts;
         }
 
         Ok(stats)
@@ -866,80 +857,75 @@ impl MppWriteEngine {
         initial_records: Vec<PreparedRecord>,
         params: &WriteParameters,
     ) -> Result<(u64, u64)> {
-        #[derive(Clone)]
-        struct PendingItem {
-            record: PreparedRecord,
-            overload_attempts: u32,
-            other_attempts: u32,
-        }
-
-        let mut pending: Vec<PendingItem> = initial_records
-            .into_iter()
-            .map(|record| PendingItem {
-                record,
-                overload_attempts: 0,
-                other_attempts: 0,
-            })
-            .collect();
+        let mut pending_records: Vec<PreparedRecord> = initial_records;
+        let mut pending_attempts: Vec<(u32, u32)> = vec![(0, 0); pending_records.len()];
 
         let mut total_overload_retries: u64 = 0;
         let mut total_other_retries: u64 = 0;
         let mut backoff_step: u32 = 0;
 
-        while !pending.is_empty() {
-            let batch_slice: Vec<PreparedRecord> =
-                pending.iter().map(|p| p.record.clone()).collect();
-            let outcomes = self.sink.execute_batch_write(&batch_slice, params).await;
+        while !pending_records.is_empty() {
+            let outcomes = self
+                .sink
+                .execute_batch_write(&pending_records, params)
+                .await;
 
-            let mut next_pending = Vec::new();
+            let mut next_records = Vec::new();
+            let mut next_attempts = Vec::new();
             let mut batch_overload_count: u64 = 0;
             let mut batch_other_count: u64 = 0;
 
-            for (mut item, outcome) in pending.into_iter().zip(outcomes.into_iter()) {
+            for ((record, (mut ov_att, mut oth_att)), outcome) in pending_records
+                .into_iter()
+                .zip(pending_attempts.into_iter())
+                .zip(outcomes.into_iter())
+            {
                 match outcome {
                     RecordWriteOutcome::Success => {
                         // Successfully written; do not re-queue.
                     }
                     RecordWriteOutcome::OverloadError(err_msg) => {
-                        item.overload_attempts = item.overload_attempts.saturating_add(1);
+                        ov_att = ov_att.saturating_add(1);
                         batch_overload_count += 1;
                         debug!(
-                            key = ?item.record.key,
-                            overload_attempt = item.overload_attempts,
+                            key = ?record.key,
+                            overload_attempt = ov_att,
                             error = %err_msg,
                             "Overload error on key; scheduling infinite backoff retry"
                         );
-                        next_pending.push(item);
+                        next_records.push(record);
+                        next_attempts.push((ov_att, oth_att));
                     }
                     RecordWriteOutcome::OtherError(err_msg) => {
-                        item.other_attempts = item.other_attempts.saturating_add(1);
-                        if item.other_attempts > self.retry_config.max_other_retries {
+                        oth_att = oth_att.saturating_add(1);
+                        if oth_att > self.retry_config.max_other_retries {
                             self.metrics.inc_failed_records(1);
                             warn!(
-                                key = ?item.record.key,
-                                attempts = item.other_attempts,
+                                key = ?record.key,
+                                attempts = oth_att,
                                 error = %err_msg,
                                 "Non-overload error exceeded max_other_retries; terminating stream"
                             );
                             return Err(ProxyError::WriteFailed {
-                                attempts: item.other_attempts,
+                                attempts: oth_att,
                                 message: err_msg,
                             });
                         }
                         batch_other_count += 1;
                         warn!(
-                            key = ?item.record.key,
-                            other_attempt = item.other_attempts,
+                            key = ?record.key,
+                            other_attempt = oth_att,
                             max_other_retries = self.retry_config.max_other_retries,
                             error = %err_msg,
                             "Non-overload error on key; retrying"
                         );
-                        next_pending.push(item);
+                        next_records.push(record);
+                        next_attempts.push((ov_att, oth_att));
                     }
                 }
             }
 
-            if next_pending.is_empty() {
+            if next_records.is_empty() {
                 break;
             }
 
@@ -956,7 +942,8 @@ impl MppWriteEngine {
             backoff_step = backoff_step.saturating_add(1);
             tokio::time::sleep(sleep_dur).await;
 
-            pending = next_pending;
+            pending_records = next_records;
+            pending_attempts = next_attempts;
         }
 
         Ok((total_overload_retries, total_other_retries))
@@ -1068,16 +1055,11 @@ impl MppWriteEngine {
             .max_concurrent_subbatches_per_stream
             .max(1);
 
-        let chunks: Vec<(usize, Vec<Key>)> = keys
-            .chunks(chunk_size)
-            .enumerate()
-            .map(|(chunk_idx, slice)| (chunk_idx, slice.to_vec()))
-            .collect();
-
-        let mut ordered_chunks: Vec<Option<Vec<RecordReadOutcome>>> = vec![None; chunks.len()];
+        let raw_chunks = split_into_chunks(keys, chunk_size);
+        let mut ordered_chunks: Vec<Option<Vec<RecordReadOutcome>>> = vec![None; raw_chunks.len()];
         let mut in_flight = FuturesUnordered::new();
 
-        for (chunk_idx, chunk_keys) in chunks {
+        for (chunk_idx, chunk_keys) in raw_chunks.into_iter().enumerate() {
             while in_flight.len() >= max_concurrency {
                 let res: Result<(usize, Vec<RecordReadOutcome>)> = in_flight.next().await.unwrap();
                 let (done_idx, outcomes) = res?;
@@ -1133,63 +1115,57 @@ impl MppWriteEngine {
         initial_keys: Vec<Key>,
         bins: Option<&[String]>,
     ) -> Result<Vec<RecordReadOutcome>> {
-        #[derive(Clone)]
-        struct PendingKeyItem {
-            orig_idx: usize,
-            key: Key,
-            overload_attempts: u32,
-            other_attempts: u32,
-        }
-
         let total = initial_keys.len();
         let mut results: Vec<Option<RecordReadOutcome>> = vec![None; total];
-        let mut pending: Vec<PendingKeyItem> = initial_keys
-            .into_iter()
-            .enumerate()
-            .map(|(orig_idx, key)| PendingKeyItem {
-                orig_idx,
-                key,
-                overload_attempts: 0,
-                other_attempts: 0,
-            })
-            .collect();
+        let mut pending_keys: Vec<Key> = initial_keys;
+        let mut pending_meta: Vec<(usize, u32, u32)> =
+            (0..total).map(|orig_idx| (orig_idx, 0, 0)).collect();
 
         let mut backoff_step: u32 = 0;
 
-        while !pending.is_empty() {
-            let batch_keys: Vec<Key> = pending.iter().map(|p| p.key.clone()).collect();
-            let outcomes = self.sink.execute_batch_read_keys(&batch_keys, bins).await;
+        while !pending_keys.is_empty() {
+            let outcomes = self
+                .sink
+                .execute_batch_read_keys(&pending_keys, bins)
+                .await;
 
-            let mut next_pending = Vec::new();
+            let mut next_keys = Vec::new();
+            let mut next_meta = Vec::new();
             let mut batch_overload_count: u64 = 0;
             let mut batch_other_count: u64 = 0;
 
-            for (mut item, outcome) in pending.into_iter().zip(outcomes.into_iter()) {
+            for ((key, (orig_idx, mut ov_att, mut oth_att)), outcome) in pending_keys
+                .into_iter()
+                .zip(pending_meta.into_iter())
+                .zip(outcomes.into_iter())
+            {
                 match outcome {
                     RecordReadOutcome::Found(_) | RecordReadOutcome::NotFound => {
-                        results[item.orig_idx] = Some(outcome);
+                        results[orig_idx] = Some(outcome);
                     }
                     RecordReadOutcome::OverloadError(_) => {
-                        item.overload_attempts = item.overload_attempts.saturating_add(1);
+                        ov_att = ov_att.saturating_add(1);
                         batch_overload_count += 1;
-                        next_pending.push(item);
+                        next_keys.push(key);
+                        next_meta.push((orig_idx, ov_att, oth_att));
                     }
                     RecordReadOutcome::OtherError(err_msg) => {
-                        item.other_attempts = item.other_attempts.saturating_add(1);
-                        if item.other_attempts > self.retry_config.max_other_retries {
+                        oth_att = oth_att.saturating_add(1);
+                        if oth_att > self.retry_config.max_other_retries {
                             self.metrics.inc_failed_records(1);
                             return Err(ProxyError::WriteFailed {
-                                attempts: item.other_attempts,
+                                attempts: oth_att,
                                 message: err_msg,
                             });
                         }
                         batch_other_count += 1;
-                        next_pending.push(item);
+                        next_keys.push(key);
+                        next_meta.push((orig_idx, ov_att, oth_att));
                     }
                 }
             }
 
-            if next_pending.is_empty() {
+            if next_keys.is_empty() {
                 break;
             }
 
@@ -1204,7 +1180,8 @@ impl MppWriteEngine {
             backoff_step = backoff_step.saturating_add(1);
             tokio::time::sleep(sleep_dur).await;
 
-            pending = next_pending;
+            pending_keys = next_keys;
+            pending_meta = next_meta;
         }
 
         Ok(results
@@ -1212,6 +1189,22 @@ impl MppWriteEngine {
             .map(|r| r.unwrap_or(RecordReadOutcome::NotFound))
             .collect())
     }
+}
+
+/// Split an owned `Vec<T>` into sub-vectors of at most `chunk_size` elements without cloning `T`.
+fn split_into_chunks<T>(items: Vec<T>, chunk_size: usize) -> Vec<Vec<T>> {
+    let step = chunk_size.max(1);
+    let num_chunks = items.len().div_ceil(step);
+    let mut out = Vec::with_capacity(num_chunks);
+    let mut iter = items.into_iter();
+    loop {
+        let chunk: Vec<T> = iter.by_ref().take(step).collect();
+        if chunk.is_empty() {
+            break;
+        }
+        out.push(chunk);
+    }
+    out
 }
 
 /// Compute exponential backoff with full jitter:

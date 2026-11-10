@@ -45,7 +45,8 @@ case class AerospikeFlightOptions(
     readTypeMismatchMode: String = "fail",
     readKeys: Option[String] = None,
     lookupSourceView: Option[String] = None,
-    lookupJoinType: String = "left"
+    lookupJoinType: String = "left",
+    compression: String = "zstd"
 ) extends Serializable {
 
   require(jobId.trim.nonEmpty, "'connector.jobId' cannot be empty")
@@ -103,7 +104,6 @@ case class AerospikeFlightOptions(
    * by the Rust `proxy_server`.
    */
   def toFlightDescriptorJsonBytes: Array[Byte] = {
-    val mapper = new ObjectMapper()
     val payload = new util.LinkedHashMap[String, Any]()
     payload.put("job_id", jobId)
     payload.put("namespace", namespace)
@@ -115,11 +115,14 @@ case class AerospikeFlightOptions(
     payload.put("ignore_nulls", Boolean.box(ignoreNulls))
     useBatchWrite.foreach(ub => payload.put("use_batch_write", Boolean.box(ub)))
     payload.put("validate_only", Boolean.box(validateOnly))
-    mapper.writeValueAsBytes(payload)
+    payload.put("compression", compression)
+    AerospikeFlightOptions.SharedMapper.writeValueAsBytes(payload)
   }
 }
 
 object AerospikeFlightOptions {
+  private[spark] val SharedMapper = new ObjectMapper()
+
   private val AllowedWriteModes = Set(
     "update",
     "replace",
@@ -282,6 +285,17 @@ object AerospikeFlightOptions {
         )
     }
 
+    val compressionEnabled = get("flight.compression.enabled")
+      .orElse(get("aerospike.flight.compression.enabled"))
+      .orElse(get("compression.enabled"))
+      .getOrElse("true")
+      .toBoolean
+    val rawCompression = get("flight.compression")
+      .orElse(get("aerospike.flight.compression"))
+      .orElse(get("compression"))
+      .getOrElse("zstd")
+    val compression = FlightCompressionHelper.normalizeCompression(rawCompression, compressionEnabled)
+
     AerospikeFlightOptions(
       jobId = jobId,
       hosts = hosts,
@@ -313,7 +327,8 @@ object AerospikeFlightOptions {
       readTypeMismatchMode = readTypeMismatchMode,
       readKeys = readKeys,
       lookupSourceView = lookupSourceView,
-      lookupJoinType = lookupJoinType
+      lookupJoinType = lookupJoinType,
+      compression = compression
     )
   }
 

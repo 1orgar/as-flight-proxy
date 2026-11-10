@@ -2,11 +2,12 @@ use arrow_array::RecordBatch;
 use arrow_flight::decode::{DecodedPayload, FlightDataDecoder};
 use arrow_flight::encode::FlightDataEncoderBuilder;
 use arrow_flight::error::FlightError;
-use arrow_flight::flight_service_server::FlightService;
+use arrow_flight::flight_service_server::{FlightService, FlightServiceServer};
 use arrow_flight::{
     Action, ActionType, Criteria, Empty, FlightData, FlightDescriptor, FlightInfo,
     HandshakeRequest, HandshakeResponse, PollInfo, PutResult, SchemaResult, Ticket,
 };
+use arrow_ipc::writer::IpcWriteOptions;
 use arrow_schema::{Field, Schema};
 use bytes::Bytes;
 use futures::stream::{self, BoxStream, StreamExt, TryStreamExt};
@@ -15,14 +16,15 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
-use tonic::metadata::MetadataValue;
+use tonic::codec::CompressionEncoding;
+use tonic::metadata::{MetadataMap, MetadataValue};
 use tonic::{Request, Response, Status, Streaming};
 use tracing::{debug, error, info};
 
 use crate::auth::Authenticator;
 use crate::config::{
-    InferSchemaRequest, LookupExchangeParams, LookupJoinType, ReadModeSpec, ReadTicket,
-    WriteParameters,
+    FlightCompression, InferSchemaRequest, LookupExchangeParams, LookupJoinType, ReadModeSpec,
+    ReadTicket, ServerConfig, WriteParameters,
 };
 use crate::converter::{
     ScannedRecord, build_lookup_record_batch, convert_record_batch,
@@ -90,6 +92,8 @@ pub struct ProxyFlightService {
     metrics: Arc<ProxyMetrics>,
     max_bin_name_len: usize,
     raft_node: Option<Arc<RaftNode>>,
+    compression_enabled: bool,
+    default_compression: FlightCompression,
 }
 
 impl ProxyFlightService {
@@ -105,12 +109,70 @@ impl ProxyFlightService {
             metrics,
             max_bin_name_len,
             raft_node: None,
+            compression_enabled: true,
+            default_compression: FlightCompression::default(),
         }
     }
 
     pub fn with_raft_node(mut self, raft_node: Arc<RaftNode>) -> Self {
         self.raft_node = Some(raft_node);
         self
+    }
+
+    pub fn with_compression(
+        mut self,
+        enabled: bool,
+        default_compression: FlightCompression,
+    ) -> Self {
+        self.compression_enabled = enabled;
+        self.default_compression = if enabled {
+            default_compression
+        } else {
+            FlightCompression::None
+        };
+        self
+    }
+
+    /// Wrap this service in a `FlightServiceServer` configured with message size limits
+    /// and gRPC transport compression settings from `ServerConfig`.
+    pub fn into_server(self, server_cfg: &ServerConfig) -> FlightServiceServer<Self> {
+        let max_msg_bytes = server_cfg.max_decoding_message_size_mb * 1024 * 1024;
+        let mut svc = FlightServiceServer::new(self)
+            .max_decoding_message_size(max_msg_bytes)
+            .max_encoding_message_size(max_msg_bytes);
+
+        if server_cfg.compression_enabled {
+            svc = svc
+                .accept_compressed(CompressionEncoding::Gzip)
+                .accept_compressed(CompressionEncoding::Zstd);
+            if server_cfg.compression == FlightCompression::Gzip {
+                svc = svc.send_compressed(CompressionEncoding::Gzip);
+            }
+        }
+        svc
+    }
+
+    fn resolve_effective_compression(
+        &self,
+        client_override: Option<FlightCompression>,
+        header_override: Option<FlightCompression>,
+    ) -> FlightCompression {
+        if !self.compression_enabled {
+            return FlightCompression::None;
+        }
+        client_override
+            .or(header_override)
+            .unwrap_or(self.default_compression)
+    }
+
+    fn resolve_ipc_write_options(
+        &self,
+        client_override: Option<FlightCompression>,
+        headers: &MetadataMap,
+    ) -> Result<IpcWriteOptions, Status> {
+        let header_override = FlightCompression::from_headers(headers).map_err(Status::from)?;
+        let effective = self.resolve_effective_compression(client_override, header_override);
+        effective.to_ipc_write_options().map_err(Status::from)
     }
 }
 
@@ -558,11 +620,15 @@ impl FlightService for ProxyFlightService {
             .verify_metadata(request.metadata())
             .map_err(Status::from)?;
 
+        let headers = request.metadata().clone();
         let ticket = request.into_inner();
         let read_ticket: ReadTicket = serde_json::from_slice(&ticket.ticket).map_err(|e| {
             Status::invalid_argument(format!("Failed to parse ReadTicket JSON from Ticket: {e}"))
         })?;
         read_ticket.validate().map_err(Status::from)?;
+
+        let ipc_write_options =
+            self.resolve_ipc_write_options(read_ticket.compression, &headers)?;
 
         let target_schema = decode_arrow_schema_ipc_base64(&read_ticket.schema_ipc_base64)
             .map_err(Status::from)?;
@@ -700,7 +766,8 @@ impl FlightService for ProxyFlightService {
                 }
 
                 ReadModeSpec::BatchKeys { keys } => {
-                    let mut as_keys = Vec::with_capacity(keys.len());
+                    let total_requested_keys = keys.len();
+                    let mut as_keys = Vec::with_capacity(total_requested_keys);
                     for lit in &keys {
                         match lit.to_key(&read_ticket.namespace, &read_ticket.set_name) {
                             Ok(k) => as_keys.push(k),
@@ -713,9 +780,16 @@ impl FlightService for ProxyFlightService {
                         }
                     }
 
-                    for chunk in as_keys.chunks(batch_size) {
+                    let mut key_iter = as_keys.into_iter();
+                    loop {
+                        let chunk: Vec<aerospike::Key> =
+                            key_iter.by_ref().take(batch_size).collect();
+                        if chunk.is_empty() {
+                            break;
+                        }
+                        let chunk_len = chunk.len();
                         let outcomes = match write_engine
-                            .read_keys(chunk.to_vec(), Some(requested_bins.clone()))
+                            .read_keys(chunk.clone(), Some(requested_bins.clone()))
                             .await
                         {
                             Ok(o) => o,
@@ -727,15 +801,15 @@ impl FlightService for ProxyFlightService {
                             }
                         };
 
-                        let mut found_records = Vec::with_capacity(chunk.len());
-                        for (key, outcome) in chunk.iter().zip(outcomes.into_iter()) {
+                        let mut found_records = Vec::with_capacity(chunk_len);
+                        for (key, outcome) in chunk.into_iter().zip(outcomes.into_iter()) {
                             if let RecordReadOutcome::Found(map) = outcome {
                                 let mut bins = IndexMap::with_capacity(map.len());
                                 for (k, v) in map {
                                     bins.insert(k, v);
                                 }
                                 found_records.push(ScannedRecord {
-                                    key: Some(key.clone()),
+                                    key: Some(key),
                                     bins,
                                 });
                             }
@@ -772,7 +846,7 @@ impl FlightService for ProxyFlightService {
                         node_id,
                         namespace = %read_ticket.namespace,
                         set_name = %read_ticket.set_name,
-                        requested_keys = keys.len(),
+                        requested_keys = total_requested_keys,
                         batches = total_batches_emitted,
                         rows = total_rows_emitted,
                         elapsed_ms = stream_start.elapsed().as_millis() as u64,
@@ -784,6 +858,7 @@ impl FlightService for ProxyFlightService {
 
         let encoded_stream = FlightDataEncoderBuilder::new()
             .with_schema(target_schema)
+            .with_options(ipc_write_options)
             .build(ReceiverStream::new(batch_rx))
             .map_err(Status::from)
             .boxed();
@@ -799,6 +874,11 @@ impl FlightService for ProxyFlightService {
             .verify_metadata(request.metadata())
             .map_err(Status::from)?;
 
+        let header_compression =
+            FlightCompression::from_headers(request.metadata()).map_err(Status::from)?;
+        let compression_enabled = self.compression_enabled;
+        let default_compression = self.default_compression;
+
         let flight_data_stream = request.into_inner().map_err(FlightError::from);
         let mut decoder = FlightDataDecoder::new(flight_data_stream);
 
@@ -806,8 +886,7 @@ impl FlightService for ProxyFlightService {
         let metrics = Arc::clone(&self.metrics);
         let node_id = self.raft_node.as_ref().map(|r| r.node_id()).unwrap_or(1);
 
-        let (batch_tx, batch_rx) =
-            mpsc::channel::<std::result::Result<RecordBatch, FlightError>>(8);
+        let (flight_tx, flight_rx) = mpsc::channel::<Result<FlightData, Status>>(16);
 
         tokio::spawn(async move {
             let _stream_guard = ActiveStreamGuard::new(Arc::clone(&metrics));
@@ -822,11 +901,50 @@ impl FlightService for ProxyFlightService {
             let mut total_rows_out: usize = 0;
             let mut total_batches_out: usize = 0;
 
+            let mut batch_tx_opt: Option<mpsc::Sender<std::result::Result<RecordBatch, FlightError>>> =
+                None;
+            let mut encoder_handle: Option<tokio::task::JoinHandle<()>> = None;
+
+            let init_encoder = |params_opt: &Option<LookupExchangeParams>,
+                                ftx: mpsc::Sender<Result<FlightData, Status>>|
+             -> (
+                mpsc::Sender<std::result::Result<RecordBatch, FlightError>>,
+                tokio::task::JoinHandle<()>,
+            ) {
+                let effective_comp = if !compression_enabled {
+                    FlightCompression::None
+                } else {
+                    params_opt
+                        .as_ref()
+                        .and_then(|p| p.compression)
+                        .or(header_compression)
+                        .unwrap_or(default_compression)
+                };
+                let ipc_opts = effective_comp.to_ipc_write_options().unwrap_or_default();
+                let (btx, brx) =
+                    mpsc::channel::<std::result::Result<RecordBatch, FlightError>>(8);
+                let handle = tokio::spawn(async move {
+                    let mut enc_stream = FlightDataEncoderBuilder::new()
+                        .with_options(ipc_opts)
+                        .build(ReceiverStream::new(brx));
+                    while let Some(item) = enc_stream.next().await {
+                        if ftx.send(item.map_err(Status::from)).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+                (btx, handle)
+            };
+
             while let Some(decoded_res) = decoder.next().await {
                 let decoded = match decoded_res {
                     Ok(d) => d,
                     Err(e) => {
-                        let _ = batch_tx.send(Err(e)).await;
+                        drop(batch_tx_opt);
+                        if let Some(h) = encoder_handle {
+                            let _ = h.await;
+                        }
+                        let _ = flight_tx.send(Err(Status::from(e))).await;
                         return;
                     }
                 };
@@ -836,9 +954,7 @@ impl FlightService for ProxyFlightService {
                         match serde_json::from_slice::<LookupExchangeParams>(&desc.cmd) {
                             Ok(p) => {
                                 if let Err(e) = p.validate() {
-                                    let _ = batch_tx
-                                        .send(Err(FlightError::Tonic(Box::new(Status::from(e)))))
-                                        .await;
+                                    let _ = flight_tx.send(Err(Status::from(e))).await;
                                     return;
                                 }
                                 match decode_arrow_schema_ipc_base64(&p.bins_schema_ipc_base64) {
@@ -853,21 +969,15 @@ impl FlightService for ProxyFlightService {
                                         lookup_params = Some(p);
                                     }
                                     Err(e) => {
-                                        let _ = batch_tx
-                                            .send(Err(FlightError::Tonic(Box::new(Status::from(
-                                                e,
-                                            )))))
-                                            .await;
+                                        let _ = flight_tx.send(Err(Status::from(e))).await;
                                         return;
                                     }
                                 }
                             }
                             Err(e) => {
-                                let _ = batch_tx
-                                    .send(Err(FlightError::Tonic(Box::new(
-                                        Status::invalid_argument(format!(
-                                            "Invalid LookupExchangeParams JSON: {e}"
-                                        )),
+                                let _ = flight_tx
+                                    .send(Err(Status::invalid_argument(format!(
+                                        "Invalid LookupExchangeParams JSON: {e}"
                                     ))))
                                     .await;
                                 return;
@@ -897,12 +1007,14 @@ impl FlightService for ProxyFlightService {
                     }
                     DecodedPayload::RecordBatch(input_batch) => {
                         let (Some(p), Some(bs)) = (&lookup_params, &bins_schema) else {
-                            let _ = batch_tx
-                                .send(Err(FlightError::Tonic(Box::new(
-                                    Status::invalid_argument(
-                                        "Missing LookupExchangeParams FlightDescriptor before RecordBatch",
-                                    ),
-                                ))))
+                            drop(batch_tx_opt);
+                            if let Some(h) = encoder_handle {
+                                let _ = h.await;
+                            }
+                            let _ = flight_tx
+                                .send(Err(Status::invalid_argument(
+                                    "Missing LookupExchangeParams FlightDescriptor before RecordBatch",
+                                )))
                                 .await;
                             return;
                         };
@@ -915,9 +1027,11 @@ impl FlightService for ProxyFlightService {
                         ) {
                             Ok(k) => k,
                             Err(e) => {
-                                let _ = batch_tx
-                                    .send(Err(FlightError::Tonic(Box::new(Status::from(e)))))
-                                    .await;
+                                drop(batch_tx_opt);
+                                if let Some(h) = encoder_handle {
+                                    let _ = h.await;
+                                }
+                                let _ = flight_tx.send(Err(Status::from(e))).await;
                                 return;
                             }
                         };
@@ -932,9 +1046,11 @@ impl FlightService for ProxyFlightService {
                         {
                             Ok(o) => o,
                             Err(e) => {
-                                let _ = batch_tx
-                                    .send(Err(FlightError::Tonic(Box::new(Status::from(e)))))
-                                    .await;
+                                drop(batch_tx_opt);
+                                if let Some(h) = encoder_handle {
+                                    let _ = h.await;
+                                }
+                                let _ = flight_tx.send(Err(Status::from(e))).await;
                                 return;
                             }
                         };
@@ -961,7 +1077,19 @@ impl FlightService for ProxyFlightService {
                                 metrics.inc_records_read(rows as u64);
                                 metrics.inc_read_batches();
                                 sent_any_batch = true;
-                                if batch_tx.send(Ok(out_batch)).await.is_err() {
+                                if batch_tx_opt.is_none() {
+                                    let (btx, handle) =
+                                        init_encoder(&lookup_params, flight_tx.clone());
+                                    batch_tx_opt = Some(btx);
+                                    encoder_handle = Some(handle);
+                                }
+                                if batch_tx_opt
+                                    .as_ref()
+                                    .unwrap()
+                                    .send(Ok(out_batch))
+                                    .await
+                                    .is_err()
+                                {
                                     return;
                                 }
                             }
@@ -969,9 +1097,11 @@ impl FlightService for ProxyFlightService {
                                 // All rows filtered out in Inner join mode for this batch
                             }
                             Err(e) => {
-                                let _ = batch_tx
-                                    .send(Err(FlightError::Tonic(Box::new(Status::from(e)))))
-                                    .await;
+                                drop(batch_tx_opt);
+                                if let Some(h) = encoder_handle {
+                                    let _ = h.await;
+                                }
+                                let _ = flight_tx.send(Err(Status::from(e))).await;
                                 return;
                             }
                         }
@@ -981,8 +1111,22 @@ impl FlightService for ProxyFlightService {
 
             if !sent_any_batch {
                 if let Some(out_schema) = out_schema_opt {
-                    let _ = batch_tx.send(Ok(RecordBatch::new_empty(out_schema))).await;
+                    if batch_tx_opt.is_none() {
+                        let (btx, handle) = init_encoder(&lookup_params, flight_tx.clone());
+                        batch_tx_opt = Some(btx);
+                        encoder_handle = Some(handle);
+                    }
+                    let _ = batch_tx_opt
+                        .as_ref()
+                        .unwrap()
+                        .send(Ok(RecordBatch::new_empty(out_schema)))
+                        .await;
                 }
+            }
+
+            drop(batch_tx_opt);
+            if let Some(h) = encoder_handle {
+                let _ = h.await;
             }
 
             if let Some(p) = &lookup_params {
@@ -1001,12 +1145,8 @@ impl FlightService for ProxyFlightService {
             }
         });
 
-        let encoded_stream = FlightDataEncoderBuilder::new()
-            .build(ReceiverStream::new(batch_rx))
-            .map_err(Status::from)
-            .boxed();
-
-        Ok(Response::new(encoded_stream))
+        let output_stream = ReceiverStream::new(flight_rx).boxed();
+        Ok(Response::new(output_stream))
     }
 }
 
