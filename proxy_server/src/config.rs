@@ -121,7 +121,15 @@ pub enum FlightCompression {
 
 impl FlightCompression {
     pub fn from_str_insensitive(s: &str) -> Result<Self> {
-        match s.trim().to_ascii_lowercase().as_str() {
+        let base = s
+            .trim()
+            .to_ascii_lowercase()
+            .split(':')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        match base.as_str() {
             "" | "none" | "off" | "false" | "disabled" | "0" => Ok(FlightCompression::None),
             "zstd" | "zstandard" | "true" | "1" => Ok(FlightCompression::Zstd),
             "lz4" | "lz4_frame" | "lz4-frame" | "lz4frame" => Ok(FlightCompression::Lz4),

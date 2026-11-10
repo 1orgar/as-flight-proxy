@@ -62,7 +62,8 @@ Data source format short name: **`"aerospike-flight"`** (or full class name `"co
 | `flight.username` | `aerospike.flight.username` | `""` | Username for Arrow Flight `Handshake` authentication |
 | `flight.password` | `aerospike.flight.password` | `""` | Password for Arrow Flight `Handshake` authentication |
 | `flight.timeoutMs` | `aerospike.flight.timeout_ms` | `"60000"` | Per-call Arrow Flight RPC timeout in milliseconds |
-| `flight.compression` | `aerospike.flight.compression`, `compression` | `"zstd"` | Arrow Flight stream compression algorithm: `"zstd"` (default, off-heap IPC buffer compression), `"lz4"` (`LZ4_FRAME` IPC compression), `"gzip"` (gRPC transport compression), or `"none"` (`"off"`, `"false"`, `"disabled"`) |
+| `flight.compression` | `aerospike.flight.compression`, `compression` | `"zstd"` | Arrow Flight stream compression algorithm: `"zstd"` (default, off-heap IPC buffer compression; also supports inline level syntax like `"zstd:3"`), `"lz4"` (`LZ4_FRAME` IPC compression), `"gzip"` (gRPC transport compression), or `"none"` (`"off"`, `"false"`, `"disabled"`) |
+| `flight.compression.level` | `flight.compressionLevel`, `aerospike.flight.compression.level`, `compression.level` | `"1"` | ZSTD compression level for outbound Spark batches: **`1..9`** standard range (`1` = fastest default, `3` = ZSTD balanced default, `9` = high ratio); also supports `10..22` (ultra) and `-7..-1` (ultra-fast) |
 | `flight.compression.enabled` | `aerospike.flight.compression.enabled`, `compression.enabled` | `"true"` | Master client switch to enable (`"true"`) or disable (`"false"`) Flight compression |
 | `flight.tls.enabled` | `aerospike.flight.tls.enabled` | `"false"` | Enables TLS (`grpc+tls://`) for Arrow Flight connections |
 | `flight.tls.caCertPath` | `aerospike.flight.tls.ca_cert_path` | None | Path to trusted root CA certificate PEM file on Spark nodes |

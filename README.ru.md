@@ -221,7 +221,8 @@ backoff_multiplier = 2.0
 | `flight.tls.clientKeyPath` | Нет | — | Путь к приватному ключу клиента (PKCS#8 PEM) для mTLS |
 | `flight.tls.verifyServer` | Нет | `"true"` | Проверять ли сертификат сервера при TLS |
 | `flight.timeoutMs` | Нет | `"60000"` | Таймаут RPC вызовов Arrow Flight (мс) |
-| `flight.compression` | Нет | `"zstd"` | Сжатие Arrow Flight стримов (`"zstd"`, `"lz4"`, `"gzip"`, `"none"` / `"off"`) |
+| `flight.compression` | Нет | `"zstd"` | Сжатие Arrow Flight стримов (`"zstd"`, `"zstd:3"`, `"lz4"`, `"gzip"`, `"none"` / `"off"`) |
+| `flight.compression.level` | Нет | `"1"` | Уровень сжатия ZSTD (`1..9` основной диапазон, `-7..22` полный диапазон ZSTD; `1` — самый быстрый) |
 | `flight.compression.enabled` | Нет | `"true"` | Мастер-переключатель компрессии на клиенте (`"false"` отключает сжатие) |
 | `aerospike.read.numPartitions` | Нет | `"32"` | Число партиций Spark при параллельном чтении (`1..4096`) |
 | `aerospike.read.batchSize` | Нет | `"4096"` | Число строк в одном `RecordBatch` при чтении (`DoGet`) и `DoExchange` Lookup |

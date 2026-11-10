@@ -1504,8 +1504,9 @@ class ArrowBatchConverterSpec extends AnyFunSuite {
 
     val allocator = new RootAllocator(Long.MaxValue)
     try {
-      // 1. FlightCompressionHelper.normalizeCompression
+      // 1. FlightCompressionHelper.normalizeCompression & parseCompressionLevel
       assert(FlightCompressionHelper.normalizeCompression("zstd", enabled = true) == "zstd")
+      assert(FlightCompressionHelper.normalizeCompression("zstd:5", enabled = true) == "zstd")
       assert(FlightCompressionHelper.normalizeCompression("ZSTANDARD", enabled = true) == "zstd")
       assert(FlightCompressionHelper.normalizeCompression("true", enabled = true) == "zstd")
       assert(FlightCompressionHelper.normalizeCompression("lz4", enabled = true) == "lz4")
@@ -1520,20 +1521,33 @@ class ArrowBatchConverterSpec extends AnyFunSuite {
         FlightCompressionHelper.normalizeCompression("brotli", enabled = true)
       }
 
+      assert(FlightCompressionHelper.parseCompressionLevel("zstd", None) == 1)
+      assert(FlightCompressionHelper.parseCompressionLevel("zstd:6", None) == 6)
+      assert(FlightCompressionHelper.parseCompressionLevel("zstd", Some("9")) == 9)
+      assert(FlightCompressionHelper.parseCompressionLevel("zstd", Some("-3")) == -3)
+      intercept[IllegalArgumentException] {
+        FlightCompressionHelper.parseCompressionLevel("zstd", Some("99"))
+      }
+      intercept[IllegalArgumentException] {
+        FlightCompressionHelper.parseCompressionLevel("zstd", Some("not_an_int"))
+      }
+
       // 2. grpcCompressionCallOption
       assert(FlightCompressionHelper.grpcCompressionCallOption("gzip").isDefined)
       assert(FlightCompressionHelper.grpcCompressionCallOption("zstd").isEmpty)
       assert(FlightCompressionHelper.grpcCompressionCallOption("none").isEmpty)
 
-      // 3. ArrowCompressionCodecFactory & direct ZSTD / LZ4_FRAME buffer round-trip
-      val zstdCodec = ArrowCompressionCodecFactory.createCodec(CompressionUtil.CodecType.ZSTD)
+      // 3. ArrowCompressionCodecFactory & direct ZSTD (levels 1, 3, 9) / LZ4_FRAME buffer round-trip
+      val zstdCodec1 = ArrowCompressionCodecFactory.createCodec(CompressionUtil.CodecType.ZSTD)
+      val zstdCodec3 = ArrowCompressionCodecFactory.createCodec(CompressionUtil.CodecType.ZSTD, 3)
+      val zstdCodec9 = ArrowCompressionCodecFactory.createCodec(CompressionUtil.CodecType.ZSTD, 9)
       val lz4Codec = ArrowCompressionCodecFactory.createCodec(CompressionUtil.CodecType.LZ4_FRAME)
-      assert(zstdCodec.getCodecType == CompressionUtil.CodecType.ZSTD)
+      assert(zstdCodec1.getCodecType == CompressionUtil.CodecType.ZSTD)
       assert(lz4Codec.getCodecType == CompressionUtil.CodecType.LZ4_FRAME)
       assert(NoCompressionCodec.Factory.INSTANCE != null)
 
       val payloadBytes = ("aerospike-arrow-flight-high-speed-compression-test-" * 64).getBytes("UTF-8")
-      for (codec <- Seq(zstdCodec, lz4Codec)) {
+      for (codec <- Seq(zstdCodec1, zstdCodec3, zstdCodec9, lz4Codec)) {
         val rawBuf = allocator.buffer(payloadBytes.length)
         rawBuf.writeBytes(payloadBytes)
         // compress() closes rawBuf and returns compressedBuf

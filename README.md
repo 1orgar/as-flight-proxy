@@ -221,7 +221,8 @@ Data source format: `.format("aerospike-flight")`.
 | `flight.tls.clientKeyPath` | No | — | Path to client PKCS#8 private key (PEM) for mTLS |
 | `flight.tls.verifyServer` | No | `"true"` | Verify server certificate hostname and chain |
 | `flight.timeoutMs` | No | `"60000"` | Arrow Flight RPC timeout in milliseconds |
-| `flight.compression` | No | `"zstd"` | Arrow Flight stream compression (`"zstd"`, `"lz4"`, `"gzip"`, `"none"` / `"off"`) |
+| `flight.compression` | No | `"zstd"` | Arrow Flight stream compression (`"zstd"`, `"zstd:3"`, `"lz4"`, `"gzip"`, `"none"` / `"off"`) |
+| `flight.compression.level` | No | `"1"` | ZSTD compression level (`1..9` standard range, `-7..22` full ZSTD range; `1` = fastest) |
 | `flight.compression.enabled` | No | `"true"` | Master switch for client-side compression (`"false"` disables compression) |
 | `aerospike.read.numPartitions` | No | `"32"` | Number of parallel Spark partitions for reads (`1..4096`) |
 | `aerospike.read.batchSize` | No | `"4096"` | Number of rows per Arrow `RecordBatch` during `DoGet` and `DoExchange` Lookup |

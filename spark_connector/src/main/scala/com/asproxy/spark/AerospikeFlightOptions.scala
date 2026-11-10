@@ -47,6 +47,7 @@ case class AerospikeFlightOptions(
     lookupSourceView: Option[String] = None,
     lookupJoinType: String = "left",
     compression: String = "zstd",
+    compressionLevel: Int = 1,
     autoConvertStrings: Boolean = false
 ) extends Serializable {
 
@@ -55,6 +56,11 @@ case class AerospikeFlightOptions(
   require(batchSize > 0, s"'connector.batchSize' must be > 0 (got $batchSize)")
   require(writerThreads > 0, s"'connector.writerThreads' must be > 0 (got $writerThreads)")
   require(queueCapacity > 0, s"'connector.queueCapacity' must be > 0 (got $queueCapacity)")
+  require(
+    compressionLevel >= ZstdArrowCodec.MinCompressionLevel &&
+      compressionLevel <= ZstdArrowCodec.MaxCompressionLevel,
+    s"'flight.compression.level' must be between ${ZstdArrowCodec.MinCompressionLevel} and ${ZstdArrowCodec.MaxCompressionLevel} (standard range: 1..9, got $compressionLevel)"
+  )
   require(
     maxBinNameLen >= 1 && maxBinNameLen <= AerospikeSchemaValidator.AerospikeHardMaxBinNameBytes,
     s"'aerospike.maxBinNameLen' must be between 1 and ${AerospikeSchemaValidator.AerospikeHardMaxBinNameBytes} bytes (got $maxBinNameLen)"
@@ -118,6 +124,7 @@ case class AerospikeFlightOptions(
     useBatchWrite.foreach(ub => payload.put("use_batch_write", Boolean.box(ub)))
     payload.put("validate_only", Boolean.box(validateOnly))
     payload.put("compression", compression)
+    payload.put("compression_level", Int.box(compressionLevel))
     payload.put("auto_convert_strings", Boolean.box(autoConvertStrings))
     AerospikeFlightOptions.SharedMapper.writeValueAsBytes(payload)
   }
@@ -310,6 +317,13 @@ object AerospikeFlightOptions {
       .orElse(get("compression"))
       .getOrElse("zstd")
     val compression = FlightCompressionHelper.normalizeCompression(rawCompression, compressionEnabled)
+    val explicitCompressionLevel = get("flight.compression.level")
+      .orElse(get("flight.compressionLevel"))
+      .orElse(get("aerospike.flight.compression.level"))
+      .orElse(get("aerospike.flight.compressionLevel"))
+      .orElse(get("compression.level"))
+    val compressionLevel =
+      FlightCompressionHelper.parseCompressionLevel(rawCompression, explicitCompressionLevel)
 
     val autoConvertStrings = get("connector.autoConvertStrings")
       .orElse(get("connector.auto_convert_strings"))
@@ -353,6 +367,7 @@ object AerospikeFlightOptions {
       lookupSourceView = lookupSourceView,
       lookupJoinType = lookupJoinType,
       compression = compression,
+      compressionLevel = compressionLevel,
       autoConvertStrings = autoConvertStrings
     )
   }

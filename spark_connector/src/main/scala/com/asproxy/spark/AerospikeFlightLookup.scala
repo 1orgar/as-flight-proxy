@@ -269,7 +269,8 @@ object AerospikeFlightLookup extends Logging {
             FlightCompressionHelper.configureOutboundStream(
               writer,
               inputRoot,
-              options.compression
+              options.compression,
+              options.compressionLevel
             )
             batchConverter.reset()
             while (inputRows.hasNext) {

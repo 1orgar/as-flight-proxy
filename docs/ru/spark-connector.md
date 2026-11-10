@@ -62,7 +62,8 @@ pyspark \
 | `flight.username` | `aerospike.flight.username` | `""` | Логин для Arrow Flight `Handshake` |
 | `flight.password` | `aerospike.flight.password` | `""` | Пароль для Arrow Flight `Handshake` |
 | `flight.timeoutMs` | `aerospike.flight.timeout_ms` | `"60000"` | Таймаут RPC-вызовов Arrow Flight (мс) |
-| `flight.compression` | `aerospike.flight.compression`, `compression` | `"zstd"` | Алгоритм сжатия стримов Arrow Flight: `"zstd"` (по умолчанию, off-heap сжатие буферов IPC), `"lz4"` (`LZ4_FRAME`), `"gzip"` (транспортное сжатие gRPC) или `"none"` (`"off"`, `"false"`, `"disabled"`) |
+| `flight.compression` | `aerospike.flight.compression`, `compression` | `"zstd"` | Алгоритм сжатия стримов Arrow Flight: `"zstd"` (по умолчанию, off-heap сжатие буферов IPC; также поддерживает inline-запись вида `"zstd:3"`), `"lz4"` (`LZ4_FRAME`), `"gzip"` (транспортное сжатие gRPC) или `"none"` (`"off"`, `"false"`, `"disabled"`) |
+| `flight.compression.level` | `flight.compressionLevel`, `aerospike.flight.compression.level`, `compression.level` | `"1"` | Уровень сжатия ZSTD при отправке батчей из Spark: **`1..9`** — основной рабочий диапазон (`1` — максимальная скорость по умолчанию, `3` — баланс ZSTD, `9` — сильное сжатие); также поддерживаются `10..22` (ultra) и `-7..-1` (ultra-fast) |
 | `flight.compression.enabled` | `aerospike.flight.compression.enabled`, `compression.enabled` | `"true"` | Мастер-переключатель компрессии на клиенте (`"false"` полностью отключает сжатие) |
 | `flight.tls.enabled` | `aerospike.flight.tls.enabled` | `"false"` | Включить шифрование TLS (`grpc+tls://`) при подключении к прокси |
 | `flight.tls.caCertPath` | `aerospike.flight.tls.ca_cert_path` | Нет | Путь к PEM-файлу корневого сертификата CA на узлах Spark |

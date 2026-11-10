@@ -246,7 +246,8 @@ class AerospikeFlightDataWriter(
       FlightCompressionHelper.configureOutboundStream(
         streamListener,
         workerRoot,
-        options.compression
+        options.compression,
+        options.compressionLevel
       )
 
       try {

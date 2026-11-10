@@ -21,9 +21,19 @@ import org.apache.arrow.vector.compression.{
 /**
  * Off-heap ZSTD Arrow IPC buffer compression codec backed by `zstd-jni` (bundled with Apache Spark).
  * Operates directly on native `ArrowBuf.memoryAddress()` pointers with zero heap copies.
+ *
+ * Supported ZSTD compression levels:
+ *   - `1..9`: standard range (`1` = fastest / default, `3` = ZSTD default balance, `9` = high ratio)
+ *   - `10..22`: ultra compression levels (higher CPU/memory cost)
+ *   - `-7..-1`: negative fast levels (higher speed, lower ratio)
  */
-object ZstdArrowCodec extends AbstractCompressionCodec {
-  private val DefaultCompressionLevel: Int = 1
+class ZstdArrowCodec(val compressionLevel: Int = ZstdArrowCodec.DefaultCompressionLevel)
+    extends AbstractCompressionCodec {
+  require(
+    compressionLevel >= ZstdArrowCodec.MinCompressionLevel &&
+      compressionLevel <= ZstdArrowCodec.MaxCompressionLevel,
+    s"ZSTD compression level must be between ${ZstdArrowCodec.MinCompressionLevel} and ${ZstdArrowCodec.MaxCompressionLevel} (standard range: 1..9, got $compressionLevel)"
+  )
 
   override def getCodecType: CompressionUtil.CodecType = CompressionUtil.CodecType.ZSTD
 
@@ -44,12 +54,12 @@ object ZstdArrowCodec extends AbstractCompressionCodec {
       maxCompressedSize,
       srcAddr,
       uncompressedSize,
-      DefaultCompressionLevel
+      compressionLevel
     )
     if (Zstd.isError(bytesWritten)) {
       compressedBuffer.close()
       throw new RuntimeException(
-        s"Arrow IPC ZSTD compression failed: ${Zstd.getErrorName(bytesWritten)}"
+        s"Arrow IPC ZSTD compression failed (level=$compressionLevel): ${Zstd.getErrorName(bytesWritten)}"
       )
     }
 
@@ -87,6 +97,13 @@ object ZstdArrowCodec extends AbstractCompressionCodec {
     uncompressedBuffer.writerIndex(decompressedBytes)
     uncompressedBuffer
   }
+}
+
+object ZstdArrowCodec {
+  final val DefaultCompressionLevel: Int = 1
+  final val MinCompressionLevel: Int = -7
+  final val MaxCompressionLevel: Int = 22
+  lazy val DefaultInstance: ZstdArrowCodec = new ZstdArrowCodec(DefaultCompressionLevel)
 }
 
 /**
@@ -169,7 +186,7 @@ object Lz4FrameArrowCodec extends AbstractCompressionCodec {
 object ArrowCompressionCodecFactory extends CompressionCodec.Factory {
   override def createCodec(codecType: CompressionUtil.CodecType): CompressionCodec = {
     codecType match {
-      case CompressionUtil.CodecType.ZSTD      => ZstdArrowCodec
+      case CompressionUtil.CodecType.ZSTD      => ZstdArrowCodec.DefaultInstance
       case CompressionUtil.CodecType.LZ4_FRAME => Lz4FrameArrowCodec
       case _ => NoCompressionCodec.Factory.INSTANCE.createCodec(codecType)
     }
@@ -179,7 +196,11 @@ object ArrowCompressionCodecFactory extends CompressionCodec.Factory {
       codecType: CompressionUtil.CodecType,
       compressionLevel: Int
   ): CompressionCodec = {
-    createCodec(codecType)
+    codecType match {
+      case CompressionUtil.CodecType.ZSTD      => new ZstdArrowCodec(compressionLevel)
+      case CompressionUtil.CodecType.LZ4_FRAME => Lz4FrameArrowCodec
+      case _ => NoCompressionCodec.Factory.INSTANCE.createCodec(codecType)
+    }
   }
 }
 
@@ -206,12 +227,14 @@ object FlightCompressionHelper {
 
   /**
    * Normalizes user-specified compression options into `"zstd"`, `"lz4"`, `"gzip"`, or `"none"`.
+   * Also supports inline level syntax such as `"zstd:3"`.
    */
   def normalizeCompression(raw: String, enabled: Boolean = true): String = {
     if (!enabled) {
       return "none"
     }
-    raw.trim.toLowerCase(Locale.ROOT) match {
+    val base = raw.trim.toLowerCase(Locale.ROOT).split(":", 2).head.trim
+    base match {
       case "" | "none" | "off" | "false" | "disabled" | "0" => "none"
       case "zstd" | "zstandard" | "true" | "1"              => "zstd"
       case "lz4" | "lz4_frame" | "lz4-frame" | "lz4frame"   => "lz4"
@@ -221,6 +244,40 @@ object FlightCompressionHelper {
           s"Unsupported flight.compression '$other'. Expected 'zstd', 'lz4', 'gzip', or 'none'"
         )
     }
+  }
+
+  /**
+   * Parses the ZSTD compression level from an explicit `flight.compression.level` option or
+   * an inline `"zstd:<level>"` suffix, defaulting to `1` (fast).
+   * Valid range: `-7..22` (standard range: `1..9`).
+   */
+  def parseCompressionLevel(rawCompression: String, explicitLevelOpt: Option[String]): Int = {
+    val inlineLevelOpt = Option(rawCompression)
+      .map(_.trim)
+      .filter(_.contains(":"))
+      .map(_.split(":", 2)(1).trim)
+      .filter(_.nonEmpty)
+
+    val levelStrOpt = explicitLevelOpt.map(_.trim).filter(_.nonEmpty).orElse(inlineLevelOpt)
+    val level = levelStrOpt match {
+      case Some(s) =>
+        try {
+          s.toInt
+        } catch {
+          case _: NumberFormatException =>
+            throw new IllegalArgumentException(
+              s"Invalid flight.compression.level '$s'. Expected integer in ${ZstdArrowCodec.MinCompressionLevel}..${ZstdArrowCodec.MaxCompressionLevel} (standard: 1..9)"
+            )
+        }
+      case None => ZstdArrowCodec.DefaultCompressionLevel
+    }
+
+    if (level < ZstdArrowCodec.MinCompressionLevel || level > ZstdArrowCodec.MaxCompressionLevel) {
+      throw new IllegalArgumentException(
+        s"Invalid flight.compression.level '$level'. Expected integer between ${ZstdArrowCodec.MinCompressionLevel} and ${ZstdArrowCodec.MaxCompressionLevel} (standard range: 1..9)"
+      )
+    }
+    level
   }
 
   /**
@@ -260,11 +317,12 @@ object FlightCompressionHelper {
   def configureOutboundStream(
       listener: OutboundStreamListener,
       root: VectorSchemaRoot,
-      compression: String
+      compression: String,
+      compressionLevel: Int = ZstdArrowCodec.DefaultCompressionLevel
   ): Unit = {
     listener.setUseZeroCopy(true)
     val codecOpt: Option[CompressionCodec] = compression match {
-      case "zstd" => Some(ZstdArrowCodec)
+      case "zstd" => Some(new ZstdArrowCodec(compressionLevel))
       case "lz4"  => Some(Lz4FrameArrowCodec)
       case _      => None
     }
