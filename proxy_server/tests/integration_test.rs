@@ -3878,5 +3878,193 @@ fn test_auto_convert_strings_option() {
     );
 }
 
+#[tokio::test]
+async fn test_wide_300_bins_and_concurrent_raft_group_commit() {
+    use as_proxy_server::config::{FlightCompression, ServerConfig};
+
+    // 1. Build a 300-bin RecordBatch (1 PK + 300 Float64 bins) with 150 rows
+    let mut fields = Vec::with_capacity(301);
+    fields.push(Field::new("id", DataType::Int64, false));
+    for b in 0..300 {
+        fields.push(Field::new(format!("f_{b}"), DataType::Float64, true));
+    }
+    let schema = Arc::new(Schema::new(fields));
+
+    let num_rows = 150usize;
+    let mut cols: Vec<Arc<dyn Array>> = Vec::with_capacity(301);
+    let mut id_b = Int64Builder::with_capacity(num_rows);
+    for r in 0..num_rows {
+        id_b.append_value(r as i64);
+    }
+    cols.push(Arc::new(id_b.finish()));
+
+    for b in 0..300 {
+        let mut fb = Float64Builder::with_capacity(num_rows);
+        for r in 0..num_rows {
+            if b == 299 && r % 50 == 0 {
+                fb.append_null();
+            } else {
+                fb.append_value((r * 1000 + b) as f64 * 0.5);
+            }
+        }
+        cols.push(Arc::new(fb.finish()));
+    }
+    let wide_300_batch = RecordBatch::try_new(Arc::clone(&schema), cols).unwrap();
+
+    // 2. Spin up a 2-node Raft cluster (1 Leader + 1 Follower) and stream multi-batch DoPut concurrently to the Follower
+    let rl1 = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let r_addr1 = rl1.local_addr().unwrap().to_string();
+    drop(rl1);
+    let rl2 = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let r_addr2 = rl2.local_addr().unwrap().to_string();
+    drop(rl2);
+
+    let fl1 = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let f_addr1 = fl1.local_addr().unwrap().to_string();
+    let fl2 = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let f_addr2 = fl2.local_addr().unwrap().to_string();
+
+    let peers = vec![
+        RaftPeer {
+            node_id: 1,
+            raft_addr: r_addr1.clone(),
+            flight_addr: f_addr1.clone(),
+        },
+        RaftPeer {
+            node_id: 2,
+            raft_addr: r_addr2.clone(),
+            flight_addr: f_addr2.clone(),
+        },
+    ];
+
+    let sink = Arc::new(MockAerospikeSink::new(HashMap::new(), HashMap::new()));
+
+    let r1 = RaftNode::new(RaftConfig {
+        enabled: true,
+        node_id: 1,
+        listen_addr: r_addr1,
+        election_timeout_min_ms: 80,
+        election_timeout_max_ms: 140,
+        heartbeat_interval_ms: 30,
+        job_stats_ttl_secs: 3600,
+        peers: peers.clone(),
+    });
+    r1.start().await.unwrap();
+
+    let r2 = RaftNode::new(RaftConfig {
+        enabled: true,
+        node_id: 2,
+        listen_addr: r_addr2,
+        election_timeout_min_ms: 250,
+        election_timeout_max_ms: 400,
+        heartbeat_interval_ms: 30,
+        job_stats_ttl_secs: 3600,
+        peers,
+    });
+    r2.start().await.unwrap();
+
+    for (fl, r_node) in [(fl1, Arc::clone(&r1)), (fl2, Arc::clone(&r2))] {
+        let m = ProxyMetrics::new();
+        let eng = Arc::new(MppWriteEngine::new(
+            sink.clone(),
+            WriterConfig {
+                use_batch_write: true,
+                batch_write_size: 512,
+                max_in_flight_records: 4096,
+                max_concurrent_subbatches_per_stream: 4,
+            },
+            RetryConfig::default(),
+            m.clone(),
+        ));
+        let auth = Arc::new(Authenticator::new(AuthConfig {
+            enabled: false,
+            ..AuthConfig::default()
+        }));
+        let svc = ProxyFlightService::new(auth, eng, m, 64)
+            .with_raft_node(r_node)
+            .into_server(&ServerConfig::default());
+        tokio::spawn(async move {
+            Server::builder()
+                .add_service(svc)
+                .serve_with_incoming(TcpListenerStream::new(fl))
+                .await
+                .unwrap();
+        });
+    }
+
+    // Wait for leader election
+    for _ in 0..40 {
+        if r1.get_cluster_snapshot().await.role == RaftRole::Leader
+            || r2.get_cluster_snapshot().await.role == RaftRole::Leader
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(40)).await;
+    }
+
+    // Pick Follower's Flight address so concurrent proposals exercise Follower ProposeBatch forwarding!
+    let follower_flight_addr = if r2.get_cluster_snapshot().await.role == RaftRole::Follower {
+        f_addr2.clone()
+    } else {
+        f_addr1.clone()
+    };
+
+    // Launch 6 concurrent multi-batch DoPut streams (each sending 2 batches of 75 rows x 300 bins)
+    let mut stream_handles = Vec::new();
+    for s in 0..6 {
+        let addr = follower_flight_addr.clone();
+        let sc = Arc::clone(&schema);
+        let b1 = wide_300_batch.slice(0, 75);
+        let b2 = wide_300_batch.slice(75, 75);
+        stream_handles.push(tokio::spawn(async move {
+            let ch = tonic::transport::Endpoint::from_shared(format!("http://{addr}"))
+                .unwrap()
+                .connect()
+                .await
+                .unwrap();
+            let mut client = FlightServiceClient::new(ch);
+            let wp = WriteParameters {
+                job_id: Some("wide-300-job".into()),
+                namespace: "ns".into(),
+                set_name: "wide300".into(),
+                key_column: "id".into(),
+                write_mode: WriteMode::Replace,
+                ttl_seconds: None,
+                send_key: true,
+                ignore_nulls: false,
+                use_batch_write: Some(true),
+                validate_only: false,
+                compression: Some(FlightCompression::None),
+                auto_convert_strings: false,
+            };
+            let desc = FlightDescriptor::new_cmd(serde_json::to_vec(&wp).unwrap());
+            let stream = FlightDataEncoderBuilder::new()
+                .with_schema(sc)
+                .with_flight_descriptor(Some(desc))
+                .build(stream::iter(vec![Ok(b1), Ok(b2)]))
+                .map(|r| r.unwrap());
+            let mut resp = client.do_put(Request::new(stream)).await.unwrap().into_inner();
+            let mut ack_count = 0;
+            while let Some(msg) = resp.try_next().await.unwrap() {
+                let ack: PutBatchAck = serde_json::from_slice(&msg.app_metadata).unwrap();
+                assert_eq!(ack.rows_written, 75);
+                ack_count += 1;
+            }
+            assert_eq!(ack_count, 2, "stream {s} must receive 2 PutResult ACKs");
+        }));
+    }
+
+    for h in stream_handles {
+        h.await.unwrap();
+    }
+
+    let status = r1.get_job_status("wide-300-job").await.unwrap();
+    assert_eq!(status.total_rows_written, 6 * 150);
+    assert_eq!(status.total_batches_processed, 12);
+
+    r1.shutdown();
+    r2.shutdown();
+}
+
 
 

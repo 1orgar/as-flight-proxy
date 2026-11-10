@@ -26,12 +26,12 @@
 
 ## 1. Подключение Fat-JAR в Spark и PySpark
 
-Используйте собранный Fat-JAR `spark-aerospike-flight-connector-assembly-0.4.0.jar` с **Apache Spark 3.5.x** (Scala 2.12, Java 11/17):
+Используйте собранный Fat-JAR `spark-aerospike-flight-connector-assembly-0.4.2.jar` с **Apache Spark 3.5.x** (Scala 2.12, Java 11/17):
 
 ```bash
 # Запуск PySpark или spark-submit
 pyspark \
-  --jars /path/to/spark-aerospike-flight-connector-assembly-0.4.0.jar \
+  --jars /path/to/spark-aerospike-flight-connector-assembly-0.4.2.jar \
   --conf "spark.driver.extraJavaOptions=--add-opens=java.base/java.nio=ALL-UNNAMED" \
   --conf "spark.executor.extraJavaOptions=--add-opens=java.base/java.nio=ALL-UNNAMED"
 ```

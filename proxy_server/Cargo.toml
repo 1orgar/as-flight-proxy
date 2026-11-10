@@ -1,6 +1,6 @@
 [package]
 name = "as_proxy_server"
-version = "0.4.0"
+version = "0.4.2"
 edition = "2024"
 rust-version = "1.88"
 description = "High-performance Arrow Flight to Aerospike 8+ MPP Proxy Server"

@@ -357,6 +357,38 @@ impl FlightService for ProxyFlightService {
                             }
                         };
 
+                        total_stream_rows += stats.rows_written + stats.rows_validated;
+                        let ack = PutBatchAck {
+                            batch_index,
+                            rows_written: stats.rows_written,
+                            overload_retries: stats.overload_retries,
+                            other_retries: stats.other_retries,
+                            node_id,
+                            rows_validated: stats.rows_validated,
+                            matched_rows: stats.matched_rows,
+                            mismatched_rows: stats.mismatched_rows,
+                            missing_keys: stats.missing_keys,
+                            bin_mismatch_rows: stats.bin_mismatch_rows,
+                        };
+                        let is_first_batch = batch_index == 0;
+                        batch_index += 1;
+
+                        let ack_bytes = serde_json::to_vec(&ack).unwrap_or_default();
+
+                        // For subsequent batches in a multi-batch stream, send the PutResult ACK to Spark immediately
+                        // so the client can pipeline the next batch without waiting on the Raft round-trip.
+                        if !is_first_batch {
+                            if tx
+                                .send(Ok(PutResult {
+                                    app_metadata: Bytes::from(ack_bytes.clone()),
+                                }))
+                                .await
+                                .is_err()
+                            {
+                                return;
+                            }
+                        }
+
                         // Replicate job batch progress across the proxy cluster via Raft
                         if let (Some(raft), Some(job_id)) = (&raft_node, &params.job_id) {
                             let _ = raft
@@ -380,31 +412,17 @@ impl FlightService for ProxyFlightService {
                                 .await;
                         }
 
-                        total_stream_rows += stats.rows_written + stats.rows_validated;
-                        let ack = PutBatchAck {
-                            batch_index,
-                            rows_written: stats.rows_written,
-                            overload_retries: stats.overload_retries,
-                            other_retries: stats.other_retries,
-                            node_id,
-                            rows_validated: stats.rows_validated,
-                            matched_rows: stats.matched_rows,
-                            mismatched_rows: stats.mismatched_rows,
-                            missing_keys: stats.missing_keys,
-                            bin_mismatch_rows: stats.bin_mismatch_rows,
-                        };
-                        batch_index += 1;
-
-                        let ack_bytes = serde_json::to_vec(&ack).unwrap_or_default();
-                        if tx
-                            .send(Ok(PutResult {
-                                app_metadata: Bytes::from(ack_bytes),
-                            }))
-                            .await
-                            .is_err()
-                        {
-                            // Client closed stream early
-                            return;
+                        if is_first_batch {
+                            if tx
+                                .send(Ok(PutResult {
+                                    app_metadata: Bytes::from(ack_bytes),
+                                }))
+                                .await
+                                .is_err()
+                            {
+                                // Client closed stream early
+                                return;
+                            }
                         }
                     }
                 }

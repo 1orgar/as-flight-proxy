@@ -26,12 +26,12 @@
 
 ## 1. Installation & Spark Submit
 
-Use the shaded assembly Fat-JAR `spark-aerospike-flight-connector-assembly-0.4.0.jar` with **Apache Spark 3.5.x** (Scala 2.12, Java 11/17):
+Use the shaded assembly Fat-JAR `spark-aerospike-flight-connector-assembly-0.4.2.jar` with **Apache Spark 3.5.x** (Scala 2.12, Java 11/17):
 
 ```bash
 # PySpark shell or spark-submit
 pyspark \
-  --jars /path/to/spark-aerospike-flight-connector-assembly-0.4.0.jar \
+  --jars /path/to/spark-aerospike-flight-connector-assembly-0.4.2.jar \
   --conf "spark.driver.extraJavaOptions=--add-opens=java.base/java.nio=ALL-UNNAMED" \
   --conf "spark.executor.extraJavaOptions=--add-opens=java.base/java.nio=ALL-UNNAMED"
 ```

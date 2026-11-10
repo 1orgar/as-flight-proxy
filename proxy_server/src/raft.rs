@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{Mutex, RwLock, watch};
+use tokio::sync::{Mutex, RwLock, oneshot, watch};
 use tracing::{debug, info, warn};
 
 use crate::config::RaftConfig;
@@ -347,6 +347,9 @@ enum RaftRpcRequest {
     Propose {
         command: MetadataCommand,
     },
+    ProposeBatch {
+        commands: Vec<MetadataCommand>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -421,6 +424,9 @@ impl RaftVolatileCore {
 pub struct RaftNode {
     config: RaftConfig,
     core: Mutex<RaftVolatileCore>,
+    replication_lock: Mutex<()>,
+    forward_lock: Mutex<()>,
+    pending_forwards: Mutex<Vec<(MetadataCommand, oneshot::Sender<bool>)>>,
     state_machine: RwLock<ClusterMetadataState>,
     shutdown_tx: watch::Sender<bool>,
 }
@@ -437,6 +443,9 @@ impl RaftNode {
         Arc::new(Self {
             config,
             core: Mutex::new(core),
+            replication_lock: Mutex::new(()),
+            forward_lock: Mutex::new(()),
+            pending_forwards: Mutex::new(Vec::new()),
             state_machine: RwLock::new(ClusterMetadataState::default()),
             shutdown_tx,
         })
@@ -567,8 +576,8 @@ impl RaftNode {
     }
 
     /// Propose a metadata command to the Raft cluster.
-    /// - If this node is the Leader, appends to log, replicates to peers, and applies once committed.
-    /// - If this node is a Follower, forwards the command to the current Leader over the Raft port.
+    /// - If this node is the Leader, appends to log, replicates to peers (using group commit), and applies once committed.
+    /// - If this node is a Follower, batches concurrent proposals and forwards them to the current Leader over the Raft port.
     pub async fn propose(self: &Arc<Self>, command: MetadataCommand) -> Result<()> {
         if !self.config.enabled {
             self.state_machine.write().await.apply(&command);
@@ -582,19 +591,50 @@ impl RaftNode {
             };
 
             if role == RaftRole::Leader {
-                return self.append_and_replicate_as_leader(command).await;
+                return self
+                    .append_and_replicate_batch_as_leader(vec![command])
+                    .await;
             }
 
             if let Some(lid) = leader_id {
                 if let Some(peer) = self.config.peers.iter().find(|p| p.node_id == lid) {
-                    let req = RaftRpcRequest::Propose {
-                        command: command.clone(),
-                    };
-                    if let Ok(RaftRpcResponse::Propose {
-                        success: true, ..
-                    }) = send_rpc(&peer.raft_addr, &req, 1500).await
-                    {
-                        return Ok(());
+                    let (tx, mut rx) = oneshot::channel();
+                    self.pending_forwards
+                        .lock()
+                        .await
+                        .push((command.clone(), tx));
+
+                    let _fwd_guard = self.forward_lock.lock().await;
+                    if let Ok(done) = rx.try_recv() {
+                        if done {
+                            return Ok(());
+                        }
+                    } else {
+                        let batch: Vec<(MetadataCommand, oneshot::Sender<bool>)> = {
+                            let mut q = self.pending_forwards.lock().await;
+                            std::mem::take(&mut *q)
+                        };
+                        if !batch.is_empty() {
+                            let commands: Vec<MetadataCommand> =
+                                batch.iter().map(|(c, _)| c.clone()).collect();
+                            let req = if commands.len() == 1 {
+                                RaftRpcRequest::Propose {
+                                    command: commands.into_iter().next().unwrap(),
+                                }
+                            } else {
+                                RaftRpcRequest::ProposeBatch { commands }
+                            };
+                            let ok = matches!(
+                                send_rpc(&peer.raft_addr, &req, 1500).await,
+                                Ok(RaftRpcResponse::Propose { success: true, .. })
+                            );
+                            for (_, sender) in batch {
+                                let _ = sender.send(ok);
+                            }
+                            if ok {
+                                return Ok(());
+                            }
+                        }
                     }
                 }
             }
@@ -649,10 +689,18 @@ impl RaftNode {
         }
     }
 
-    async fn append_and_replicate_as_leader(
+    async fn append_and_replicate_batch_as_leader(
         self: &Arc<Self>,
-        command: MetadataCommand,
+        commands: Vec<MetadataCommand>,
     ) -> Result<()> {
+        if commands.is_empty() {
+            return Ok(());
+        }
+
+        let needs_immediate_follower_commit = commands
+            .iter()
+            .any(|c| !matches!(c, MetadataCommand::RecordJobBatch { .. }));
+
         let remote_peers: Vec<_> = self
             .config
             .peers
@@ -666,18 +714,20 @@ impl RaftNode {
             if core.role != RaftRole::Leader {
                 return Err(ProxyError::Internal("Node stepped down from Leader".into()));
             }
-            let next_idx = core.log.len() as u64 + 1;
             let term = core.current_term;
-            core.log.push(LogEntry {
-                index: next_idx,
-                term,
-                command,
-            });
-
-            if remote_peers.is_empty() {
-                core.commit_index = next_idx;
+            for command in commands {
+                let next_idx = core.log.len() as u64 + 1;
+                core.log.push(LogEntry {
+                    index: next_idx,
+                    term,
+                    command,
+                });
             }
-            next_idx
+            let last_idx = core.log.len() as u64;
+            if remote_peers.is_empty() {
+                core.commit_index = last_idx;
+            }
+            last_idx
         };
 
         if remote_peers.is_empty() {
@@ -685,14 +735,19 @@ impl RaftNode {
             return Ok(());
         }
 
-        self.replicate_to_peers().await;
+        // Group commit: serialize peer replication so concurrent proposals are replicated together
+        let _rep_guard = self.replication_lock.lock().await;
+        let already_committed = self.core.lock().await.commit_index >= entry_index;
+        if !already_committed {
+            self.replicate_to_peers_unlocked().await;
+        }
         self.apply_committed_entries().await;
 
         let committed = self.core.lock().await.commit_index >= entry_index;
-        if committed {
-            // Propagate the updated leader_commit index to followers so follower reads are immediately consistent
-            self.replicate_to_peers().await;
-        } else {
+        if committed && needs_immediate_follower_commit {
+            // Propagate the updated leader_commit index to followers so follower reads after SetJobState/ResetJob are immediately consistent
+            self.replicate_to_peers_unlocked().await;
+        } else if !committed {
             debug!(
                 node_id = self.config.node_id,
                 entry_index, "Entry appended; waiting for async heartbeat replication"
@@ -841,6 +896,11 @@ impl RaftNode {
     }
 
     async fn replicate_to_peers(self: &Arc<Self>) {
+        let _rep_guard = self.replication_lock.lock().await;
+        self.replicate_to_peers_unlocked().await;
+    }
+
+    async fn replicate_to_peers_unlocked(self: &Arc<Self>) {
         let remote_peers: Vec<_> = self
             .config
             .peers
@@ -874,7 +934,7 @@ impl RaftNode {
                 let prev_log_term = core.term_at(prev_log_index).unwrap_or(0);
                 let entries: Vec<LogEntry> = if (next_idx as usize) <= core.log.len() {
                     let start_idx = next_idx as usize - 1;
-                    let end_idx = (start_idx + 128).min(core.log.len());
+                    let end_idx = (start_idx + 1024).min(core.log.len());
                     core.log[start_idx..end_idx].to_vec()
                 } else {
                     Vec::new()
@@ -918,8 +978,11 @@ impl RaftNode {
                     return;
                 }
                 if success {
-                    core.match_index.insert(peer_id, match_index);
-                    core.next_index.insert(peer_id, match_index + 1);
+                    let prev_match = core.match_index.get(&peer_id).copied().unwrap_or(0);
+                    if match_index >= prev_match {
+                        core.match_index.insert(peer_id, match_index);
+                        core.next_index.insert(peer_id, match_index + 1);
+                    }
                 } else {
                     let fallback = attempted_next_idx.saturating_sub(1).max(1);
                     let fast_backtrack = (match_index + 1).min(fallback).max(1);
@@ -1123,7 +1186,34 @@ impl RaftNode {
                     (core.role, core.leader_id)
                 };
                 if role == RaftRole::Leader {
-                    match self.append_and_replicate_as_leader(command).await {
+                    match self.append_and_replicate_batch_as_leader(vec![command]).await {
+                        Ok(()) => RaftRpcResponse::Propose {
+                            success: true,
+                            leader_id: Some(self.config.node_id),
+                            error: None,
+                        },
+                        Err(e) => RaftRpcResponse::Propose {
+                            success: false,
+                            leader_id,
+                            error: Some(e.to_string()),
+                        },
+                    }
+                } else {
+                    RaftRpcResponse::Propose {
+                        success: false,
+                        leader_id,
+                        error: Some("Not Leader".to_string()),
+                    }
+                }
+            }
+
+            RaftRpcRequest::ProposeBatch { commands } => {
+                let (role, leader_id) = {
+                    let core = self.core.lock().await;
+                    (core.role, core.leader_id)
+                };
+                if role == RaftRole::Leader {
+                    match self.append_and_replicate_batch_as_leader(commands).await {
                         Ok(()) => RaftRpcResponse::Propose {
                             success: true,
                             leader_id: Some(self.config.node_id),

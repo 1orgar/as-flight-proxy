@@ -47,6 +47,371 @@ pub struct PreparedRecord {
     pub bins: Vec<Bin>,
 }
 
+/// Pre-compiled primary key extractor that resolves Arrow `DataType` and downcasts once per `RecordBatch`
+/// instead of once per row.
+enum CompiledKeyColumn<'a> {
+    Utf8(&'a StringArray),
+    LargeUtf8(&'a LargeStringArray),
+    Utf8View(&'a StringViewArray),
+    Int8(&'a [i8]),
+    Int16(&'a [i16]),
+    Int32(&'a [i32]),
+    Int64(&'a [i64]),
+    UInt8(&'a [u8]),
+    UInt16(&'a [u16]),
+    UInt32(&'a [u32]),
+    UInt64(&'a [u64]),
+    Binary(&'a BinaryArray),
+    LargeBinary(&'a LargeBinaryArray),
+    FixedSizeBinary(&'a FixedSizeBinaryArray),
+    BinaryView(&'a BinaryViewArray),
+}
+
+impl<'a> CompiledKeyColumn<'a> {
+    fn compile(array: &'a dyn Array, col_name: &str) -> Result<Self> {
+        match array.data_type() {
+            DataType::Utf8 => Ok(Self::Utf8(
+                array
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .ok_or_else(|| ProxyError::Conversion("Failed to downcast Utf8 key".into()))?,
+            )),
+            DataType::LargeUtf8 => Ok(Self::LargeUtf8(
+                array
+                    .as_any()
+                    .downcast_ref::<LargeStringArray>()
+                    .ok_or_else(|| {
+                        ProxyError::Conversion("Failed to downcast LargeUtf8 key".into())
+                    })?,
+            )),
+            DataType::Utf8View => Ok(Self::Utf8View(
+                array
+                    .as_any()
+                    .downcast_ref::<StringViewArray>()
+                    .ok_or_else(|| {
+                        ProxyError::Conversion("Failed to downcast Utf8View key".into())
+                    })?,
+            )),
+            DataType::Int8 => Ok(Self::Int8(array.as_primitive::<Int8Type>().values())),
+            DataType::Int16 => Ok(Self::Int16(array.as_primitive::<Int16Type>().values())),
+            DataType::Int32 => Ok(Self::Int32(array.as_primitive::<Int32Type>().values())),
+            DataType::Int64 => Ok(Self::Int64(array.as_primitive::<Int64Type>().values())),
+            DataType::UInt8 => Ok(Self::UInt8(array.as_primitive::<UInt8Type>().values())),
+            DataType::UInt16 => Ok(Self::UInt16(array.as_primitive::<UInt16Type>().values())),
+            DataType::UInt32 => Ok(Self::UInt32(array.as_primitive::<UInt32Type>().values())),
+            DataType::UInt64 => Ok(Self::UInt64(array.as_primitive::<UInt64Type>().values())),
+            DataType::Binary => Ok(Self::Binary(
+                array
+                    .as_any()
+                    .downcast_ref::<BinaryArray>()
+                    .ok_or_else(|| ProxyError::Conversion("Failed to downcast Binary key".into()))?,
+            )),
+            DataType::LargeBinary => Ok(Self::LargeBinary(
+                array
+                    .as_any()
+                    .downcast_ref::<LargeBinaryArray>()
+                    .ok_or_else(|| {
+                        ProxyError::Conversion("Failed to downcast LargeBinary key".into())
+                    })?,
+            )),
+            DataType::FixedSizeBinary(_) => Ok(Self::FixedSizeBinary(
+                array
+                    .as_any()
+                    .downcast_ref::<FixedSizeBinaryArray>()
+                    .ok_or_else(|| {
+                        ProxyError::Conversion("Failed to downcast FixedSizeBinary key".into())
+                    })?,
+            )),
+            DataType::BinaryView => Ok(Self::BinaryView(
+                array
+                    .as_any()
+                    .downcast_ref::<BinaryViewArray>()
+                    .ok_or_else(|| {
+                        ProxyError::Conversion("Failed to downcast BinaryView key".into())
+                    })?,
+            )),
+            other => Err(ProxyError::InvalidArgument(format!(
+                "Unsupported primary key data type {:?} for column '{}'. Supported: String, Int8..64, UInt8..64, Binary",
+                other, col_name
+            ))),
+        }
+    }
+
+    #[inline]
+    fn extract(&self, row: usize) -> Result<Value> {
+        match self {
+            Self::Utf8(arr) => Ok(Value::String(arr.value(row).to_string())),
+            Self::LargeUtf8(arr) => Ok(Value::String(arr.value(row).to_string())),
+            Self::Utf8View(arr) => Ok(Value::String(arr.value(row).to_string())),
+            Self::Int8(vals) => Ok(Value::Int(i64::from(vals[row]))),
+            Self::Int16(vals) => Ok(Value::Int(i64::from(vals[row]))),
+            Self::Int32(vals) => Ok(Value::Int(i64::from(vals[row]))),
+            Self::Int64(vals) => Ok(Value::Int(vals[row])),
+            Self::UInt8(vals) => Ok(Value::Int(i64::from(vals[row]))),
+            Self::UInt16(vals) => Ok(Value::Int(i64::from(vals[row]))),
+            Self::UInt32(vals) => Ok(Value::Int(i64::from(vals[row]))),
+            Self::UInt64(vals) => {
+                let v = vals[row];
+                let signed = i64::try_from(v).map_err(|_| {
+                    ProxyError::Conversion(format!(
+                        "UInt64 key value {v} at row {row} overflows i64"
+                    ))
+                })?;
+                Ok(Value::Int(signed))
+            }
+            Self::Binary(arr) => Ok(Value::Blob(arr.value(row).to_vec())),
+            Self::LargeBinary(arr) => Ok(Value::Blob(arr.value(row).to_vec())),
+            Self::FixedSizeBinary(arr) => Ok(Value::Blob(arr.value(row).to_vec())),
+            Self::BinaryView(arr) => Ok(Value::Blob(arr.value(row).to_vec())),
+        }
+    }
+}
+
+/// Pre-compiled bin column extractor that resolves Arrow `DataType`, typed value slices, and null buffers
+/// once per `RecordBatch` so wide tables (100–300+ bins) avoid per-cell `DataType` matching and `Any` downcasting.
+enum CompiledValueExtractor<'a> {
+    Null,
+    Boolean(&'a arrow_array::BooleanArray),
+    Int8(&'a [i8]),
+    Int16(&'a [i16]),
+    Int32(&'a [i32]),
+    Int64(&'a [i64]),
+    UInt8(&'a [u8]),
+    UInt16(&'a [u16]),
+    UInt32(&'a [u32]),
+    UInt64(&'a [u64]),
+    Float32(&'a [f32]),
+    Float64(&'a [f64]),
+    Date32(&'a [i32]),
+    Date64(&'a [i64]),
+    TimestampSecond(&'a [i64]),
+    TimestampMillisecond(&'a [i64]),
+    TimestampMicrosecond(&'a [i64]),
+    TimestampNanosecond(&'a [i64]),
+    Utf8(&'a StringArray, bool),
+    LargeUtf8(&'a LargeStringArray, bool),
+    Utf8View(&'a StringViewArray, bool),
+    Binary(&'a BinaryArray),
+    LargeBinary(&'a LargeBinaryArray),
+    FixedSizeBinary(&'a FixedSizeBinaryArray),
+    BinaryView(&'a BinaryViewArray),
+    Decimal128(&'a Decimal128Array),
+    Decimal256(&'a Decimal256Array),
+    Fallback(&'a dyn Array, bool, bool),
+}
+
+struct CompiledBinColumn<'a> {
+    name: String,
+    nulls: Option<&'a NullBuffer>,
+    extractor: CompiledValueExtractor<'a>,
+}
+
+impl<'a> CompiledBinColumn<'a> {
+    fn compile(
+        name: String,
+        array: &'a dyn Array,
+        ignore_nulls: bool,
+        auto_convert_strings: bool,
+    ) -> Result<Self> {
+        let nulls = if array.null_count() == 0 {
+            None
+        } else {
+            array.nulls()
+        };
+        let extractor = match array.data_type() {
+            DataType::Null => CompiledValueExtractor::Null,
+            DataType::Boolean => CompiledValueExtractor::Boolean(array.as_boolean()),
+            DataType::Int8 => {
+                CompiledValueExtractor::Int8(array.as_primitive::<Int8Type>().values())
+            }
+            DataType::Int16 => {
+                CompiledValueExtractor::Int16(array.as_primitive::<Int16Type>().values())
+            }
+            DataType::Int32 => {
+                CompiledValueExtractor::Int32(array.as_primitive::<Int32Type>().values())
+            }
+            DataType::Int64 => {
+                CompiledValueExtractor::Int64(array.as_primitive::<Int64Type>().values())
+            }
+            DataType::UInt8 => {
+                CompiledValueExtractor::UInt8(array.as_primitive::<UInt8Type>().values())
+            }
+            DataType::UInt16 => {
+                CompiledValueExtractor::UInt16(array.as_primitive::<UInt16Type>().values())
+            }
+            DataType::UInt32 => {
+                CompiledValueExtractor::UInt32(array.as_primitive::<UInt32Type>().values())
+            }
+            DataType::UInt64 => {
+                CompiledValueExtractor::UInt64(array.as_primitive::<UInt64Type>().values())
+            }
+            DataType::Float32 => {
+                CompiledValueExtractor::Float32(array.as_primitive::<Float32Type>().values())
+            }
+            DataType::Float64 => {
+                CompiledValueExtractor::Float64(array.as_primitive::<Float64Type>().values())
+            }
+            DataType::Date32 => {
+                CompiledValueExtractor::Date32(array.as_primitive::<Date32Type>().values())
+            }
+            DataType::Date64 => {
+                CompiledValueExtractor::Date64(array.as_primitive::<Date64Type>().values())
+            }
+            DataType::Timestamp(TimeUnit::Second, _) => CompiledValueExtractor::TimestampSecond(
+                array.as_primitive::<TimestampSecondType>().values(),
+            ),
+            DataType::Timestamp(TimeUnit::Millisecond, _) => {
+                CompiledValueExtractor::TimestampMillisecond(
+                    array.as_primitive::<TimestampMillisecondType>().values(),
+                )
+            }
+            DataType::Timestamp(TimeUnit::Microsecond, _) => {
+                CompiledValueExtractor::TimestampMicrosecond(
+                    array.as_primitive::<TimestampMicrosecondType>().values(),
+                )
+            }
+            DataType::Timestamp(TimeUnit::Nanosecond, _) => {
+                CompiledValueExtractor::TimestampNanosecond(
+                    array.as_primitive::<TimestampNanosecondType>().values(),
+                )
+            }
+            DataType::Utf8 => CompiledValueExtractor::Utf8(
+                array
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .ok_or_else(|| ProxyError::Conversion("Failed to downcast Utf8".into()))?,
+                auto_convert_strings,
+            ),
+            DataType::LargeUtf8 => CompiledValueExtractor::LargeUtf8(
+                array
+                    .as_any()
+                    .downcast_ref::<LargeStringArray>()
+                    .ok_or_else(|| ProxyError::Conversion("Failed to downcast LargeUtf8".into()))?,
+                auto_convert_strings,
+            ),
+            DataType::Utf8View => CompiledValueExtractor::Utf8View(
+                array
+                    .as_any()
+                    .downcast_ref::<StringViewArray>()
+                    .ok_or_else(|| ProxyError::Conversion("Failed to downcast Utf8View".into()))?,
+                auto_convert_strings,
+            ),
+            DataType::Binary => CompiledValueExtractor::Binary(
+                array
+                    .as_any()
+                    .downcast_ref::<BinaryArray>()
+                    .ok_or_else(|| ProxyError::Conversion("Failed to downcast Binary".into()))?,
+            ),
+            DataType::LargeBinary => CompiledValueExtractor::LargeBinary(
+                array
+                    .as_any()
+                    .downcast_ref::<LargeBinaryArray>()
+                    .ok_or_else(|| {
+                        ProxyError::Conversion("Failed to downcast LargeBinary".into())
+                    })?,
+            ),
+            DataType::FixedSizeBinary(_) => CompiledValueExtractor::FixedSizeBinary(
+                array
+                    .as_any()
+                    .downcast_ref::<FixedSizeBinaryArray>()
+                    .ok_or_else(|| {
+                        ProxyError::Conversion("Failed to downcast FixedSizeBinary".into())
+                    })?,
+            ),
+            DataType::BinaryView => CompiledValueExtractor::BinaryView(
+                array
+                    .as_any()
+                    .downcast_ref::<BinaryViewArray>()
+                    .ok_or_else(|| {
+                        ProxyError::Conversion("Failed to downcast BinaryView".into())
+                    })?,
+            ),
+            DataType::Decimal128(_, _) => CompiledValueExtractor::Decimal128(
+                array
+                    .as_any()
+                    .downcast_ref::<Decimal128Array>()
+                    .ok_or_else(|| {
+                        ProxyError::Conversion("Failed to downcast Decimal128".into())
+                    })?,
+            ),
+            DataType::Decimal256(_, _) => CompiledValueExtractor::Decimal256(
+                array
+                    .as_any()
+                    .downcast_ref::<Decimal256Array>()
+                    .ok_or_else(|| {
+                        ProxyError::Conversion("Failed to downcast Decimal256".into())
+                    })?,
+            ),
+            _ => CompiledValueExtractor::Fallback(array, ignore_nulls, auto_convert_strings),
+        };
+        Ok(Self {
+            name,
+            nulls,
+            extractor,
+        })
+    }
+
+    #[inline]
+    fn is_null(&self, row: usize) -> bool {
+        matches!(self.extractor, CompiledValueExtractor::Null)
+            || self.nulls.is_some_and(|n| n.is_null(row))
+    }
+
+    #[inline]
+    fn extract_non_null(&self, row: usize) -> Result<Value> {
+        match self.extractor {
+            CompiledValueExtractor::Null => Ok(Value::Nil),
+            CompiledValueExtractor::Boolean(arr) => Ok(Value::Bool(arr.value(row))),
+            CompiledValueExtractor::Int8(vals) => Ok(Value::Int(i64::from(vals[row]))),
+            CompiledValueExtractor::Int16(vals) => Ok(Value::Int(i64::from(vals[row]))),
+            CompiledValueExtractor::Int32(vals) => Ok(Value::Int(i64::from(vals[row]))),
+            CompiledValueExtractor::Int64(vals) => Ok(Value::Int(vals[row])),
+            CompiledValueExtractor::UInt8(vals) => Ok(Value::Int(i64::from(vals[row]))),
+            CompiledValueExtractor::UInt16(vals) => Ok(Value::Int(i64::from(vals[row]))),
+            CompiledValueExtractor::UInt32(vals) => Ok(Value::Int(i64::from(vals[row]))),
+            CompiledValueExtractor::UInt64(vals) => Ok(Value::Int(vals[row] as i64)),
+            CompiledValueExtractor::Float32(vals) => {
+                Ok(Value::Float(FloatValue::from(f64::from(vals[row]))))
+            }
+            CompiledValueExtractor::Float64(vals) => Ok(Value::Float(FloatValue::from(vals[row]))),
+            CompiledValueExtractor::Date32(vals) => Ok(Value::Int(
+                i64::from(vals[row]).saturating_mul(MILLIS_PER_DAY),
+            )),
+            CompiledValueExtractor::Date64(vals) => Ok(Value::Int(vals[row])),
+            CompiledValueExtractor::TimestampSecond(vals) => {
+                Ok(Value::Int(vals[row].saturating_mul(1_000)))
+            }
+            CompiledValueExtractor::TimestampMillisecond(vals) => Ok(Value::Int(vals[row])),
+            CompiledValueExtractor::TimestampMicrosecond(vals) => {
+                Ok(Value::Int(vals[row].div_euclid(1_000)))
+            }
+            CompiledValueExtractor::TimestampNanosecond(vals) => {
+                Ok(Value::Int(vals[row].div_euclid(1_000_000)))
+            }
+            CompiledValueExtractor::Utf8(arr, auto_conv) => {
+                Ok(parse_string_auto(arr.value(row), auto_conv))
+            }
+            CompiledValueExtractor::LargeUtf8(arr, auto_conv) => {
+                Ok(parse_string_auto(arr.value(row), auto_conv))
+            }
+            CompiledValueExtractor::Utf8View(arr, auto_conv) => {
+                Ok(parse_string_auto(arr.value(row), auto_conv))
+            }
+            CompiledValueExtractor::Binary(arr) => Ok(Value::Blob(arr.value(row).to_vec())),
+            CompiledValueExtractor::LargeBinary(arr) => Ok(Value::Blob(arr.value(row).to_vec())),
+            CompiledValueExtractor::FixedSizeBinary(arr) => {
+                Ok(Value::Blob(arr.value(row).to_vec()))
+            }
+            CompiledValueExtractor::BinaryView(arr) => Ok(Value::Blob(arr.value(row).to_vec())),
+            CompiledValueExtractor::Decimal128(arr) => Ok(Value::String(arr.value_as_string(row))),
+            CompiledValueExtractor::Decimal256(arr) => Ok(Value::String(arr.value_as_string(row))),
+            CompiledValueExtractor::Fallback(arr, ignore_nulls, auto_conv) => {
+                extract_complex_value_with_options(arr, row, ignore_nulls, auto_conv)
+            }
+        }
+    }
+}
+
 /// Convert an entire Arrow `RecordBatch` into a vector of `PreparedRecord`s.
 pub fn convert_record_batch(
     batch: &RecordBatch,
@@ -83,8 +448,20 @@ pub fn convert_record_batch(
         }
     }
 
-    // Collect non-key columns and validate bin name format, length, uniqueness, and count once per batch
-    let mut bin_columns: Vec<(String, &dyn Array)> =
+    // Determine whether null column values should be emitted as Value::Nil (to delete bins in update mode
+    // or verify bin absence in DQ validate mode) or omitted.
+    let is_validate = params.is_validate_mode();
+    let emit_nil_for_nulls = if is_validate {
+        !params.ignore_nulls
+    } else {
+        match params.write_mode {
+            WriteMode::Update | WriteMode::UpdateOnly | WriteMode::Validate => !params.ignore_nulls,
+            WriteMode::Replace | WriteMode::ReplaceOnly | WriteMode::CreateOnly => false,
+        }
+    };
+
+    // Collect non-key columns, validate bin name format/length/uniqueness, and pre-compile column extractors once per batch
+    let mut bin_columns: Vec<CompiledBinColumn<'_>> =
         Vec::with_capacity(schema.fields().len().saturating_sub(1));
     let mut seen_bin_names: HashSet<&str> =
         HashSet::with_capacity(schema.fields().len().saturating_sub(1));
@@ -118,7 +495,13 @@ pub fn convert_record_batch(
                 bin_name
             )));
         }
-        bin_columns.push((bin_name.clone(), batch.column(idx).as_ref()));
+        let compiled_col = CompiledBinColumn::compile(
+            bin_name.clone(),
+            batch.column(idx).as_ref(),
+            !emit_nil_for_nulls,
+            params.auto_convert_strings,
+        )?;
+        bin_columns.push(compiled_col);
     }
 
     if bin_columns.is_empty() {
@@ -134,40 +517,24 @@ pub fn convert_record_batch(
         )));
     }
 
-    // Determine whether null column values should be emitted as Value::Nil (to delete bins in update mode
-    // or verify bin absence in DQ validate mode) or omitted.
-    let is_validate = params.is_validate_mode();
-    let emit_nil_for_nulls = if is_validate {
-        !params.ignore_nulls
-    } else {
-        match params.write_mode {
-            WriteMode::Update | WriteMode::UpdateOnly | WriteMode::Validate => !params.ignore_nulls,
-            WriteMode::Replace | WriteMode::ReplaceOnly | WriteMode::CreateOnly => false,
-        }
-    };
-
+    let compiled_key = CompiledKeyColumn::compile(key_array.as_ref(), &params.key_column)?;
     let mut records = Vec::with_capacity(num_rows);
 
     for row in 0..num_rows {
-        let user_key_val = extract_key_value(key_array.as_ref(), row, &params.key_column)?;
+        let user_key_val = compiled_key.extract(row)?;
         let key = Key::new(&params.namespace, &params.set_name, user_key_val).map_err(|e| {
             ProxyError::Conversion(format!("Failed to build Aerospike key at row {row}: {e}"))
         })?;
 
         let mut bins = Vec::with_capacity(bin_columns.len());
-        for (bin_name, col_array) in &bin_columns {
-            if col_array.is_null(row) || col_array.data_type() == &DataType::Null {
+        for col in &bin_columns {
+            if col.is_null(row) {
                 if emit_nil_for_nulls {
-                    bins.push(Bin::new(bin_name.clone(), Value::Nil));
+                    bins.push(Bin::new(col.name.clone(), Value::Nil));
                 }
             } else {
-                let val = extract_value_with_options(
-                    *col_array,
-                    row,
-                    !emit_nil_for_nulls,
-                    params.auto_convert_strings,
-                )?;
-                bins.push(Bin::new(bin_name.clone(), val));
+                let val = col.extract_non_null(row)?;
+                bins.push(Bin::new(col.name.clone(), val));
             }
         }
 
@@ -306,97 +673,6 @@ pub fn values_equal_dq(expected: &Value, actual: &Value) -> bool {
     }
 }
 
-/// Extract a primary key `Value` (must be String, Int, or Blob in Aerospike).
-fn extract_key_value(array: &dyn Array, row: usize, col_name: &str) -> Result<Value> {
-    match array.data_type() {
-        DataType::Utf8 => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .ok_or_else(|| ProxyError::Conversion("Failed to downcast Utf8 key".into()))?;
-            Ok(Value::String(arr.value(row).to_string()))
-        }
-        DataType::LargeUtf8 => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<LargeStringArray>()
-                .ok_or_else(|| ProxyError::Conversion("Failed to downcast LargeUtf8 key".into()))?;
-            Ok(Value::String(arr.value(row).to_string()))
-        }
-        DataType::Utf8View => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<StringViewArray>()
-                .ok_or_else(|| ProxyError::Conversion("Failed to downcast Utf8View key".into()))?;
-            Ok(Value::String(arr.value(row).to_string()))
-        }
-        DataType::Int8 => Ok(Value::Int(i64::from(array.as_primitive::<Int8Type>().value(row)))),
-        DataType::Int16 => Ok(Value::Int(i64::from(
-            array.as_primitive::<Int16Type>().value(row),
-        ))),
-        DataType::Int32 => Ok(Value::Int(i64::from(
-            array.as_primitive::<Int32Type>().value(row),
-        ))),
-        DataType::Int64 => Ok(Value::Int(array.as_primitive::<Int64Type>().value(row))),
-        DataType::UInt8 => Ok(Value::Int(i64::from(
-            array.as_primitive::<UInt8Type>().value(row),
-        ))),
-        DataType::UInt16 => Ok(Value::Int(i64::from(
-            array.as_primitive::<UInt16Type>().value(row),
-        ))),
-        DataType::UInt32 => Ok(Value::Int(i64::from(
-            array.as_primitive::<UInt32Type>().value(row),
-        ))),
-        DataType::UInt64 => {
-            let v = array.as_primitive::<UInt64Type>().value(row);
-            let signed = i64::try_from(v).map_err(|_| {
-                ProxyError::Conversion(format!(
-                    "UInt64 key value {v} at row {row} overflows i64"
-                ))
-            })?;
-            Ok(Value::Int(signed))
-        }
-        DataType::Binary => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<BinaryArray>()
-                .ok_or_else(|| ProxyError::Conversion("Failed to downcast Binary key".into()))?;
-            Ok(Value::Blob(arr.value(row).to_vec()))
-        }
-        DataType::LargeBinary => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<LargeBinaryArray>()
-                .ok_or_else(|| {
-                    ProxyError::Conversion("Failed to downcast LargeBinary key".into())
-                })?;
-            Ok(Value::Blob(arr.value(row).to_vec()))
-        }
-        DataType::FixedSizeBinary(_) => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<FixedSizeBinaryArray>()
-                .ok_or_else(|| {
-                    ProxyError::Conversion("Failed to downcast FixedSizeBinary key".into())
-                })?;
-            Ok(Value::Blob(arr.value(row).to_vec()))
-        }
-        DataType::BinaryView => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<BinaryViewArray>()
-                .ok_or_else(|| {
-                    ProxyError::Conversion("Failed to downcast BinaryView key".into())
-                })?;
-            Ok(Value::Blob(arr.value(row).to_vec()))
-        }
-        other => Err(ProxyError::InvalidArgument(format!(
-            "Unsupported primary key data type {:?} for column '{}'. Supported: String, Int8..64, UInt8..64, Binary",
-            other, col_name
-        ))),
-    }
-}
-
 /// Convert a string slice into `Value::Int(i64)` or `Value::Float(FloatValue)` when
 /// `auto_convert_strings` is enabled, falling back to `Value::String`.
 /// Mirrors Python's `auto_type_convert(val, int, float)`:
@@ -441,138 +717,25 @@ pub fn extract_value_with_options(
     if array.is_null(row) {
         return Ok(Value::Nil);
     }
+    let compiled = CompiledBinColumn::compile(
+        String::new(),
+        array,
+        ignore_nulls,
+        auto_convert_strings,
+    )?;
+    compiled.extract_non_null(row)
+}
 
+fn extract_complex_value_with_options(
+    array: &dyn Array,
+    row: usize,
+    ignore_nulls: bool,
+    auto_convert_strings: bool,
+) -> Result<Value> {
     match array.data_type() {
-        DataType::Null => Ok(Value::Nil),
-        DataType::Boolean => {
-            let arr = array.as_boolean();
-            Ok(Value::Bool(arr.value(row)))
-        }
-        DataType::Int8 => Ok(Value::Int(i64::from(
-            array.as_primitive::<Int8Type>().value(row),
-        ))),
-        DataType::Int16 => Ok(Value::Int(i64::from(
-            array.as_primitive::<Int16Type>().value(row),
-        ))),
-        DataType::Int32 => Ok(Value::Int(i64::from(
-            array.as_primitive::<Int32Type>().value(row),
-        ))),
-        DataType::Int64 => Ok(Value::Int(array.as_primitive::<Int64Type>().value(row))),
-        DataType::UInt8 => Ok(Value::Int(i64::from(
-            array.as_primitive::<UInt8Type>().value(row),
-        ))),
-        DataType::UInt16 => Ok(Value::Int(i64::from(
-            array.as_primitive::<UInt16Type>().value(row),
-        ))),
-        DataType::UInt32 => Ok(Value::Int(i64::from(
-            array.as_primitive::<UInt32Type>().value(row),
-        ))),
-        DataType::UInt64 => {
-            let v = array.as_primitive::<UInt64Type>().value(row);
-            Ok(Value::Int(v as i64))
-        }
         DataType::Float16 => {
             let v = f64::from(array.as_primitive::<Float16Type>().value(row));
             Ok(Value::Float(FloatValue::from(v)))
-        }
-        DataType::Float32 => {
-            let v = f64::from(array.as_primitive::<Float32Type>().value(row));
-            Ok(Value::Float(FloatValue::from(v)))
-        }
-        DataType::Float64 => {
-            let v = array.as_primitive::<Float64Type>().value(row);
-            Ok(Value::Float(FloatValue::from(v)))
-        }
-        DataType::Decimal128(_, _) => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<Decimal128Array>()
-                .ok_or_else(|| ProxyError::Conversion("Failed to downcast Decimal128".into()))?;
-            Ok(Value::String(arr.value_as_string(row)))
-        }
-        DataType::Decimal256(_, _) => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<Decimal256Array>()
-                .ok_or_else(|| ProxyError::Conversion("Failed to downcast Decimal256".into()))?;
-            Ok(Value::String(arr.value_as_string(row)))
-        }
-        DataType::Utf8 => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .ok_or_else(|| ProxyError::Conversion("Failed to downcast Utf8".into()))?;
-            Ok(parse_string_auto(arr.value(row), auto_convert_strings))
-        }
-        DataType::LargeUtf8 => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<LargeStringArray>()
-                .ok_or_else(|| ProxyError::Conversion("Failed to downcast LargeUtf8".into()))?;
-            Ok(parse_string_auto(arr.value(row), auto_convert_strings))
-        }
-        DataType::Utf8View => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<StringViewArray>()
-                .ok_or_else(|| ProxyError::Conversion("Failed to downcast Utf8View".into()))?;
-            Ok(parse_string_auto(arr.value(row), auto_convert_strings))
-        }
-        DataType::Binary => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<BinaryArray>()
-                .ok_or_else(|| ProxyError::Conversion("Failed to downcast Binary".into()))?;
-            Ok(Value::Blob(arr.value(row).to_vec()))
-        }
-        DataType::LargeBinary => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<LargeBinaryArray>()
-                .ok_or_else(|| ProxyError::Conversion("Failed to downcast LargeBinary".into()))?;
-            Ok(Value::Blob(arr.value(row).to_vec()))
-        }
-        DataType::FixedSizeBinary(_) => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<FixedSizeBinaryArray>()
-                .ok_or_else(|| {
-                    ProxyError::Conversion("Failed to downcast FixedSizeBinary".into())
-                })?;
-            Ok(Value::Blob(arr.value(row).to_vec()))
-        }
-        DataType::BinaryView => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<BinaryViewArray>()
-                .ok_or_else(|| ProxyError::Conversion("Failed to downcast BinaryView".into()))?;
-            Ok(Value::Blob(arr.value(row).to_vec()))
-        }
-        // Dates -> int64 UTC milliseconds
-        DataType::Date32 => {
-            let days = i64::from(array.as_primitive::<Date32Type>().value(row));
-            Ok(Value::Int(days.saturating_mul(MILLIS_PER_DAY)))
-        }
-        DataType::Date64 => {
-            let ms = array.as_primitive::<Date64Type>().value(row);
-            Ok(Value::Int(ms))
-        }
-        // Timestamps -> int64 UTC milliseconds
-        DataType::Timestamp(TimeUnit::Second, _) => {
-            let secs = array.as_primitive::<TimestampSecondType>().value(row);
-            Ok(Value::Int(secs.saturating_mul(1_000)))
-        }
-        DataType::Timestamp(TimeUnit::Millisecond, _) => {
-            let ms = array.as_primitive::<TimestampMillisecondType>().value(row);
-            Ok(Value::Int(ms))
-        }
-        DataType::Timestamp(TimeUnit::Microsecond, _) => {
-            let micros = array.as_primitive::<TimestampMicrosecondType>().value(row);
-            Ok(Value::Int(micros.div_euclid(1_000)))
-        }
-        DataType::Timestamp(TimeUnit::Nanosecond, _) => {
-            let nanos = array.as_primitive::<TimestampNanosecondType>().value(row);
-            Ok(Value::Int(nanos.div_euclid(1_000_000)))
         }
         // Nested List -> Aerospike CDT List
         DataType::List(_) => {
@@ -753,14 +916,19 @@ pub fn extract_keys_from_batch(
     })?;
 
     let key_array = batch.column(key_col_idx);
+    if key_array.null_count() > 0 {
+        for row in 0..num_rows {
+            if key_array.is_null(row) {
+                return Err(ProxyError::InvalidArgument(format!(
+                    "Null value encountered in primary key column '{key_column}' at row {row}"
+                )));
+            }
+        }
+    }
+    let compiled_key = CompiledKeyColumn::compile(key_array.as_ref(), key_column)?;
     let mut keys = Vec::with_capacity(num_rows);
     for row in 0..num_rows {
-        if key_array.is_null(row) {
-            return Err(ProxyError::InvalidArgument(format!(
-                "Null value encountered in primary key column '{key_column}' at row {row}"
-            )));
-        }
-        let user_val = extract_key_value(key_array.as_ref(), row, key_column)?;
+        let user_val = compiled_key.extract(row)?;
         let key = Key::new(namespace, set_name, user_val).map_err(|e| {
             ProxyError::Conversion(format!("Failed to build Aerospike key at row {row}: {e}"))
         })?;

@@ -42,7 +42,8 @@ class AerospikeFlightDataWriter(
     keyColumn = options.keyColumn,
     root = stagingRoot,
     ignoreNulls = options.shouldOmitNullsInFlight,
-    validateOnly = options.validateOnly
+    validateOnly = options.validateOnly,
+    initialCapacity = options.batchSize
   )
 
   private val batchQueue = new ArrayBlockingQueue[Option[ArrowRecordBatch]](options.queueCapacity)
@@ -251,6 +252,8 @@ class AerospikeFlightDataWriter(
       )
 
       try {
+        val maxInFlightBatches = 2
+        var inFlightBatches = 0
         var running = true
         while (running && workerError.get() == null) {
           val nextItem = batchQueue.poll(200, TimeUnit.MILLISECONDS)
@@ -263,60 +266,23 @@ class AerospikeFlightDataWriter(
                   recordBatch.close()
                 }
                 streamListener.putNext()
-                // Read PutResult ack from proxy_server to confirm batch persistence in Aerospike
-                val ack = putListener.read()
-                if (ack != null) {
-                  try {
-                    val metaBuf = ack.getApplicationMetadata
-                    if (metaBuf != null && metaBuf.readableBytes() > 0) {
-                      val bytes = new Array[Byte](metaBuf.readableBytes().toInt)
-                      metaBuf.getBytes(metaBuf.readerIndex(), bytes)
-                      val jsonNode = mapper.readTree(bytes)
-                      if (jsonNode != null) {
-                        val batchOverload = if (jsonNode.has("overload_retries")) {
-                          val v = jsonNode.get("overload_retries").asLong(0L)
-                          overloadRetriesCounter.addAndGet(v)
-                          v
-                        } else 0L
-                        val batchOther = if (jsonNode.has("other_retries")) {
-                          val v = jsonNode.get("other_retries").asLong(0L)
-                          otherRetriesCounter.addAndGet(v)
-                          v
-                        } else 0L
-                        if (batchOverload > 0L || batchOther > 0L) {
-                          logWarning(
-                            s"[Executor][Write] Partition=$partitionId, task=$taskId, worker=$threadIdx " +
-                              s"(${endpoint.host}:${endpoint.port}) batch experienced retries on proxy: " +
-                              s"overloadRetries=$batchOverload, otherRetries=$batchOther"
-                          )
-                        }
-                        if (jsonNode.has("rows_validated")) {
-                          rowsValidatedCounter.addAndGet(jsonNode.get("rows_validated").asLong(0L))
-                        }
-                        if (jsonNode.has("matched_rows")) {
-                          matchedRowsCounter.addAndGet(jsonNode.get("matched_rows").asLong(0L))
-                        }
-                        if (jsonNode.has("mismatched_rows")) {
-                          mismatchedRowsCounter.addAndGet(jsonNode.get("mismatched_rows").asLong(0L))
-                        }
-                        if (jsonNode.has("missing_keys")) {
-                          missingKeysCounter.addAndGet(jsonNode.get("missing_keys").asLong(0L))
-                        }
-                        if (jsonNode.has("bin_mismatch_rows")) {
-                          binMismatchRowsCounter.addAndGet(jsonNode.get("bin_mismatch_rows").asLong(0L))
-                        }
-                      }
-                    }
-                  } finally {
-                    ack.close()
-                  }
-                }
                 batchesSentCounter.incrementAndGet()
+                inFlightBatches += 1
+
+                if (inFlightBatches >= maxInFlightBatches) {
+                  readAndProcessAck(putListener, mapper, threadIdx, endpoint)
+                  inFlightBatches -= 1
+                }
 
               case None =>
                 running = false
             }
           }
+        }
+
+        while (inFlightBatches > 0 && workerError.get() == null) {
+          readAndProcessAck(putListener, mapper, threadIdx, endpoint)
+          inFlightBatches -= 1
         }
 
         streamListener.completed()
@@ -340,6 +306,61 @@ class AerospikeFlightDataWriter(
         try { workerRoot.close() } catch { case _: Throwable => }
       }
       try { workerAllocator.close() } catch { case _: Throwable => }
+    }
+  }
+
+  private def readAndProcessAck(
+      putListener: SyncPutListener,
+      mapper: ObjectMapper,
+      threadIdx: Int,
+      endpoint: HostEndpoint
+  ): Unit = {
+    val ack = putListener.read()
+    if (ack != null) {
+      try {
+        val metaBuf = ack.getApplicationMetadata
+        if (metaBuf != null && metaBuf.readableBytes() > 0) {
+          val bytes = new Array[Byte](metaBuf.readableBytes().toInt)
+          metaBuf.getBytes(metaBuf.readerIndex(), bytes)
+          val jsonNode = mapper.readTree(bytes)
+          if (jsonNode != null) {
+            val batchOverload = if (jsonNode.has("overload_retries")) {
+              val v = jsonNode.get("overload_retries").asLong(0L)
+              overloadRetriesCounter.addAndGet(v)
+              v
+            } else 0L
+            val batchOther = if (jsonNode.has("other_retries")) {
+              val v = jsonNode.get("other_retries").asLong(0L)
+              otherRetriesCounter.addAndGet(v)
+              v
+            } else 0L
+            if (batchOverload > 0L || batchOther > 0L) {
+              logWarning(
+                s"[Executor][Write] Partition=$partitionId, task=$taskId, worker=$threadIdx " +
+                  s"(${endpoint.host}:${endpoint.port}) batch experienced retries on proxy: " +
+                  s"overloadRetries=$batchOverload, otherRetries=$batchOther"
+              )
+            }
+            if (jsonNode.has("rows_validated")) {
+              rowsValidatedCounter.addAndGet(jsonNode.get("rows_validated").asLong(0L))
+            }
+            if (jsonNode.has("matched_rows")) {
+              matchedRowsCounter.addAndGet(jsonNode.get("matched_rows").asLong(0L))
+            }
+            if (jsonNode.has("mismatched_rows")) {
+              mismatchedRowsCounter.addAndGet(jsonNode.get("mismatched_rows").asLong(0L))
+            }
+            if (jsonNode.has("missing_keys")) {
+              missingKeysCounter.addAndGet(jsonNode.get("missing_keys").asLong(0L))
+            }
+            if (jsonNode.has("bin_mismatch_rows")) {
+              binMismatchRowsCounter.addAndGet(jsonNode.get("bin_mismatch_rows").asLong(0L))
+            }
+          }
+        }
+      } finally {
+        ack.close()
+      }
     }
   }
 

@@ -573,9 +573,10 @@ impl MppWriteEngine {
         }
 
         let num_bins = batch.num_columns().saturating_sub(1).max(1);
-        let bin_weight = ((num_bins + 9) / 10).max(1);
+        let bin_weight = ((num_bins + 31) / 32).clamp(1, 10);
         let base_chunk_size = self.writer_config.batch_write_size.max(1);
-        let chunk_size = (base_chunk_size / bin_weight).max(16).min(base_chunk_size);
+        let min_chunk = 64.min(base_chunk_size / 2).max(1);
+        let chunk_size = (base_chunk_size / bin_weight).max(min_chunk).min(base_chunk_size);
 
         let use_batch = params
             .use_batch_write
@@ -600,7 +601,6 @@ impl MppWriteEngine {
                 stats.rows_written += written;
                 stats.overload_retries += ov_ret;
                 stats.other_retries += oth_ret;
-                tokio::task::yield_now().await;
             }
 
             let fut = self.write_subbatch_slice(
@@ -618,7 +618,6 @@ impl MppWriteEngine {
             stats.rows_written += written;
             stats.overload_retries += ov_ret;
             stats.other_retries += oth_ret;
-            tokio::task::yield_now().await;
         }
 
         self.metrics.inc_records_written(stats.rows_written as u64);
@@ -641,9 +640,10 @@ impl MppWriteEngine {
         }
 
         let num_bins = batch.num_columns().saturating_sub(1).max(1);
-        let bin_weight = ((num_bins + 9) / 10).max(1);
+        let bin_weight = ((num_bins + 31) / 32).clamp(1, 10);
         let base_chunk_size = self.writer_config.batch_write_size.max(1);
-        let chunk_size = (base_chunk_size / bin_weight).max(16).min(base_chunk_size);
+        let min_chunk = 64.min(base_chunk_size / 2).max(1);
+        let chunk_size = (base_chunk_size / bin_weight).max(min_chunk).min(base_chunk_size);
         let max_concurrency = self
             .writer_config
             .max_concurrent_subbatches_per_stream
@@ -663,7 +663,6 @@ impl MppWriteEngine {
                 let sub = sub_stats?;
                 stats.rows_validated += sub.rows_validated;
                 Self::merge_validation_stats(&mut stats, sub);
-                tokio::task::yield_now().await;
             }
 
             let fut =
@@ -675,7 +674,6 @@ impl MppWriteEngine {
             let sub = res?;
             stats.rows_validated += sub.rows_validated;
             Self::merge_validation_stats(&mut stats, sub);
-            tokio::task::yield_now().await;
         }
 
         self.metrics

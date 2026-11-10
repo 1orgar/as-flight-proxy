@@ -7,19 +7,36 @@ import org.apache.spark.sql.catalyst.expressions.SpecializedGetters
 import org.apache.spark.sql.types._
 
 /**
+ * Unboxed column writer for a top-level Spark `InternalRow` column into an Arrow `FieldVector`.
+ * Avoids `scala.Function2` / `scala.Function3` primitive `Int` boxing on wide tables (100–300+ bins).
+ */
+private[spark] abstract class RowColumnWriter {
+  def write(row: InternalRow, targetRowIdx: Int): Unit
+}
+
+/**
+ * Unboxed indexed value writer for any `SpecializedGetters` (`InternalRow`, `ArrayData`) into an Arrow `FieldVector`.
+ */
+private[spark] abstract class IndexedValueWriter {
+  def write(getter: SpecializedGetters, ordinal: Int, targetIndex: Int): Unit
+}
+
+/**
  * Populates an Apache Arrow `VectorSchemaRoot` from Spark Catalyst `InternalRow` records.
  *
- * Pre-compiles per-column writer closures once per `VectorSchemaRoot` so the hot `appendRow` loop
- * avoids per-cell `DataType` pattern matching and `FieldVector` casts.
+ * Pre-compiles unboxed per-column writers once per `VectorSchemaRoot` so the hot `appendRow` loop
+ * avoids per-cell `DataType` pattern matching, `FieldVector` casts, and `Int` boxing.
  */
 class ArrowBatchConverter(
     sparkSchema: StructType,
     keyColumn: String,
     root: VectorSchemaRoot,
     ignoreNulls: Boolean = false,
-    validateOnly: Boolean = false
+    validateOnly: Boolean = false,
+    initialCapacity: Int = 4096
 ) {
 
+  private val effectiveInitialCapacity: Int = math.max(16, initialCapacity)
   private val fields: Array[StructField] = sparkSchema.fields
   private val keyColumnIndex: Int = {
     val idx = sparkSchema.fieldIndex(keyColumn)
@@ -34,16 +51,21 @@ class ArrowBatchConverter(
     .filter(i => i != keyColumnIndex && !(ignoreNulls && !validateOnly && fields(i).dataType == NullType))
     .toArray
 
-  // Pre-compiled per-column writer functions `(row: InternalRow, targetRowIdx: Int) => Unit`
-  private val columnWriters: Array[(InternalRow, Int) => Unit] = {
+  // Pre-compiled unboxed per-column writers
+  private val columnWriters: Array[RowColumnWriter] = {
     val activeSparkIndices = fields.indices.filter { i =>
       i == keyColumnIndex || !(ignoreNulls && !validateOnly && fields(i).dataType == NullType)
     }
     activeSparkIndices.zipWithIndex.map { case (sparkIdx, arrowIdx) =>
       val field = fields(sparkIdx)
       val vector = root.getVector(arrowIdx)
+      vector.setInitialCapacity(effectiveInitialCapacity)
       val valueWriter = createValueWriter(field.dataType, vector)
-      (row: InternalRow, targetRowIdx: Int) => valueWriter(row, sparkIdx, targetRowIdx)
+      new RowColumnWriter {
+        override def write(row: InternalRow, targetRowIdx: Int): Unit = {
+          valueWriter.write(row, sparkIdx, targetRowIdx)
+        }
+      }
     }.toArray
   }
 
@@ -51,7 +73,15 @@ class ArrowBatchConverter(
   private var currentRowCount: Int = 0
 
   def reset(): Unit = {
-    root.allocateNew()
+    var i = 0
+    val fieldVectors = root.getFieldVectors
+    val numVecs = fieldVectors.size()
+    while (i < numVecs) {
+      val v = fieldVectors.get(i)
+      v.setInitialCapacity(effectiveInitialCapacity)
+      v.allocateNew()
+      i += 1
+    }
     currentRowCount = 0
   }
 
@@ -81,13 +111,14 @@ class ArrowBatchConverter(
       }
     }
 
+    val rowIdx = currentRowCount
     var idx = 0
     while (idx < numActiveColumns) {
-      columnWriters(idx)(row, currentRowCount)
+      columnWriters(idx).write(row, rowIdx)
       idx += 1
     }
 
-    currentRowCount += 1
+    currentRowCount = rowIdx + 1
     true
   }
 
@@ -100,122 +131,149 @@ class ArrowBatchConverter(
   def rowCount: Int = currentRowCount
 
   /**
-   * Pre-compiles a writer closure `(getter: SpecializedGetters, ordinal: Int, targetIndex: Int) => Unit`
-   * for a specific `(DataType, FieldVector)` pair.
+   * Pre-compiles an unboxed `IndexedValueWriter` for a specific `(DataType, FieldVector)` pair.
    */
   private def createValueWriter(
       dataType: DataType,
       vector: FieldVector
-  ): (SpecializedGetters, Int, Int) => Unit = {
+  ): IndexedValueWriter = {
     dataType match {
       case NullType =>
-        (_: SpecializedGetters, _: Int, _: Int) => ()
+        new IndexedValueWriter {
+          override def write(getter: SpecializedGetters, ordinal: Int, targetIndex: Int): Unit = ()
+        }
 
       case BooleanType =>
         val v = vector.asInstanceOf[BitVector]
-        (getter, ordinal, targetIndex) =>
-          if (getter.isNullAt(ordinal)) v.setNull(targetIndex)
-          else v.setSafe(targetIndex, if (getter.getBoolean(ordinal)) 1 else 0)
+        new IndexedValueWriter {
+          override def write(getter: SpecializedGetters, ordinal: Int, targetIndex: Int): Unit =
+            if (getter.isNullAt(ordinal)) v.setNull(targetIndex)
+            else v.setSafe(targetIndex, if (getter.getBoolean(ordinal)) 1 else 0)
+        }
 
       case ByteType =>
         val v = vector.asInstanceOf[TinyIntVector]
-        (getter, ordinal, targetIndex) =>
-          if (getter.isNullAt(ordinal)) v.setNull(targetIndex)
-          else v.setSafe(targetIndex, getter.getByte(ordinal))
+        new IndexedValueWriter {
+          override def write(getter: SpecializedGetters, ordinal: Int, targetIndex: Int): Unit =
+            if (getter.isNullAt(ordinal)) v.setNull(targetIndex)
+            else v.setSafe(targetIndex, getter.getByte(ordinal))
+        }
 
       case ShortType =>
         val v = vector.asInstanceOf[SmallIntVector]
-        (getter, ordinal, targetIndex) =>
-          if (getter.isNullAt(ordinal)) v.setNull(targetIndex)
-          else v.setSafe(targetIndex, getter.getShort(ordinal))
+        new IndexedValueWriter {
+          override def write(getter: SpecializedGetters, ordinal: Int, targetIndex: Int): Unit =
+            if (getter.isNullAt(ordinal)) v.setNull(targetIndex)
+            else v.setSafe(targetIndex, getter.getShort(ordinal))
+        }
 
       case IntegerType =>
         val v = vector.asInstanceOf[IntVector]
-        (getter, ordinal, targetIndex) =>
-          if (getter.isNullAt(ordinal)) v.setNull(targetIndex)
-          else v.setSafe(targetIndex, getter.getInt(ordinal))
+        new IndexedValueWriter {
+          override def write(getter: SpecializedGetters, ordinal: Int, targetIndex: Int): Unit =
+            if (getter.isNullAt(ordinal)) v.setNull(targetIndex)
+            else v.setSafe(targetIndex, getter.getInt(ordinal))
+        }
 
       case LongType =>
         val v = vector.asInstanceOf[BigIntVector]
-        (getter, ordinal, targetIndex) =>
-          if (getter.isNullAt(ordinal)) v.setNull(targetIndex)
-          else v.setSafe(targetIndex, getter.getLong(ordinal))
+        new IndexedValueWriter {
+          override def write(getter: SpecializedGetters, ordinal: Int, targetIndex: Int): Unit =
+            if (getter.isNullAt(ordinal)) v.setNull(targetIndex)
+            else v.setSafe(targetIndex, getter.getLong(ordinal))
+        }
 
       case FloatType =>
         val v = vector.asInstanceOf[Float4Vector]
-        (getter, ordinal, targetIndex) =>
-          if (getter.isNullAt(ordinal)) v.setNull(targetIndex)
-          else v.setSafe(targetIndex, getter.getFloat(ordinal))
+        new IndexedValueWriter {
+          override def write(getter: SpecializedGetters, ordinal: Int, targetIndex: Int): Unit =
+            if (getter.isNullAt(ordinal)) v.setNull(targetIndex)
+            else v.setSafe(targetIndex, getter.getFloat(ordinal))
+        }
 
       case DoubleType =>
         val v = vector.asInstanceOf[Float8Vector]
-        (getter, ordinal, targetIndex) =>
-          if (getter.isNullAt(ordinal)) v.setNull(targetIndex)
-          else v.setSafe(targetIndex, getter.getDouble(ordinal))
+        new IndexedValueWriter {
+          override def write(getter: SpecializedGetters, ordinal: Int, targetIndex: Int): Unit =
+            if (getter.isNullAt(ordinal)) v.setNull(targetIndex)
+            else v.setSafe(targetIndex, getter.getDouble(ordinal))
+        }
 
       case dt: DecimalType =>
         val v = vector.asInstanceOf[DecimalVector]
         val precision = dt.precision
         val scale = dt.scale
-        (getter, ordinal, targetIndex) =>
-          if (getter.isNullAt(ordinal)) v.setNull(targetIndex)
-          else {
-            val dec = getter.getDecimal(ordinal, precision, scale)
-            if (dec == null) v.setNull(targetIndex)
-            else v.setSafe(targetIndex, dec.toJavaBigDecimal)
-          }
+        new IndexedValueWriter {
+          override def write(getter: SpecializedGetters, ordinal: Int, targetIndex: Int): Unit =
+            if (getter.isNullAt(ordinal)) v.setNull(targetIndex)
+            else {
+              val dec = getter.getDecimal(ordinal, precision, scale)
+              if (dec == null) v.setNull(targetIndex)
+              else v.setSafe(targetIndex, dec.toJavaBigDecimal)
+            }
+        }
 
       case StringType =>
         val v = vector.asInstanceOf[VarCharVector]
-        (getter, ordinal, targetIndex) =>
-          if (getter.isNullAt(ordinal)) v.setNull(targetIndex)
-          else {
-            val utf8 = getter.getUTF8String(ordinal)
-            if (utf8 == null) v.setNull(targetIndex)
-            else v.setSafe(targetIndex, utf8.getBytes)
-          }
+        new IndexedValueWriter {
+          override def write(getter: SpecializedGetters, ordinal: Int, targetIndex: Int): Unit =
+            if (getter.isNullAt(ordinal)) v.setNull(targetIndex)
+            else {
+              val utf8 = getter.getUTF8String(ordinal)
+              if (utf8 == null) v.setNull(targetIndex)
+              else v.setSafe(targetIndex, utf8.getBytes)
+            }
+        }
 
       case BinaryType =>
         val v = vector.asInstanceOf[VarBinaryVector]
-        (getter, ordinal, targetIndex) =>
-          if (getter.isNullAt(ordinal)) v.setNull(targetIndex)
-          else {
-            val bytes = getter.getBinary(ordinal)
-            if (bytes == null) v.setNull(targetIndex)
-            else v.setSafe(targetIndex, bytes)
-          }
+        new IndexedValueWriter {
+          override def write(getter: SpecializedGetters, ordinal: Int, targetIndex: Int): Unit =
+            if (getter.isNullAt(ordinal)) v.setNull(targetIndex)
+            else {
+              val bytes = getter.getBinary(ordinal)
+              if (bytes == null) v.setNull(targetIndex)
+              else v.setSafe(targetIndex, bytes)
+            }
+        }
 
       case DateType =>
         val v = vector.asInstanceOf[DateDayVector]
-        (getter, ordinal, targetIndex) =>
-          if (getter.isNullAt(ordinal)) v.setNull(targetIndex)
-          else v.setSafe(targetIndex, getter.getInt(ordinal))
+        new IndexedValueWriter {
+          override def write(getter: SpecializedGetters, ordinal: Int, targetIndex: Int): Unit =
+            if (getter.isNullAt(ordinal)) v.setNull(targetIndex)
+            else v.setSafe(targetIndex, getter.getInt(ordinal))
+        }
 
       case TimestampType =>
         val v = vector.asInstanceOf[TimeStampMicroTZVector]
-        (getter, ordinal, targetIndex) =>
-          if (getter.isNullAt(ordinal)) v.setNull(targetIndex)
-          else v.setSafe(targetIndex, getter.getLong(ordinal))
+        new IndexedValueWriter {
+          override def write(getter: SpecializedGetters, ordinal: Int, targetIndex: Int): Unit =
+            if (getter.isNullAt(ordinal)) v.setNull(targetIndex)
+            else v.setSafe(targetIndex, getter.getLong(ordinal))
+        }
 
       case ArrayType(elementType, _) =>
         val listVector = vector.asInstanceOf[ListVector]
         val elemWriter = createValueWriter(elementType, listVector.getDataVector)
-        (getter, ordinal, targetIndex) =>
-          if (getter.isNullAt(ordinal)) listVector.setNull(targetIndex)
-          else {
-            val arrayData = getter.getArray(ordinal)
-            if (arrayData == null) listVector.setNull(targetIndex)
+        new IndexedValueWriter {
+          override def write(getter: SpecializedGetters, ordinal: Int, targetIndex: Int): Unit =
+            if (getter.isNullAt(ordinal)) listVector.setNull(targetIndex)
             else {
-              val baseOffset: Int = listVector.startNewValue(targetIndex)
-              val numElements = arrayData.numElements()
-              var i = 0
-              while (i < numElements) {
-                elemWriter(arrayData, i, baseOffset + i)
-                i += 1
+              val arrayData = getter.getArray(ordinal)
+              if (arrayData == null) listVector.setNull(targetIndex)
+              else {
+                val baseOffset: Int = listVector.startNewValue(targetIndex)
+                val numElements = arrayData.numElements()
+                var i = 0
+                while (i < numElements) {
+                  elemWriter.write(arrayData, i, baseOffset + i)
+                  i += 1
+                }
+                listVector.endValue(targetIndex, numElements)
               }
-              listVector.endValue(targetIndex, numElements)
             }
-          }
+        }
 
       case MapType(keyType, valueType, _) =>
         val mapVector = vector.asInstanceOf[MapVector]
@@ -224,34 +282,36 @@ class ArrowBatchConverter(
         val valVector = entriesStruct.getChild(MapVector.VALUE_NAME)
         val keyWriter = createValueWriter(keyType, keyVector)
         val valWriter = createValueWriter(valueType, valVector)
-        (getter, ordinal, targetIndex) =>
-          if (getter.isNullAt(ordinal)) mapVector.setNull(targetIndex)
-          else {
-            val mapData = getter.getMap(ordinal)
-            if (mapData == null) mapVector.setNull(targetIndex)
+        new IndexedValueWriter {
+          override def write(getter: SpecializedGetters, ordinal: Int, targetIndex: Int): Unit =
+            if (getter.isNullAt(ordinal)) mapVector.setNull(targetIndex)
             else {
-              val baseOffset: Int = mapVector.startNewValue(targetIndex)
-              val keyArray = mapData.keyArray()
-              val valArray = mapData.valueArray()
-              val numEntries = mapData.numElements()
-              var i = 0
-              while (i < numEntries) {
-                if (keyArray.isNullAt(i)) {
-                  throw new IllegalArgumentException(s"Null map key encountered at row $targetIndex")
+              val mapData = getter.getMap(ordinal)
+              if (mapData == null) mapVector.setNull(targetIndex)
+              else {
+                val baseOffset: Int = mapVector.startNewValue(targetIndex)
+                val keyArray = mapData.keyArray()
+                val valArray = mapData.valueArray()
+                val numEntries = mapData.numElements()
+                var i = 0
+                while (i < numEntries) {
+                  if (keyArray.isNullAt(i)) {
+                    throw new IllegalArgumentException(s"Null map key encountered at row $targetIndex")
+                  }
+                  entriesStruct.setIndexDefined(baseOffset + i)
+                  keyWriter.write(keyArray, i, baseOffset + i)
+                  valWriter.write(valArray, i, baseOffset + i)
+                  i += 1
                 }
-                entriesStruct.setIndexDefined(baseOffset + i)
-                keyWriter(keyArray, i, baseOffset + i)
-                valWriter(valArray, i, baseOffset + i)
-                i += 1
+                mapVector.endValue(targetIndex, numEntries)
               }
-              mapVector.endValue(targetIndex, numEntries)
             }
-          }
+        }
 
       case StructType(structFields) =>
         val structVector = vector.asInstanceOf[StructVector]
         val numStructFields = structFields.length
-        val childWriters = new Array[(SpecializedGetters, Int, Int) => Unit](numStructFields)
+        val childWriters = new Array[IndexedValueWriter](numStructFields)
         var fIdx = 0
         while (fIdx < numStructFields) {
           val sf = structFields(fIdx)
@@ -259,20 +319,22 @@ class ArrowBatchConverter(
           childWriters(fIdx) = createValueWriter(sf.dataType, childVec)
           fIdx += 1
         }
-        (getter, ordinal, targetIndex) =>
-          if (getter.isNullAt(ordinal)) structVector.setNull(targetIndex)
-          else {
-            val nestedRow = getter.getStruct(ordinal, numStructFields)
-            if (nestedRow == null) structVector.setNull(targetIndex)
+        new IndexedValueWriter {
+          override def write(getter: SpecializedGetters, ordinal: Int, targetIndex: Int): Unit =
+            if (getter.isNullAt(ordinal)) structVector.setNull(targetIndex)
             else {
-              structVector.setIndexDefined(targetIndex)
-              var i = 0
-              while (i < numStructFields) {
-                childWriters(i)(nestedRow, i, targetIndex)
-                i += 1
+              val nestedRow = getter.getStruct(ordinal, numStructFields)
+              if (nestedRow == null) structVector.setNull(targetIndex)
+              else {
+                structVector.setIndexDefined(targetIndex)
+                var i = 0
+                while (i < numStructFields) {
+                  childWriters(i).write(nestedRow, i, targetIndex)
+                  i += 1
+                }
               }
             }
-          }
+        }
 
       case other =>
         throw new UnsupportedOperationException(s"Unsupported Spark DataType: $other")

@@ -363,7 +363,7 @@ sbt "set ThisBuild / coverageEnabled := false" assembly
 On every push to `main` and `v*` tag, [`.github/workflows/ci.yml`](.github/workflows/ci.yml) enforces `>= 85%` test coverage and publishes 3 release artifacts:
 1. `as_proxy_server-linux-x86_64.zip` — ZIP archive containing the stripped `as_proxy_server` binary for Linux `x86_64` and `config.example.toml`.
 2. `as_proxy_server-linux-arm64.zip` — ZIP archive containing the stripped `as_proxy_server` binary for Linux `ARM64` (`aarch64`) and `config.example.toml`.
-3. `spark-aerospike-flight-connector-assembly-0.4.0.jar` — Shaded Fat-JAR connector for Apache Spark 3.5 (Scala 2.12).
+3. `spark-aerospike-flight-connector-assembly-0.4.2.jar` — Shaded Fat-JAR connector for Apache Spark 3.5 (Scala 2.12).
 
 ### Running the Full E2E Benchmark & Verification Suite (Docker Compose)
 ```bash
@@ -373,7 +373,7 @@ curl -sL "https://github.com/1orgar/as-flight-proxy/releases/latest/download/as_
 unzip -o e2e/artifacts/proxy.zip -d e2e/artifacts/
 mv "e2e/artifacts/as_proxy_server-linux-${ARCH}" e2e/artifacts/as_proxy_server
 chmod +x e2e/artifacts/as_proxy_server
-curl -sL "https://github.com/1orgar/as-flight-proxy/releases/latest/download/spark-aerospike-flight-connector-assembly-0.4.0.jar" -o e2e/artifacts/spark-aerospike-flight-connector-assembly-0.4.0.jar
+curl -sL "https://github.com/1orgar/as-flight-proxy/releases/latest/download/spark-aerospike-flight-connector-assembly-0.4.2.jar" -o e2e/artifacts/spark-aerospike-flight-connector-assembly-0.4.2.jar
 
 docker compose -f docker-compose.e2e.yml up --abort-on-container-exit --exit-code-from spark-e2e
 docker compose -f docker-compose.e2e.yml down
