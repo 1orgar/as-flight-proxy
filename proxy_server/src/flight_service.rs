@@ -275,12 +275,23 @@ impl FlightService for ProxyFlightService {
             let mut write_params: Option<WriteParameters> = None;
             let mut batch_index: usize = 0;
             let mut total_stream_rows: usize = 0;
+            let mut pending_raft_commands: Vec<MetadataCommand> = Vec::new();
+            let coalesce_raft_batches = raft_node
+                .as_ref()
+                .is_some_and(|r| r.has_remote_peers());
 
             while let Some(decoded_res) = decoder.next().await {
                 let decoded = match decoded_res {
                     Ok(d) => d,
                     Err(e) => {
                         error!("FlightData decode error in do_put stream: {e}");
+                        if let Some(ref raft) = raft_node {
+                            if !pending_raft_commands.is_empty() {
+                                let _ = raft
+                                    .propose_batch(std::mem::take(&mut pending_raft_commands))
+                                    .await;
+                            }
+                        }
                         let _ = tx.send(Err(ProxyError::Flight(e).into())).await;
                         return;
                     }
@@ -341,15 +352,16 @@ impl FlightService for ProxyFlightService {
                             Err(err) => {
                                 error!("MPP write engine error on batch {batch_index}: {err}");
                                 if let (Some(raft), Some(job_id)) = (&raft_node, &params.job_id) {
+                                    pending_raft_commands.push(MetadataCommand::SetJobState {
+                                        job_id: job_id.clone(),
+                                        namespace: params.namespace.clone(),
+                                        set_name: params.set_name.clone(),
+                                        state: JobState::Failed,
+                                        error_message: Some(err.to_string()),
+                                        timestamp_ms: now_ms(),
+                                    });
                                     let _ = raft
-                                        .propose(MetadataCommand::SetJobState {
-                                            job_id: job_id.clone(),
-                                            namespace: params.namespace.clone(),
-                                            set_name: params.set_name.clone(),
-                                            state: JobState::Failed,
-                                            error_message: Some(err.to_string()),
-                                            timestamp_ms: now_ms(),
-                                        })
+                                        .propose_batch(std::mem::take(&mut pending_raft_commands))
                                         .await;
                                 }
                                 let _ = tx.send(Err(err.into())).await;
@@ -370,61 +382,66 @@ impl FlightService for ProxyFlightService {
                             missing_keys: stats.missing_keys,
                             bin_mismatch_rows: stats.bin_mismatch_rows,
                         };
-                        let is_first_batch = batch_index == 0;
                         batch_index += 1;
 
                         let ack_bytes = serde_json::to_vec(&ack).unwrap_or_default();
 
-                        // For subsequent batches in a multi-batch stream, send the PutResult ACK to Spark immediately
-                        // so the client can pipeline the next batch without waiting on the Raft round-trip.
-                        if !is_first_batch {
-                            if tx
-                                .send(Ok(PutResult {
-                                    app_metadata: Bytes::from(ack_bytes.clone()),
-                                }))
-                                .await
-                                .is_err()
-                            {
-                                return;
-                            }
-                        }
-
-                        // Replicate job batch progress across the proxy cluster via Raft
                         if let (Some(raft), Some(job_id)) = (&raft_node, &params.job_id) {
-                            let _ = raft
-                                .propose(MetadataCommand::RecordJobBatch {
-                                    job_id: job_id.clone(),
-                                    node_id,
-                                    namespace: params.namespace.clone(),
-                                    set_name: params.set_name.clone(),
-                                    is_dq_validation: params.is_validate_mode(),
-                                    rows_written: stats.rows_written as u64,
-                                    overload_retries: stats.overload_retries,
-                                    other_retries: stats.other_retries,
-                                    rows_validated: stats.rows_validated as u64,
-                                    matched_rows: stats.matched_rows as u64,
-                                    mismatched_rows: stats.mismatched_rows as u64,
-                                    missing_keys: stats.missing_keys as u64,
-                                    bin_mismatch_rows: stats.bin_mismatch_rows as u64,
-                                    mismatch_samples: stats.mismatch_samples,
-                                    timestamp_ms: now_ms(),
-                                })
-                                .await;
+                            let cmd = MetadataCommand::RecordJobBatch {
+                                job_id: job_id.clone(),
+                                node_id,
+                                namespace: params.namespace.clone(),
+                                set_name: params.set_name.clone(),
+                                is_dq_validation: params.is_validate_mode(),
+                                rows_written: stats.rows_written as u64,
+                                overload_retries: stats.overload_retries,
+                                other_retries: stats.other_retries,
+                                rows_validated: stats.rows_validated as u64,
+                                matched_rows: stats.matched_rows as u64,
+                                mismatched_rows: stats.mismatched_rows as u64,
+                                missing_keys: stats.missing_keys as u64,
+                                bin_mismatch_rows: stats.bin_mismatch_rows as u64,
+                                mismatch_samples: stats.mismatch_samples,
+                                timestamp_ms: now_ms(),
+                            };
+                            if coalesce_raft_batches {
+                                pending_raft_commands.push(cmd);
+                                if pending_raft_commands.len() >= 64 {
+                                    let _ = raft
+                                        .propose_batch(std::mem::take(&mut pending_raft_commands))
+                                        .await;
+                                }
+                            } else {
+                                let _ = raft.propose(cmd).await;
+                            }
                         }
 
-                        if is_first_batch {
-                            if tx
-                                .send(Ok(PutResult {
-                                    app_metadata: Bytes::from(ack_bytes),
-                                }))
-                                .await
-                                .is_err()
-                            {
-                                // Client closed stream early
-                                return;
+                        if tx
+                            .send(Ok(PutResult {
+                                app_metadata: Bytes::from(ack_bytes),
+                            }))
+                            .await
+                            .is_err()
+                        {
+                            // Client closed stream early
+                            if let Some(ref raft) = raft_node {
+                                if !pending_raft_commands.is_empty() {
+                                    let _ = raft
+                                        .propose_batch(std::mem::take(&mut pending_raft_commands))
+                                        .await;
+                                }
                             }
+                            return;
                         }
                     }
+                }
+            }
+
+            if let Some(ref raft) = raft_node {
+                if !pending_raft_commands.is_empty() {
+                    let _ = raft
+                        .propose_batch(std::mem::take(&mut pending_raft_commands))
+                        .await;
                 }
             }
 

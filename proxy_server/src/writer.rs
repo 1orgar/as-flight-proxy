@@ -16,8 +16,8 @@ use tracing::{debug, warn};
 
 use crate::config::{RetryConfig, WriteParameters, WriterConfig};
 use crate::converter::{
-    PreparedRecord, RecordDqResult, ScannedRecord, convert_record_batch,
-    validate_record_against_bins,
+    PreparedRecord, RecordDqResult, ScannedRecord, convert_record_batch_with_key_index,
+    validate_record_against_bins, validate_record_batch_schema,
 };
 use crate::error::{ProxyError, Result};
 use crate::metrics::ProxyMetrics;
@@ -572,11 +572,11 @@ impl MppWriteEngine {
                 .await;
         }
 
+        let key_col_idx = validate_record_batch_schema(batch, params, max_bin_name_len)?;
         let num_bins = batch.num_columns().saturating_sub(1).max(1);
-        let bin_weight = ((num_bins + 31) / 32).clamp(1, 10);
+        let bin_weight = ((num_bins + 9) / 10).max(1);
         let base_chunk_size = self.writer_config.batch_write_size.max(1);
-        let min_chunk = 64.min(base_chunk_size / 2).max(1);
-        let chunk_size = (base_chunk_size / bin_weight).max(min_chunk).min(base_chunk_size);
+        let chunk_size = (base_chunk_size / bin_weight).max(16).min(base_chunk_size);
 
         let use_batch = params
             .use_batch_write
@@ -601,13 +601,14 @@ impl MppWriteEngine {
                 stats.rows_written += written;
                 stats.overload_retries += ov_ret;
                 stats.other_retries += oth_ret;
+                tokio::task::yield_now().await;
             }
 
             let fut = self.write_subbatch_slice(
                 slice,
                 params.clone(),
                 use_batch,
-                max_bin_name_len,
+                key_col_idx,
                 bin_weight,
             );
             in_flight_futures.push(fut);
@@ -618,6 +619,7 @@ impl MppWriteEngine {
             stats.rows_written += written;
             stats.overload_retries += ov_ret;
             stats.other_retries += oth_ret;
+            tokio::task::yield_now().await;
         }
 
         self.metrics.inc_records_written(stats.rows_written as u64);
@@ -639,11 +641,11 @@ impl MppWriteEngine {
             return Ok(BatchWriteStats::default());
         }
 
+        let key_col_idx = validate_record_batch_schema(batch, params, max_bin_name_len)?;
         let num_bins = batch.num_columns().saturating_sub(1).max(1);
-        let bin_weight = ((num_bins + 31) / 32).clamp(1, 10);
+        let bin_weight = ((num_bins + 9) / 10).max(1);
         let base_chunk_size = self.writer_config.batch_write_size.max(1);
-        let min_chunk = 64.min(base_chunk_size / 2).max(1);
-        let chunk_size = (base_chunk_size / bin_weight).max(min_chunk).min(base_chunk_size);
+        let chunk_size = (base_chunk_size / bin_weight).max(16).min(base_chunk_size);
         let max_concurrency = self
             .writer_config
             .max_concurrent_subbatches_per_stream
@@ -663,10 +665,11 @@ impl MppWriteEngine {
                 let sub = sub_stats?;
                 stats.rows_validated += sub.rows_validated;
                 Self::merge_validation_stats(&mut stats, sub);
+                tokio::task::yield_now().await;
             }
 
             let fut =
-                self.validate_subbatch_slice(slice, params.clone(), max_bin_name_len, bin_weight);
+                self.validate_subbatch_slice(slice, params.clone(), key_col_idx, bin_weight);
             in_flight_futures.push(fut);
         }
 
@@ -674,6 +677,7 @@ impl MppWriteEngine {
             let sub = res?;
             stats.rows_validated += sub.rows_validated;
             Self::merge_validation_stats(&mut stats, sub);
+            tokio::task::yield_now().await;
         }
 
         self.metrics
@@ -689,7 +693,7 @@ impl MppWriteEngine {
         slice: RecordBatch,
         params: WriteParameters,
         use_batch: bool,
-        max_bin_name_len: usize,
+        key_col_idx: usize,
         bin_weight: usize,
     ) -> Result<(usize, u64, u64)> {
         let slice_rows = slice.num_rows();
@@ -706,7 +710,7 @@ impl MppWriteEngine {
             .map_err(|_| ProxyError::Internal("Backpressure semaphore closed".to_string()))?;
 
         // 2. Convert only this small slice while holding the semaphore permit, then drop the slice reference
-        let chunk = convert_record_batch(&slice, &params, max_bin_name_len)?;
+        let chunk = convert_record_batch_with_key_index(&slice, &params, key_col_idx)?;
         drop(slice);
         let num_records = chunk.len();
         if num_records == 0 {
@@ -734,7 +738,7 @@ impl MppWriteEngine {
         &self,
         slice: RecordBatch,
         params: WriteParameters,
-        max_bin_name_len: usize,
+        key_col_idx: usize,
         bin_weight: usize,
     ) -> Result<BatchWriteStats> {
         let slice_rows = slice.num_rows();
@@ -749,7 +753,7 @@ impl MppWriteEngine {
             .await
             .map_err(|_| ProxyError::Internal("Backpressure semaphore closed".to_string()))?;
 
-        let chunk = convert_record_batch(&slice, &params, max_bin_name_len)?;
+        let chunk = convert_record_batch_with_key_index(&slice, &params, key_col_idx)?;
         drop(slice);
         let num_records = chunk.len();
         if num_records == 0 {

@@ -3,8 +3,8 @@
 > 🌐 **Язык / Language**: **[🇷🇺 Русский (README.ru.md)](README.ru.md)** | **[🇬🇧 English (README.md)](README.md)**
 
 [![CI & Build Artifacts](https://github.com/1orgar/as-flight-proxy/actions/workflows/ci.yml/badge.svg)](https://github.com/1orgar/as-flight-proxy/actions/workflows/ci.yml)
-[![Coverage (Rust Proxy)](https://img.shields.io/badge/coverage%20(rust)-86.1%25-brightgreen?logo=rust)](https://github.com/1orgar/as-flight-proxy/actions/workflows/ci.yml)
-[![Coverage (Spark Connector)](https://img.shields.io/badge/coverage%20(scala)-88.2%25-brightgreen?logo=scala)](https://github.com/1orgar/as-flight-proxy/actions/workflows/ci.yml)
+[![Coverage (Rust Proxy)](https://img.shields.io/badge/coverage%20(rust)-85.6%25-brightgreen?logo=rust)](https://github.com/1orgar/as-flight-proxy/actions/workflows/ci.yml)
+[![Coverage (Spark Connector)](https://img.shields.io/badge/coverage%20(scala)-91.9%25-brightgreen?logo=scala)](https://github.com/1orgar/as-flight-proxy/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/1orgar/as-flight-proxy?include_prereleases&label=Release)](https://github.com/1orgar/as-flight-proxy/releases)
 [![Rust](https://img.shields.io/badge/Rust-1.88%2B-orange?logo=rust)](https://www.rust-lang.org/)
 [![Spark](https://img.shields.io/badge/Apache%20Spark-3.5-E25A1C?logo=apachespark)](https://spark.apache.org/)
@@ -129,9 +129,21 @@ flowchart LR
    * **На уровне буферов Arrow IPC (`ZSTD` / `LZ4_FRAME`)**: нативное сжатие off-heap буферов колонок через JNI (`com.github.luben.zstd.Zstd.compressUnsafe` / `decompressUnsafe`) в `spark_connector` и `arrow-ipc` в `proxy_server`.
    * **На уровне gRPC-конвертов (`zstd`, `gzip`)**: сжатие HTTP/2 фреймов в Tonic и Netty gRPC.
    * **Полное отключение компрессии**: задайте `flight.compression.enabled = false` (или `flight.compression = none`) на клиенте или `compression_enabled = false` в `config.toml` прокси-сервера.
-2. **Оптимизации горячего пути**:
-   * В `spark_connector`: предкомпилированные на уровне схемы функции записи/чтения векторов (`ArrowBatchConverter` / `ArrowRowReader`) без `match` по типам на каждой строке и переиспользуемый `GenericInternalRow`.
-   * В `proxy_server`: zero-clone нарезка под-батчей (`Arc<Vec<ConvertedRow>>`), исполнение первой попытки `BatchWrite` без клонирования строк и `Release`-профиль с `lto = "thin"`, `codegen-units = 1`, `opt-level = 3`.
+2. **Оптимизации горячего пути (включая широкие таблицы до `300+` бинов в `0.4.3`)**:
+   * В `spark_connector`: специализированные небоксированные функции записи примитивов (`RowColumnWriter`), прямой перенос `UTF8String` в `VarCharVector` без промежуточного `byte[]` (`getBaseObject`), сохранение выученной ёмкости буферов при `reset()` и конвейерная отправка `DoPut` со скользящим окном (`maxInFlightBatches = 2`).
+   * В `proxy_server`: удержание буферов сокетов Aerospike до `256 КБ` (`buffer_reclaim_threshold = 262144`), однократная валидация схемы на весь `RecordBatch` с заимствованными ссылками `&str` на имена бинов, адаптивная нарезка `BatchWrite` по ширине таблицы (`bin_weight = ceil(num_bins / 10)`), коалесцирование обновлений статуса в Raft (`propose_batch` без межканальных блокировок) и `Release`-профиль с `lto = "thin"`, `codegen-units = 1`, `opt-level = 3`.
+
+### Оптимальные сочетания параметров (`spark_connector` + `proxy.toml`) по сценариям
+
+> 📖 Подробный разбор формул расчёта и тюнинга см. в **[Руководстве по настройке `proxy_server` (Раздел 5)](docs/ru/proxy-configuration.md#5-рекомендации-по-тюнингу-производительности-и-оптимальные-сочетания-параметров-proxytoml--spark_connector)**.
+
+| Сценарий нагрузки | Параметры `spark_connector` | Параметры `proxy.toml` |
+| :--- | :--- | :--- |
+| **Узкие таблицы (`1–20` бинов)** | `connector.batchSize = "8192"`<br>`connector.writerThreads = "2"`..`"4"`<br>`flight.compression = "zstd"`, `level = "1"` | `writer.batch_write_size = 512..1024`<br>`writer.max_in_flight_records = 16384`<br>`writer.max_concurrent_subbatches_per_stream = 16` |
+| **Широкие таблицы (`50–150` бинов, например `100` `Float`)** | `connector.batchSize = "2048"`..`"4096"`<br>`connector.writerThreads = "2"`<br>`flight.compression = "zstd"`, `level = "1"` | `writer.batch_write_size = 512`<br>`writer.max_in_flight_records = 32768`<br>`writer.max_concurrent_subbatches_per_stream = 8`<br>`aerospike.conn_pools_per_node = 8` |
+| **Сверхширокие таблицы (`150–300+` бинов) или тяжёлые CDT** | `connector.batchSize = "1024"`..`"2048"`<br>`connector.writerThreads = "1"`..`"2"`<br>`flight.compression = "zstd"`, `level = "1"`..`"3"` | `server.max_decoding_message_size_mb = 128`<br>`writer.batch_write_size = 256..512`<br>`writer.max_in_flight_records = 32768`<br>`writer.max_concurrent_subbatches_per_stream = 6..8` |
+| **Высокий параллелизм Spark (`160+` ядер) + малые поды (`1 vCPU / 2 Гб`)** | `connector.batchSize = "2048"`<br>`connector.writerThreads = "1"`..`"2"`<br>`flight.compression = "zstd"` (или `"lz4"`) | `writer.batch_write_size = 512`<br>`writer.max_in_flight_records = 16384`<br>`writer.max_concurrent_subbatches_per_stream = 4..8` |
+| **Параллельное чтение (`DoGet`) и `DoExchange` Lookup** | `aerospike.read.numPartitions = "160"`..`"320"`<br>`aerospike.read.batchSize = "4096"` + `.select(...)` | `server.compression = "zstd"`, `compression_level = 1`<br>`writer.batch_write_size = 512` |
 
 ---
 
@@ -363,7 +375,7 @@ sbt "set ThisBuild / coverageEnabled := false" assembly
 При каждом пуше в `main` и создании тега `v*` workflow [`.github/workflows/ci.yml`](.github/workflows/ci.yml) автоматически проверяет покрытие (`>= 85%`) и публикует 3 релизных артефакта:
 1. `as_proxy_server-linux-x86_64.zip` — ZIP-архив с бинарником `as_proxy_server` для Linux `x86_64` и примером конфигурации `config.example.toml`.
 2. `as_proxy_server-linux-arm64.zip` — ZIP-архив с бинарником `as_proxy_server` для Linux `ARM64` (`aarch64`) и `config.example.toml`.
-3. `spark-aerospike-flight-connector-assembly-0.4.0.jar` — Fat-JAR коннектора для Spark 3.5 (Scala 2.12).
+3. `spark-aerospike-flight-connector-assembly-0.4.3.jar` — Fat-JAR коннектора для Spark 3.5 (Scala 2.12).
 
 ### Запуск полного E2E-стенда (Docker Compose)
 ```bash
@@ -373,7 +385,7 @@ curl -sL "https://github.com/1orgar/as-flight-proxy/releases/latest/download/as_
 unzip -o e2e/artifacts/proxy.zip -d e2e/artifacts/
 mv "e2e/artifacts/as_proxy_server-linux-${ARCH}" e2e/artifacts/as_proxy_server
 chmod +x e2e/artifacts/as_proxy_server
-curl -sL "https://github.com/1orgar/as-flight-proxy/releases/latest/download/spark-aerospike-flight-connector-assembly-0.4.0.jar" -o e2e/artifacts/spark-aerospike-flight-connector-assembly-0.4.0.jar
+curl -sL "https://github.com/1orgar/as-flight-proxy/releases/latest/download/spark-aerospike-flight-connector-assembly-0.4.3.jar" -o e2e/artifacts/spark-aerospike-flight-connector-assembly-0.4.3.jar
 
 docker compose -f docker-compose.e2e.yml up --abort-on-container-exit --exit-code-from spark-e2e
 docker compose -f docker-compose.e2e.yml down

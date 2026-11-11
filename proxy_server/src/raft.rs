@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{Mutex, RwLock, oneshot, watch};
+use tokio::sync::{Mutex, RwLock, watch};
 use tracing::{debug, info, warn};
 
 use crate::config::RaftConfig;
@@ -424,9 +424,6 @@ impl RaftVolatileCore {
 pub struct RaftNode {
     config: RaftConfig,
     core: Mutex<RaftVolatileCore>,
-    replication_lock: Mutex<()>,
-    forward_lock: Mutex<()>,
-    pending_forwards: Mutex<Vec<(MetadataCommand, oneshot::Sender<bool>)>>,
     state_machine: RwLock<ClusterMetadataState>,
     shutdown_tx: watch::Sender<bool>,
 }
@@ -443,9 +440,6 @@ impl RaftNode {
         Arc::new(Self {
             config,
             core: Mutex::new(core),
-            replication_lock: Mutex::new(()),
-            forward_lock: Mutex::new(()),
-            pending_forwards: Mutex::new(Vec::new()),
             state_machine: RwLock::new(ClusterMetadataState::default()),
             shutdown_tx,
         })
@@ -453,6 +447,13 @@ impl RaftNode {
 
     pub fn node_id(&self) -> u64 {
         self.config.node_id
+    }
+
+    pub fn has_remote_peers(&self) -> bool {
+        self.config
+            .peers
+            .iter()
+            .any(|p| p.node_id != self.config.node_id)
     }
 
     /// Start the Raft TCP server on `config.listen_addr` and spawn background election / replication tasks.
@@ -576,11 +577,23 @@ impl RaftNode {
     }
 
     /// Propose a metadata command to the Raft cluster.
-    /// - If this node is the Leader, appends to log, replicates to peers (using group commit), and applies once committed.
-    /// - If this node is a Follower, batches concurrent proposals and forwards them to the current Leader over the Raft port.
+    /// - If this node is the Leader, appends to log, replicates to peers, and applies once committed.
+    /// - If this node is a Follower, forwards the command to the current Leader over the Raft port.
     pub async fn propose(self: &Arc<Self>, command: MetadataCommand) -> Result<()> {
+        self.propose_batch(vec![command]).await
+    }
+
+    /// Propose a batch of metadata commands to the Raft cluster in a single RPC / log append.
+    pub async fn propose_batch(self: &Arc<Self>, commands: Vec<MetadataCommand>) -> Result<()> {
+        if commands.is_empty() {
+            return Ok(());
+        }
+
         if !self.config.enabled {
-            self.state_machine.write().await.apply(&command);
+            let mut sm = self.state_machine.write().await;
+            for cmd in &commands {
+                sm.apply(cmd);
+            }
             return Ok(());
         }
 
@@ -592,49 +605,26 @@ impl RaftNode {
 
             if role == RaftRole::Leader {
                 return self
-                    .append_and_replicate_batch_as_leader(vec![command])
+                    .append_and_replicate_batch_as_leader(commands)
                     .await;
             }
 
             if let Some(lid) = leader_id {
                 if let Some(peer) = self.config.peers.iter().find(|p| p.node_id == lid) {
-                    let (tx, mut rx) = oneshot::channel();
-                    self.pending_forwards
-                        .lock()
-                        .await
-                        .push((command.clone(), tx));
-
-                    let _fwd_guard = self.forward_lock.lock().await;
-                    if let Ok(done) = rx.try_recv() {
-                        if done {
-                            return Ok(());
+                    let req = if commands.len() == 1 {
+                        RaftRpcRequest::Propose {
+                            command: commands[0].clone(),
                         }
                     } else {
-                        let batch: Vec<(MetadataCommand, oneshot::Sender<bool>)> = {
-                            let mut q = self.pending_forwards.lock().await;
-                            std::mem::take(&mut *q)
-                        };
-                        if !batch.is_empty() {
-                            let commands: Vec<MetadataCommand> =
-                                batch.iter().map(|(c, _)| c.clone()).collect();
-                            let req = if commands.len() == 1 {
-                                RaftRpcRequest::Propose {
-                                    command: commands.into_iter().next().unwrap(),
-                                }
-                            } else {
-                                RaftRpcRequest::ProposeBatch { commands }
-                            };
-                            let ok = matches!(
-                                send_rpc(&peer.raft_addr, &req, 1500).await,
-                                Ok(RaftRpcResponse::Propose { success: true, .. })
-                            );
-                            for (_, sender) in batch {
-                                let _ = sender.send(ok);
-                            }
-                            if ok {
-                                return Ok(());
-                            }
+                        RaftRpcRequest::ProposeBatch {
+                            commands: commands.clone(),
                         }
+                    };
+                    if let Ok(RaftRpcResponse::Propose {
+                        success: true, ..
+                    }) = send_rpc(&peer.raft_addr, &req, 1500).await
+                    {
+                        return Ok(());
                     }
                 }
             }
@@ -648,7 +638,10 @@ impl RaftNode {
             node_id = self.config.node_id,
             "Raft leader unreachable after retries; applying metadata update locally"
         );
-        self.state_machine.write().await.apply(&command);
+        let mut sm = self.state_machine.write().await;
+        for cmd in &commands {
+            sm.apply(cmd);
+        }
         Ok(())
     }
 
@@ -735,18 +728,13 @@ impl RaftNode {
             return Ok(());
         }
 
-        // Group commit: serialize peer replication so concurrent proposals are replicated together
-        let _rep_guard = self.replication_lock.lock().await;
-        let already_committed = self.core.lock().await.commit_index >= entry_index;
-        if !already_committed {
-            self.replicate_to_peers_unlocked().await;
-        }
+        self.replicate_to_peers().await;
         self.apply_committed_entries().await;
 
         let committed = self.core.lock().await.commit_index >= entry_index;
         if committed && needs_immediate_follower_commit {
             // Propagate the updated leader_commit index to followers so follower reads after SetJobState/ResetJob are immediately consistent
-            self.replicate_to_peers_unlocked().await;
+            self.replicate_to_peers().await;
         } else if !committed {
             debug!(
                 node_id = self.config.node_id,
@@ -896,11 +884,6 @@ impl RaftNode {
     }
 
     async fn replicate_to_peers(self: &Arc<Self>) {
-        let _rep_guard = self.replication_lock.lock().await;
-        self.replicate_to_peers_unlocked().await;
-    }
-
-    async fn replicate_to_peers_unlocked(self: &Arc<Self>) {
         let remote_peers: Vec<_> = self
             .config
             .peers

@@ -3,8 +3,8 @@
 > 🌐 **Language / Язык**: **[🇬🇧 English (README.md)](README.md)** | **[🇷🇺 Русская версия (README.ru.md)](README.ru.md)**
 
 [![CI & Build Artifacts](https://github.com/1orgar/as-flight-proxy/actions/workflows/ci.yml/badge.svg)](https://github.com/1orgar/as-flight-proxy/actions/workflows/ci.yml)
-[![Coverage (Rust Proxy)](https://img.shields.io/badge/coverage%20(rust)-86.1%25-brightgreen?logo=rust)](https://github.com/1orgar/as-flight-proxy/actions/workflows/ci.yml)
-[![Coverage (Spark Connector)](https://img.shields.io/badge/coverage%20(scala)-88.2%25-brightgreen?logo=scala)](https://github.com/1orgar/as-flight-proxy/actions/workflows/ci.yml)
+[![Coverage (Rust Proxy)](https://img.shields.io/badge/coverage%20(rust)-85.6%25-brightgreen?logo=rust)](https://github.com/1orgar/as-flight-proxy/actions/workflows/ci.yml)
+[![Coverage (Spark Connector)](https://img.shields.io/badge/coverage%20(scala)-91.9%25-brightgreen?logo=scala)](https://github.com/1orgar/as-flight-proxy/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/1orgar/as-flight-proxy?include_prereleases&label=Release)](https://github.com/1orgar/as-flight-proxy/releases)
 [![Rust](https://img.shields.io/badge/Rust-1.88%2B-orange?logo=rust)](https://www.rust-lang.org/)
 [![Spark](https://img.shields.io/badge/Apache%20Spark-3.5-E25A1C?logo=apachespark)](https://spark.apache.org/)
@@ -129,9 +129,21 @@ The connector and proxy server implement end-to-end hot-path optimizations and c
    * **Arrow IPC Body Compression (`ZSTD` / `LZ4_FRAME`)**: Native off-heap buffer compression via JNI (`com.github.luben.zstd.Zstd.compressUnsafe` / `decompressUnsafe`) in `spark_connector` and `arrow-ipc` in `proxy_server`.
    * **gRPC Envelope Compression (`zstd`, `gzip`)**: HTTP/2 frame-level compression in Tonic and Netty gRPC.
    * **Disabling Compression**: Set `flight.compression.enabled = false` (or `flight.compression = none`) on the Spark connector, or `compression_enabled = false` in the proxy server's `config.toml`.
-2. **Hot-Path Optimizations**:
-   * **Spark Connector**: Pre-compiled per-column readers and writers (`ArrowBatchConverter` / `ArrowRowReader`) that eliminate per-row type dispatch, plus a reusable `GenericInternalRow` on the read path.
-   * **Rust Proxy Server**: Zero-clone sub-batch slicing (`Arc<Vec<ConvertedRow>>`), zero-clone first-attempt `BatchWrite` execution, and a Cargo release profile with `lto = "thin"`, `codegen-units = 1`, `opt-level = 3`, and `strip = true`.
+2. **Hot-Path Optimizations (including wide tables up to `300+` bins in `0.4.3`)**:
+   * **Spark Connector**: Unboxed primitive column writers (`RowColumnWriter`), zero-copy `UTF8String` to `VarCharVector` transfer via `getBaseObject`, preserved vector buffer capacity across `reset()`, and sliding-window `DoPut` pipelining (`maxInFlightBatches = 2`).
+   * **Rust Proxy Server**: Pooled Aerospike socket buffer retention up to `256 KB` (`buffer_reclaim_threshold = 262144`), single-pass `RecordBatch` schema validation with borrowed `&str` bin names, adaptive bin-aware sub-batch slicing (`bin_weight = ceil(num_bins / 10)`), stream-coalesced Raft job updates (`propose_batch` with zero cross-stream lock contention), and a Cargo release profile with `lto = "thin"`, `codegen-units = 1`, `opt-level = 3`, and `strip = true`.
+
+### Optimal Parameter Combinations (`spark_connector` + `proxy.toml`) by Workload
+
+> 📖 For sizing formulas and detailed tuning guidance, see **[Proxy Server Configuration (Section 5)](docs/en/proxy-configuration.md#5-performance-tuning--optimal-parameter-combinations-proxytoml--spark_connector)**.
+
+| Workload Scenario | `spark_connector` Options | `proxy.toml` Settings |
+| :--- | :--- | :--- |
+| **Narrow Tables (`1–20` bins)** | `connector.batchSize = "8192"`<br>`connector.writerThreads = "2"`..`"4"`<br>`flight.compression = "zstd"`, `level = "1"` | `writer.batch_write_size = 512..1024`<br>`writer.max_in_flight_records = 16384`<br>`writer.max_concurrent_subbatches_per_stream = 16` |
+| **Wide Tables (`50–150` bins, e.g. `100` `Float`s)** | `connector.batchSize = "2048"`..`"4096"`<br>`connector.writerThreads = "2"`<br>`flight.compression = "zstd"`, `level = "1"` | `writer.batch_write_size = 512`<br>`writer.max_in_flight_records = 32768`<br>`writer.max_concurrent_subbatches_per_stream = 8`<br>`aerospike.conn_pools_per_node = 8` |
+| **Ultra-Wide Tables (`150–300+` bins) or Heavy CDTs** | `connector.batchSize = "1024"`..`"2048"`<br>`connector.writerThreads = "1"`..`"2"`<br>`flight.compression = "zstd"`, `level = "1"`..`"3"` | `server.max_decoding_message_size_mb = 128`<br>`writer.batch_write_size = 256..512`<br>`writer.max_in_flight_records = 32768`<br>`writer.max_concurrent_subbatches_per_stream = 6..8` |
+| **High-Concurrency Spark (`160+` cores) + Small Pods (`1 vCPU / 2 GB`)** | `connector.batchSize = "2048"`<br>`connector.writerThreads = "1"`..`"2"`<br>`flight.compression = "zstd"` (or `"lz4"`) | `writer.batch_write_size = 512`<br>`writer.max_in_flight_records = 16384`<br>`writer.max_concurrent_subbatches_per_stream = 4..8` |
+| **Parallel Read (`DoGet`) & `DoExchange` Lookup** | `aerospike.read.numPartitions = "160"`..`"320"`<br>`aerospike.read.batchSize = "4096"` + `.select(...)` | `server.compression = "zstd"`, `compression_level = 1`<br>`writer.batch_write_size = 512` |
 
 ---
 
@@ -363,7 +375,7 @@ sbt "set ThisBuild / coverageEnabled := false" assembly
 On every push to `main` and `v*` tag, [`.github/workflows/ci.yml`](.github/workflows/ci.yml) enforces `>= 85%` test coverage and publishes 3 release artifacts:
 1. `as_proxy_server-linux-x86_64.zip` — ZIP archive containing the stripped `as_proxy_server` binary for Linux `x86_64` and `config.example.toml`.
 2. `as_proxy_server-linux-arm64.zip` — ZIP archive containing the stripped `as_proxy_server` binary for Linux `ARM64` (`aarch64`) and `config.example.toml`.
-3. `spark-aerospike-flight-connector-assembly-0.4.2.jar` — Shaded Fat-JAR connector for Apache Spark 3.5 (Scala 2.12).
+3. `spark-aerospike-flight-connector-assembly-0.4.3.jar` — Shaded Fat-JAR connector for Apache Spark 3.5 (Scala 2.12).
 
 ### Running the Full E2E Benchmark & Verification Suite (Docker Compose)
 ```bash
@@ -373,7 +385,7 @@ curl -sL "https://github.com/1orgar/as-flight-proxy/releases/latest/download/as_
 unzip -o e2e/artifacts/proxy.zip -d e2e/artifacts/
 mv "e2e/artifacts/as_proxy_server-linux-${ARCH}" e2e/artifacts/as_proxy_server
 chmod +x e2e/artifacts/as_proxy_server
-curl -sL "https://github.com/1orgar/as-flight-proxy/releases/latest/download/spark-aerospike-flight-connector-assembly-0.4.2.jar" -o e2e/artifacts/spark-aerospike-flight-connector-assembly-0.4.2.jar
+curl -sL "https://github.com/1orgar/as-flight-proxy/releases/latest/download/spark-aerospike-flight-connector-assembly-0.4.3.jar" -o e2e/artifacts/spark-aerospike-flight-connector-assembly-0.4.3.jar
 
 docker compose -f docker-compose.e2e.yml up --abort-on-container-exit --exit-code-from spark-e2e
 docker compose -f docker-compose.e2e.yml down

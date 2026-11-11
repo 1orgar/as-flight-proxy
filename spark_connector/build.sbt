@@ -1,6 +1,6 @@
 name := "spark-aerospike-flight-connector"
 organization := "com.asproxy"
-version := "0.4.2"
+version := "0.4.3"
 scalaVersion := "2.12.18"
 
 val sparkVersion = "3.5.2"

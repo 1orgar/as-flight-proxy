@@ -76,6 +76,7 @@ fn build_client_policy(cfg: &AppConfig) -> ClientPolicy {
     client_policy.min_conns_per_node = cfg.aerospike.min_conns_per_node;
     client_policy.max_conns_per_node = cfg.aerospike.max_conns_per_node;
     client_policy.conn_pools_per_node = cfg.aerospike.conn_pools_per_node;
+    client_policy.buffer_reclaim_threshold = 262_144;
     client_policy
 }
 

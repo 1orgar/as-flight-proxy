@@ -239,13 +239,44 @@ AS_PROXY_NODE_ID=3 ./as_proxy_server --config /etc/as_proxy/proxy.toml
 
 ---
 
-## 5. Рекомендации по тюнингу производительности
+## 5. Рекомендации по тюнингу производительности и оптимальные сочетания параметров (`proxy.toml` + `spark_connector`)
 
-1. **Выбор `writer.batch_write_size`**:
-   * Для строк с `5–20` скалярными бинами оптимален размер `512..1024` (обеспечивает пропускную способность свыше `400 000` строк/сек на 2 нодах прокси).
-   * Для «тяжёлых» записей с большими CDT (`Array`/`Map`/`Struct`) или `Binary` (`> 10 КБ` на запись) уменьшите `batch_write_size` до `128..256`.
-2. **Пул соединений `aerospike.max_conns_per_node` и `conn_pools_per_node`**:
-   * Рекомендуется держать `max_conns_per_node >= (max_in_flight_records / batch_write_size) * 4` и `conn_pools_per_node = 4` или `8` для отсутствия блокировок между потоками Tokio.
-3. **Компрессия `server.compression`**:
-   * Оставьте `compression = "zstd"` (по умолчанию) для межзональных и облачных сетей: это сокращает сетевой трафик в `3–6 раз` при минимальной нагрузке на CPU благодаря нативному `zstd`.
-   * При необходимости максимальной экономии CPU в локальной сети 100GbE переключите на `compression = "lz4"` или отключите через `compression_enabled = false`.
+Производительность сквозного конвейера **Spark → Arrow Flight → `as_proxy_server` → Aerospike** зависит от согласованности параметров на стороне коннектора и прокси-сервера. Начиная с версии `0.4.3`, прокси автоматически масштабирует размер под-батча по числу бинов (`bin_weight = ceil(num_bins / 10)`), коалесцирует обновления статуса Raft в конец стрима (`propose_batch` без блокировок между стримами) и удерживает буферы сокетов Aerospike до `256 КБ` (`buffer_reclaim_threshold = 262144`) без переаллокаций.
+
+### 5.1. Сводная матрица оптимальных параметров по сценариям (Use Cases)
+
+| Сценарий нагрузки | Параметры Spark-коннектора (`.option(...)`) | Параметры `proxy.toml` (`as_proxy_server`) | Ожидаемый профиль и пояснение |
+| :--- | :--- | :--- | :--- |
+| **1. Узкие таблицы (1–20 бинов)**<br>Счётчики, профили, KV-признаки (`< 300 байт` на запись) | `connector.batchSize = "8192"`<br>`connector.writerThreads = "2"`..`"4"`<br>`flight.compression = "zstd"`<br>`flight.compression.level = "1"` | `writer.batch_write_size = 512` (или `1024`)<br>`writer.max_in_flight_records = 16384`<br>`writer.max_concurrent_subbatches_per_stream = 16`<br>`aerospike.max_conns_per_node = 512`<br>`aerospike.conn_pools_per_node = 4` | Максимальный RPS (`300K–500K+` строк/с на кластер прокси). Крупные батчи Arrow (`8192`) минимизируют накладные расходы gRPC. |
+| **2. Широкие таблицы (50–150 бинов)**<br>Витрины ML-фичей (например, `100` колонок `Float`/`Double`/`Int`, `~1–2 КБ` на запись) | `connector.batchSize = "2048"`..`"4096"`<br>`connector.writerThreads = "2"`<br>`flight.compression = "zstd"`<br>`flight.compression.level = "1"` | `writer.batch_write_size = 512`<br>`writer.max_in_flight_records = 32768`<br>`writer.max_concurrent_subbatches_per_stream = 8`<br>`aerospike.max_conns_per_node = 512`<br>`aerospike.conn_pools_per_node = 8` | При `100` бинах `bin_weight = 10` автоматически нарезает `BatchWrite` по `~51` записи (`~5100` бинов за сетевой вызов), укладываясь в буфер `256 КБ` без фрагментации памяти. |
+| **3. Сверхширокие таблицы (150–300+ бинов) или тяжёлые CDT (`Array`/`Map`/`Struct`)** | `connector.batchSize = "1024"`..`"2048"`<br>`connector.writerThreads = "1"`..`"2"`<br>`flight.compression = "zstd"`<br>`flight.compression.level = "1"`..`"3"` | `server.max_decoding_message_size_mb = 128`<br>`writer.batch_write_size = 256`..`512`<br>`writer.max_in_flight_records = 32768`<br>`writer.max_concurrent_subbatches_per_stream = 6`..`8`<br>`aerospike.timeout_ms = 3000` | Уменьшение `batchSize` до `1024..2048` удерживает размер одного Arrow `RecordBatch` в пределах `2–6 МБ` off-heap памяти и исключает пики GC/памяти на экзекьюторах. |
+| **4. Большой кластер Spark (`100–200+` ядер) + компактные поды прокси (`1–2 vCPU`, `2 Гб RAM`)** | `connector.batchSize = "2048"`<br>`connector.writerThreads = "1"`..`"2"`<br>`flight.compression = "zstd"` (или `"lz4"`)<br>`flight.compression.level = "1"` | `writer.batch_write_size = 512`<br>`writer.max_in_flight_records = 16384`<br>`writer.max_concurrent_subbatches_per_stream = 4`..`8`<br>`aerospike.max_conns_per_node = 512` | Например, при `40` экзекьюторах × `4` ядра = `160` активных тасков Spark и `writerThreads = 1..2` прокси обслуживает `160..320` потоков без лишнего переключения контекста Tokio на 1 vCPU. |
+| **5. Крупные поды прокси (`4–8+ vCPU`, `8+ Гб RAM`) + быстрая локальная сеть (`10–100 GbE`)** | `connector.batchSize = "4096"`<br>`connector.writerThreads = "2"`..`"4"`<br>`flight.compression = "lz4"` (или `"zstd:1"`) | `server.http2_stream_window_size_mb = 32`<br>`server.http2_connection_window_size_mb = 64`<br>`writer.batch_write_size = 512`<br>`writer.max_in_flight_records = 65536`<br>`writer.max_concurrent_subbatches_per_stream = 16`<br>`aerospike.max_conns_per_node = 1024`<br>`aerospike.conn_pools_per_node = 8` | Полная утилизация многоядерных подов прокси и пропускной способности сети при минимальных затратах CPU на сжатие (`lz4`). |
+| **6. Параллельное чтение (`DoGet`) и стриминговое обогащение по PK (`DoExchange` Lookup)** | `aerospike.read.numPartitions = "160"`..`"320"` (`1..2x` от числа ядер Spark)<br>`aerospike.read.batchSize = "4096"`<br>Всегда указывайте `.select(...)` нужных бинов! | `server.compression = "zstd"`<br>`server.compression_level = 1`<br>`writer.batch_write_size = 512`<br>`writer.max_in_flight_records = 32768` | Проталкивание проекции колонок (`Column Pruning`) кратно снижает трафик из Aerospike, а `batch_write_size = 512` управляет размером `BatchRead` при `DoExchange`. |
+
+---
+
+### 5.2. Детальные правила расчёта ключевых параметров
+
+1. **Как связать число ядер Spark, `connector.writerThreads` и `writer.max_concurrent_subbatches_per_stream`**:
+   * Общее число одновременных стримов `DoPut`, приходящих на один под прокси:
+     $$\text{StreamsPerPod} \approx \frac{\text{ActiveSparkTasks} \times \text{connector.writerThreads}}{\text{ProxyPods}}$$
+   * Если у вас **160 активных задач Spark** (`40` экзекьюторов по `4` ядра) и **4 пода прокси**, то при `connector.writerThreads = 2` на каждый под прокси приходится `80` одновременных стримов `DoPut`.
+   * Если под прокси имеет **1–2 vCPU**, ставьте `connector.writerThreads = "1"` или `"2"` и `writer.max_concurrent_subbatches_per_stream = 4..8`. Завышение `writerThreads` до `4..8` на 160 ядрах создаёт `640..1280` конкурентных стримов, которые конкурируют за кванты CPU планировщика Tokio.
+2. **Выбор `connector.batchSize` и `writer.batch_write_size` в зависимости от ширины таблицы**:
+   * Прокси автоматически делит каждый входящий `RecordBatch` на под-батчи размера:
+     $$\text{chunk\_size} = \max\left(16, \left\lfloor \frac{\text{batch\_write\_size}}{\lceil \text{num\_bins} / 10 \rceil} \right\rfloor\right)$$
+   * Для **100 бинов** при `batch_write_size = 512` размер одного `BatchWrite` составляет `51` запись (`~5100` бинов). Для **300 бинов** — `17` записей (`~5100` бинов). Это гарантирует, что сериализованный буфер каждой команды Aerospike не превышает `256 КБ` (`buffer_reclaim_threshold`) и не вызывает лишних аллокаций памяти.
+   * На стороне Spark выбирайте `connector.batchSize` так, чтобы произведение `batchSize × num_bins` составляло **`100 000 .. 400 000` ячеек**:
+     * `10` бинов → `batchSize = 8192`
+     * `100` бинов → `batchSize = 2048..4096`
+     * `300` бинов → `batchSize = 1024..2048`
+3. **Настройка пула соединений Aerospike (`max_conns_per_node` и `conn_pools_per_node`)**:
+   * Для отсутствия ожидания свободных сокетов (`ConnectionPoolEmpty`) держите:
+     $$\text{aerospike.max\_conns\_per\_node} \ge 512, \quad \text{aerospike.conn\_pools\_per\_node} = 4..8$$
+   * Увеличение `conn_pools_per_node` с `4` до `8` распределяет соединения по 8 независимым мьютексам на каждую ноду Aerospike, полностью устраняя конкуренцию потоков на многоядерных подах.
+4. **Выбор алгоритма и уровня компрессии (`flight.compression` и `flight.compression.level`)**:
+   * **`zstd` с уровнем `1` (по умолчанию)** — золотой стандарт для большинства инсталляций: сжимает колоночные буферы Arrow в `3–5 раз` со скоростью `> 500 МБ/с` на ядро через нативный JNI (`zstd-jni` off-heap).
+   * **`zstd` с уровнем `3..9`** — используйте только при узком сетевом канале между кластером Spark и прокси (межрегиональный трафик), когда на экзекьюторах Spark есть свободный CPU.
+   * **`lz4`** — используйте при сверхбыстрой сети (`25–100 GbE`), если CPU экзекьюторов или подов прокси загружен на `> 85%`.
+   * **`none` (`compression_enabled = false`)** — отключает сжатие полностью (нулевой расход CPU на кодеки, максимальный сетевой трафик).

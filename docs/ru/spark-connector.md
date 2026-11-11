@@ -21,17 +21,18 @@
    - [5.3. Параллельное чтение: скан 4096 партиций, `inferSchema` и PK Pushdown](#53-параллельное-чтение-скан-4096-партиций-inferschema-и-pk-pushdown)
    - [5.4. Распределённое обогащение DataFrame по ключам (`DoExchange` Lookup)](#54-распределённое-обогащение-dataframe-по-ключам-doexchange-lookup)
    - [5.5. Запрос статуса джоба и состояния кластера Raft](#55-запрос-статуса-джоба-и-состояния-кластера-raft)
+6. [Оптимальные профили настроек для разных сценариев нагрузки](#6-оптимальные-профили-настроек-для-разных-сценариев-нагрузки)
 
 ---
 
 ## 1. Подключение Fat-JAR в Spark и PySpark
 
-Используйте собранный Fat-JAR `spark-aerospike-flight-connector-assembly-0.4.2.jar` с **Apache Spark 3.5.x** (Scala 2.12, Java 11/17):
+Используйте собранный Fat-JAR `spark-aerospike-flight-connector-assembly-0.4.3.jar` с **Apache Spark 3.5.x** (Scala 2.12, Java 11/17):
 
 ```bash
 # Запуск PySpark или spark-submit
 pyspark \
-  --jars /path/to/spark-aerospike-flight-connector-assembly-0.4.2.jar \
+  --jars /path/to/spark-aerospike-flight-connector-assembly-0.4.3.jar \
   --conf "spark.driver.extraJavaOptions=--add-opens=java.base/java.nio=ALL-UNNAMED" \
   --conf "spark.executor.extraJavaOptions=--add-opens=java.base/java.nio=ALL-UNNAMED"
 ```
@@ -293,4 +294,38 @@ cluster_json = spark._jvm.com.asproxy.spark.AerospikeLoadStatus.fetchClusterStat
     "proxy-1:8815", "spark_writer", "change_me_in_prod", False
 )
 print(cluster_json)
+```
+
+---
+
+## 6. Оптимальные профили настроек для разных сценариев нагрузки
+
+Ниже приведены проверенные сочетания параметров коннектора и `as_proxy_server` для типовых промышленных профилей нагрузки (подробнее о серверных настройках см. [Раздел 5 Руководства по `proxy_server`](proxy-configuration.md#5-рекомендации-по-тюнингу-производительности-и-оптимальные-сочетания-параметров-proxytoml--spark_connector)).
+
+| Профиль DataFrame и кластера | `connector.batchSize` | `connector.writerThreads` | `flight.compression` / `level` | Соответствующие настройки `proxy.toml` |
+| :--- | :---: | :---: | :---: | :--- |
+| **Узкий DataFrame (`1–20` колонок)**<br>Счётчики, сегменты, простые KV | `8192` | `2..4` | `"zstd"` / `"1"` | `batch_write_size = 512..1024`<br>`max_in_flight_records = 16384`<br>`max_concurrent_subbatches_per_stream = 16` |
+| **Широкий DataFrame (`50–150` колонок)**<br>Например, `100` колонок `Float`/`Double` на `160` ядрах Spark (`40` экзекьюторов × `4` ядра) | `2048..4096` | `2` | `"zstd"` / `"1"` | `batch_write_size = 512`<br>`max_in_flight_records = 32768`<br>`max_concurrent_subbatches_per_stream = 8`<br>`conn_pools_per_node = 8` |
+| **Сверхширокий DataFrame (`150–300+` колонок)**<br>Крупные витрины признаков или сложные CDT (`Array`/`Map`/`Struct`) | `1024..2048` | `1..2` | `"zstd"` / `"1..3"` | `max_decoding_message_size_mb = 128`<br>`batch_write_size = 256..512`<br>`max_in_flight_records = 32768`<br>`max_concurrent_subbatches_per_stream = 6..8` |
+| **Компактные поды прокси (`1 vCPU / 2 Гб RAM`)**<br>При высоком параллелизме Spark (`160+` активных тасков) | `2048` | `1..2` | `"zstd"` (`"1"`) или `"lz4"` | `batch_write_size = 512`<br>`max_in_flight_records = 16384`<br>`max_concurrent_subbatches_per_stream = 4..8` |
+
+### Пример: оптимальная запись широкой витрины (`100–300` колонок `Float`/`Double`/`String`) на 160 ядрах Spark
+
+```python
+(
+    df.write.format("aerospike-flight")
+    .option("connector.jobId", "wide-features-300-bins-001")
+    .option("flight.hosts", "proxy-1:8815,proxy-2:8815,proxy-3:8815,proxy-4:8815")
+    .option("flight.compression", "zstd")
+    .option("flight.compression.level", "1")        # Максимальная скорость off-heap ZSTD JNI
+    .option("aerospike.namespace", "prod")
+    .option("aerospike.set", "ml_features_wide")
+    .option("aerospike.keyColumn", "entity_id")
+    .option("aerospike.writeMode", "update")
+    .option("aerospike.ignoreNulls", "true")        # Не передавать NULL-бины по сети
+    .option("connector.batchSize", "2048")          # 2048 строк x 100..300 бинов = оптимальный размер Arrow батча
+    .option("connector.writerThreads", "2")         # 160 ядер x 2 потока = 320 стримов (по 80 на каждый из 4 подов прокси)
+    .mode("append")
+    .save()
+)
 ```

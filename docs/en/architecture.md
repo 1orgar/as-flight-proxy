@@ -135,9 +135,9 @@ When `as_proxy_server` writes or reads a sub-batch in Aerospike (`src/writer.rs`
 ## 6. Raft Consensus & Distributed Job Tracking
 
 * Each `as_proxy_server` node runs an embedded Raft state machine (`src/raft.rs`) on a dedicated TCP port (`raft.listen_addr`, default `:8816`) separate from the Arrow Flight data plane (`:8815`).
-* When any proxy node finishes a `DoPut` batch for `job_id`, it submits a `RaftCommand::RecordJobBatch` entry:
-  * If the node is the **Raft Leader**, it appends the entry locally and replicates it to followers.
-  * If the node is a **Follower**, it transparently forwards the command to the current Leader over TCP.
+* During `DoPut` streaming, `PutBatchAck` is returned to the Spark executor **immediately** after `write_record_batch` completes, while `MetadataCommand::RecordJobBatch` updates are coalesced per stream and committed via `raft.propose_batch(...)` when the stream completes (or every 64 batches) without global cross-stream mutex serialization:
+  * If the node is the **Raft Leader**, it appends the batch of entries under a single lock acquisition and replicates it concurrently to followers.
+  * If the node is a **Follower**, it forwards the batch of commands to the current Leader over TCP without blocking other concurrent streams.
 * Job statistics (`JobLoadStatus`) are retained in memory for `raft.job_stats_ttl_secs` (default `3600` seconds) and automatically evicted by a background compaction task.
 
 ---
@@ -145,6 +145,8 @@ When `as_proxy_server` writes or reads a sub-batch in Aerospike (`src/writer.rs`
 ## 7. Hot-Path Performance Optimizations
 
 * **Rust Release Profile (`proxy_server/Cargo.toml`)**: Built with `opt-level = 3`, `lto = "thin"`, `codegen-units = 1`, `strip = true`.
-* **Zero-Clone Sub-Batching (`writer.rs`)**: `split_into_chunks` moves `PreparedRecord` and `Key` ownership into sub-batches without cloning; first-attempt batch execution operates on slices without cloning keys or bins.
-* **Pre-Allocated Struct Field Keys (`converter.rs`)**: Hoists `Value::String` map keys outside the row loop when building Arrow `StructArray`s from Aerospike `OrderedMap`/`HashMap` bins.
-* **Pre-Compiled Column Readers & Writers (`ArrowBatchConverter.scala` & `ArrowRowReader.scala`)**: Resolves Spark `DataType` and casts Arrow `FieldVector`s **once** per batch initialization into specialized closures (`Array[(InternalRow, Int) => Unit]` and `Array[Int => Any]`), eliminating per-cell pattern matching and boxing on the inner row loop.
+* **Aerospike Socket Buffer Retention (`buffer_reclaim_threshold = 256 KB` in `main.rs`)**: Raises `ClientPolicy::buffer_reclaim_threshold` from the `64 KB` default to `256 KB` (`262,144` bytes), eliminating repeated `128 KB` `TieredBufferPool` zeroing (`memset(0)`) and `1 KB` heap shrink cycles on wide-table `BatchOperate` payloads (`100–300+` bins).
+* **Single-Pass Schema Validation & Borrowed Bin Names (`converter.rs` & `writer.rs`)**: Validates the Arrow `RecordBatch` schema once (`validate_record_batch_schema`) before slicing into `RecordBatch::slice` sub-batches, and borrows `&str` column names directly from the Arrow `Schema` inside `CompiledBinColumn` without per-slice `String` or `HashSet` allocations.
+* **Adaptive Bin-Aware Sub-Batch Slicing (`writer.rs`)**: Automatically scales sub-batch size by bin count (`bin_weight = ceil(num_bins / 10)`), maintaining an optimal `~5,000` bins per `BatchWrite` across both narrow (`10` bins) and ultra-wide (`300` bins) tables while executing first-attempt writes with zero `Key`/`Bin` clones.
+* **Unboxed Primitive Writers & Zero-Copy `UTF8String` Transfer (`ArrowBatchConverter.scala`)**: Uses specialized `RowColumnWriter` traits to write primitive columns without JVM boxing, preserves `VarCharVector` learned buffer capacity across `reset()`, and copies `UTF8String` bytes directly from `getBaseObject` without allocating intermediate `byte[]` arrays via `utf8.getBytes`.
+* **Sliding-Window `DoPut` Stream Pipelining (`AerospikeFlightDataWriter.scala`)**: Keeps up to `maxInFlightBatches = 2` batches in flight per `DoPut` stream, overlapping network RTT with serialization of the next batch.

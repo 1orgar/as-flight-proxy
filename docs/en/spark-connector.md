@@ -21,17 +21,18 @@
    - [5.3. Parallel Read: Partition Scan, Schema Inference & PK Pushdown](#53-parallel-read-partition-scan-schema-inference--pk-pushdown)
    - [5.4. Distributed DataFrame Key Lookup Enrichment (`DoExchange`)](#54-distributed-dataframe-key-lookup-enrichment-doexchange)
    - [5.5. Querying Job Status & Raft Cluster Status](#55-querying-job-status--raft-cluster-status)
+6. [Optimal Option Profiles for Different Workloads](#6-optimal-option-profiles-for-different-workloads)
 
 ---
 
 ## 1. Installation & Spark Submit
 
-Use the shaded assembly Fat-JAR `spark-aerospike-flight-connector-assembly-0.4.2.jar` with **Apache Spark 3.5.x** (Scala 2.12, Java 11/17):
+Use the shaded assembly Fat-JAR `spark-aerospike-flight-connector-assembly-0.4.3.jar` with **Apache Spark 3.5.x** (Scala 2.12, Java 11/17):
 
 ```bash
 # PySpark shell or spark-submit
 pyspark \
-  --jars /path/to/spark-aerospike-flight-connector-assembly-0.4.2.jar \
+  --jars /path/to/spark-aerospike-flight-connector-assembly-0.4.3.jar \
   --conf "spark.driver.extraJavaOptions=--add-opens=java.base/java.nio=ALL-UNNAMED" \
   --conf "spark.executor.extraJavaOptions=--add-opens=java.base/java.nio=ALL-UNNAMED"
 ```
@@ -295,4 +296,38 @@ cluster_json = spark._jvm.com.asproxy.spark.AerospikeLoadStatus.fetchClusterStat
     "proxy-1:8815", "spark_writer", "change_me_in_prod", False
 )
 print(cluster_json)
+```
+
+---
+
+## 6. Optimal Option Profiles for Different Workloads
+
+Below are recommended connector and `as_proxy_server` parameter combinations for common production workloads (see [Section 5 of the Proxy Configuration Guide](proxy-configuration.md#5-performance-tuning--optimal-parameter-combinations-proxytoml--spark_connector) for server-side details).
+
+| DataFrame & Cluster Profile | `connector.batchSize` | `connector.writerThreads` | `flight.compression` / `level` | Matching `proxy.toml` Settings |
+| :--- | :---: | :---: | :---: | :--- |
+| **Narrow DataFrame (`1–20` columns)**<br>Counters, segments, KV attributes | `8192` | `2..4` | `"zstd"` / `"1"` | `batch_write_size = 512..1024`<br>`max_in_flight_records = 16384`<br>`max_concurrent_subbatches_per_stream = 16` |
+| **Wide DataFrame (`50–150` columns)**<br>e.g., `100` `Float`/`Double` columns on `160` Spark cores (`40` executors × `4` cores) | `2048..4096` | `2` | `"zstd"` / `"1"` | `batch_write_size = 512`<br>`max_in_flight_records = 32768`<br>`max_concurrent_subbatches_per_stream = 8`<br>`conn_pools_per_node = 8` |
+| **Ultra-Wide DataFrame (`150–300+` columns)**<br>Wide ML feature tables or nested CDTs (`Array`/`Map`/`Struct`) | `1024..2048` | `1..2` | `"zstd"` / `"1..3"` | `max_decoding_message_size_mb = 128`<br>`batch_write_size = 256..512`<br>`max_in_flight_records = 32768`<br>`max_concurrent_subbatches_per_stream = 6..8` |
+| **Small Proxy Pods (`1 vCPU / 2 GB RAM`)**<br>Under high Spark concurrency (`160+` active tasks) | `2048` | `1..2` | `"zstd"` (`"1"`) or `"lz4"` | `batch_write_size = 512`<br>`max_in_flight_records = 16384`<br>`max_concurrent_subbatches_per_stream = 4..8` |
+
+### Example: High-Throughput Write of a Wide Feature Table (`100–300` columns) on 160 Spark Cores
+
+```python
+(
+    df.write.format("aerospike-flight")
+    .option("connector.jobId", "wide-features-300-bins-001")
+    .option("flight.hosts", "proxy-1:8815,proxy-2:8815,proxy-3:8815,proxy-4:8815")
+    .option("flight.compression", "zstd")
+    .option("flight.compression.level", "1")        # Maximum off-heap ZSTD JNI speed
+    .option("aerospike.namespace", "prod")
+    .option("aerospike.set", "ml_features_wide")
+    .option("aerospike.keyColumn", "entity_id")
+    .option("aerospike.writeMode", "update")
+    .option("aerospike.ignoreNulls", "true")        # Skip NULL bins on the wire
+    .option("connector.batchSize", "2048")          # 2048 rows x 100..300 bins keeps Arrow batches compact
+    .option("connector.writerThreads", "2")         # 160 cores x 2 threads = 320 streams (80 per proxy pod)
+    .mode("append")
+    .save()
+)
 ```

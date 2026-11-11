@@ -239,13 +239,42 @@ AS_PROXY_NODE_ID=3 ./as_proxy_server --config /etc/as_proxy/proxy.toml
 
 ---
 
-## 5. Performance Tuning Recommendations
+## 5. Performance Tuning & Optimal Parameter Combinations (`proxy.toml` + `spark_connector`)
 
-1. **`writer.batch_write_size`**:
-   * For records with `5–20` scalar bins, `batch_write_size = 512` to `1024` yields optimal throughput (`400K+` rows/sec on 2 proxy nodes).
-   * For large CDT (`Array`/`Map`/`Struct`) or `Binary` payloads (`> 10 KB` per record), lower `batch_write_size` to `128–256` to keep individual Aerospike batch payloads well below `batch-max-buffers-per-queue`.
-2. **`aerospike.max_conns_per_node` & `conn_pools_per_node`**:
-   * Ensure `max_conns_per_node >= (max_in_flight_records / batch_write_size) * 4`. Setting `conn_pools_per_node = 4` or `8` eliminates mutex contention across Tokio worker threads.
-3. **`server.compression`**:
-   * Keep `compression = "zstd"` (default) when network bandwidth between Spark executors and proxy nodes is shared or cross-AZ (`3x–6x` wire reduction at `< 3%` CPU cost thanks to off-heap `zstd-jni`).
-   * Use `compression = "lz4"` for ultra-low CPU overhead, or `compression_enabled = false` on local 100GbE networks where CPU is the only bottleneck.
+End-to-end throughput across **Spark → Arrow Flight → `as_proxy_server` → Aerospike** depends on aligning connector and proxy settings with your table width and cluster topology. Starting in `0.4.3`, the proxy automatically scales sub-batch size by bin count (`bin_weight = ceil(num_bins / 10)`), coalesces Raft job status updates per stream (`propose_batch` with zero cross-stream lock contention), and retains pooled Aerospike socket buffers up to `256 KB` (`buffer_reclaim_threshold = 262144`) without heap reallocation thrashing.
+
+### 5.1. Optimal Parameter Matrix by Workload (Use Cases)
+
+| Workload Scenario | Spark Connector Options (`.option(...)`) | Proxy Server Settings (`proxy.toml`) | Expected Profile & Rationale |
+| :--- | :--- | :--- | :--- |
+| **1. Narrow Tables (1–20 bins)**<br>Counters, user profiles, KV features (`< 300 B` per record) | `connector.batchSize = "8192"`<br>`connector.writerThreads = "2"`..`"4"`<br>`flight.compression = "zstd"`<br>`flight.compression.level = "1"` | `writer.batch_write_size = 512` (or `1024`)<br>`writer.max_in_flight_records = 16384`<br>`writer.max_concurrent_subbatches_per_stream = 16`<br>`aerospike.max_conns_per_node = 512`<br>`aerospike.conn_pools_per_node = 4` | Highest record rate (`300K–500K+` rows/sec per proxy cluster). Large Arrow batches (`8192`) amortize gRPC framing overhead. |
+| **2. Wide Tables (50–150 bins)**<br>ML feature stores (e.g., `100` `Float`/`Double`/`Int` columns, `~1–2 KB` per record) | `connector.batchSize = "2048"`..`"4096"`<br>`connector.writerThreads = "2"`<br>`flight.compression = "zstd"`<br>`flight.compression.level = "1"` | `writer.batch_write_size = 512`<br>`writer.max_in_flight_records = 32768`<br>`writer.max_concurrent_subbatches_per_stream = 8`<br>`aerospike.max_conns_per_node = 512`<br>`aerospike.conn_pools_per_node = 8` | With `100` bins, `bin_weight = 10` automatically slices `BatchWrite` into `~51` records (`~5100` bins per RPC), staying well inside the `256 KB` pooled socket buffer. |
+| **3. Ultra-Wide Tables (150–300+ bins) or Heavy CDTs (`Array`/`Map`/`Struct`)** | `connector.batchSize = "1024"`..`"2048"`<br>`connector.writerThreads = "1"`..`"2"`<br>`flight.compression = "zstd"`<br>`flight.compression.level = "1"`..`"3"` | `server.max_decoding_message_size_mb = 128`<br>`writer.batch_write_size = 256`..`512`<br>`writer.max_in_flight_records = 32768`<br>`writer.max_concurrent_subbatches_per_stream = 6`..`8`<br>`aerospike.timeout_ms = 3000` | Lowering `batchSize` to `1024..2048` keeps each Arrow `RecordBatch` around `2–6 MB` off-heap and prevents memory spikes on executors and proxy pods. |
+| **4. High-Parallelism Spark Cluster (`100–200+` cores) + Small Proxy Pods (`1–2 vCPU`, `2 GB RAM`)** | `connector.batchSize = "2048"`<br>`connector.writerThreads = "1"`..`"2"`<br>`flight.compression = "zstd"` (or `"lz4"`)<br>`flight.compression.level = "1"` | `writer.batch_write_size = 512`<br>`writer.max_in_flight_records = 16384`<br>`writer.max_concurrent_subbatches_per_stream = 4`..`8`<br>`aerospike.max_conns_per_node = 512` | With `40` executors × `4` cores = `160` active Spark tasks and `writerThreads = 1..2`, the proxy cluster serves `160..320` streams cleanly without Tokio task scheduling thrash on 1-vCPU pods. |
+| **5. Large Proxy Pods (`4–8+ vCPU`, `8+ GB RAM`) + Fast Local Network (`10–100 GbE`)** | `connector.batchSize = "4096"`<br>`connector.writerThreads = "2"`..`"4"`<br>`flight.compression = "lz4"` (or `"zstd:1"`) | `server.http2_stream_window_size_mb = 32`<br>`server.http2_connection_window_size_mb = 64`<br>`writer.batch_write_size = 512`<br>`writer.max_in_flight_records = 65536`<br>`writer.max_concurrent_subbatches_per_stream = 16`<br>`aerospike.max_conns_per_node = 1024`<br>`aerospike.conn_pools_per_node = 8` | Maximizes multi-core Tokio throughput and saturates high-bandwidth links with minimal codec CPU overhead (`lz4`). |
+| **6. Parallel Reads (`DoGet`) & Streaming PK Enrichment (`DoExchange` Lookup)** | `aerospike.read.numPartitions = "160"`..`"320"` (`1..2x` total Spark cores)<br>`aerospike.read.batchSize = "4096"`<br>Always apply `.select(...)` for required bins! | `server.compression = "zstd"`<br>`server.compression_level = 1`<br>`writer.batch_write_size = 512`<br>`writer.max_in_flight_records = 32768` | Column pruning avoids reading unneeded bins from Aerospike storage, while `batch_write_size = 512` governs `BatchRead` chunk size during `DoExchange`. |
+
+---
+
+### 5.2. Sizing Formulas & Best Practices
+
+1. **Balancing Spark Cores, `connector.writerThreads`, and `writer.max_concurrent_subbatches_per_stream`**:
+   * Total concurrent `DoPut` streams per proxy pod is:
+     $$\text{StreamsPerPod} \approx \frac{\text{ActiveSparkTasks} \times \text{connector.writerThreads}}{\text{ProxyPods}}$$
+   * For example, with **160 active Spark tasks** (`40` executors × `4` cores) and **4 proxy pods**, setting `connector.writerThreads = 2` produces `80` active streams per proxy pod.
+   * On **1–2 vCPU proxy pods**, keep `connector.writerThreads = "1"` or `"2"` and `writer.max_concurrent_subbatches_per_stream = 4..8` so Tokio worker threads spend time doing socket I/O rather than context-switching across thousands of sub-batch tasks.
+2. **Choosing `connector.batchSize` and `writer.batch_write_size` for Wide Tables (`100–300+` bins)**:
+   * The proxy automatically scales each Aerospike `BatchWrite` sub-batch using:
+     $$\text{chunk\_size} = \max\left(16, \left\lfloor \frac{\text{batch\_write\_size}}{\lceil \text{num\_bins} / 10 \rceil} \right\rfloor\right)$$
+   * For **100 bins** (`batch_write_size = 512`), each sub-batch contains `51` records (`~5100` bins). For **300 bins**, each sub-batch contains `17` records (`~5100` bins), keeping per-node wire buffers under the `256 KB` `buffer_reclaim_threshold`.
+   * On the Spark side, aim for `batchSize × num_bins` between **`100,000` and `400,000` cells**:
+     * `10` bins → `batchSize = 8192`
+     * `100` bins → `batchSize = 2048..4096`
+     * `300` bins → `batchSize = 1024..2048`
+3. **Aerospike Connection Pool Sizing (`max_conns_per_node` & `conn_pools_per_node`)**:
+   * Keep `aerospike.max_conns_per_node >= 512` and `aerospike.conn_pools_per_node = 4..8` so concurrent Tokio tasks never contend on a single connection pool mutex.
+4. **Compression Codec & Level Selection (`flight.compression` & `flight.compression.level`)**:
+   * **`zstd` at level `1` (default)**: Best all-around choice (`3x–5x` wire reduction at `> 500 MB/s` per core via off-heap JNI).
+   * **`zstd` at levels `3..9`**: Useful on bandwidth-constrained or cross-region links when Spark executors have spare CPU.
+   * **`lz4`**: Ideal when CPU on Spark executors or 1-vCPU proxy pods is the primary bottleneck.
+   * **`none` (`compression_enabled = false`)**: Zero compression CPU overhead on dedicated `25–100 GbE` local networks.

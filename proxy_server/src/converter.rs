@@ -201,14 +201,14 @@ enum CompiledValueExtractor<'a> {
 }
 
 struct CompiledBinColumn<'a> {
-    name: String,
+    name: &'a str,
     nulls: Option<&'a NullBuffer>,
     extractor: CompiledValueExtractor<'a>,
 }
 
 impl<'a> CompiledBinColumn<'a> {
     fn compile(
-        name: String,
+        name: &'a str,
         array: &'a dyn Array,
         ignore_nulls: bool,
         auto_convert_strings: bool,
@@ -412,17 +412,13 @@ impl<'a> CompiledBinColumn<'a> {
     }
 }
 
-/// Convert an entire Arrow `RecordBatch` into a vector of `PreparedRecord`s.
-pub fn convert_record_batch(
+/// Validate the schema and primary key column of an Arrow `RecordBatch` once before slicing it into sub-batches.
+/// Returns `key_col_idx`.
+pub fn validate_record_batch_schema(
     batch: &RecordBatch,
     params: &WriteParameters,
     max_bin_name_len: usize,
-) -> Result<Vec<PreparedRecord>> {
-    let num_rows = batch.num_rows();
-    if num_rows == 0 {
-        return Ok(Vec::new());
-    }
-
+) -> Result<usize> {
     let schema = batch.schema();
     let key_col_idx = schema.index_of(&params.key_column).map_err(|_| {
         ProxyError::InvalidArgument(format!(
@@ -436,6 +432,7 @@ pub fn convert_record_batch(
         ))
     })?;
 
+    let num_rows = batch.num_rows();
     let key_array = batch.column(key_col_idx);
     if key_array.null_count() > 0 {
         for row in 0..num_rows {
@@ -448,23 +445,21 @@ pub fn convert_record_batch(
         }
     }
 
-    // Determine whether null column values should be emitted as Value::Nil (to delete bins in update mode
-    // or verify bin absence in DQ validate mode) or omitted.
-    let is_validate = params.is_validate_mode();
-    let emit_nil_for_nulls = if is_validate {
-        !params.ignore_nulls
-    } else {
-        match params.write_mode {
-            WriteMode::Update | WriteMode::UpdateOnly | WriteMode::Validate => !params.ignore_nulls,
-            WriteMode::Replace | WriteMode::ReplaceOnly | WriteMode::CreateOnly => false,
-        }
-    };
+    let num_bins = schema.fields().len().saturating_sub(1);
+    if num_bins == 0 {
+        return Err(ProxyError::InvalidArgument(format!(
+            "Arrow schema must contain at least 1 bin column in addition to primary key column '{}'",
+            params.key_column
+        )));
+    }
+    if num_bins > 32_767 {
+        return Err(ProxyError::InvalidArgument(format!(
+            "Arrow schema contains {} bin columns, which exceeds Aerospike's maximum of 32,767 bins per record",
+            num_bins
+        )));
+    }
 
-    // Collect non-key columns, validate bin name format/length/uniqueness, and pre-compile column extractors once per batch
-    let mut bin_columns: Vec<CompiledBinColumn<'_>> =
-        Vec::with_capacity(schema.fields().len().saturating_sub(1));
-    let mut seen_bin_names: HashSet<&str> =
-        HashSet::with_capacity(schema.fields().len().saturating_sub(1));
+    let mut seen_bin_names: HashSet<&str> = HashSet::with_capacity(num_bins);
     for (idx, field) in schema.fields().iter().enumerate() {
         if idx == key_col_idx {
             continue;
@@ -495,8 +490,41 @@ pub fn convert_record_batch(
                 bin_name
             )));
         }
+    }
+
+    Ok(key_col_idx)
+}
+
+/// Convert an Arrow `RecordBatch` (or slice) whose schema and primary key column were already validated.
+pub fn convert_record_batch_with_key_index(
+    batch: &RecordBatch,
+    params: &WriteParameters,
+    key_col_idx: usize,
+) -> Result<Vec<PreparedRecord>> {
+    let num_rows = batch.num_rows();
+    if num_rows == 0 {
+        return Ok(Vec::new());
+    }
+
+    let schema = batch.schema();
+    let is_validate = params.is_validate_mode();
+    let emit_nil_for_nulls = if is_validate {
+        !params.ignore_nulls
+    } else {
+        match params.write_mode {
+            WriteMode::Update | WriteMode::UpdateOnly | WriteMode::Validate => !params.ignore_nulls,
+            WriteMode::Replace | WriteMode::ReplaceOnly | WriteMode::CreateOnly => false,
+        }
+    };
+
+    let mut bin_columns: Vec<CompiledBinColumn<'_>> =
+        Vec::with_capacity(schema.fields().len().saturating_sub(1));
+    for (idx, field) in schema.fields().iter().enumerate() {
+        if idx == key_col_idx {
+            continue;
+        }
         let compiled_col = CompiledBinColumn::compile(
-            bin_name.clone(),
+            field.name().as_str(),
             batch.column(idx).as_ref(),
             !emit_nil_for_nulls,
             params.auto_convert_strings,
@@ -504,19 +532,7 @@ pub fn convert_record_batch(
         bin_columns.push(compiled_col);
     }
 
-    if bin_columns.is_empty() {
-        return Err(ProxyError::InvalidArgument(format!(
-            "Arrow schema must contain at least 1 bin column in addition to primary key column '{}'",
-            params.key_column
-        )));
-    }
-    if bin_columns.len() > 32_767 {
-        return Err(ProxyError::InvalidArgument(format!(
-            "Arrow schema contains {} bin columns, which exceeds Aerospike's maximum of 32,767 bins per record",
-            bin_columns.len()
-        )));
-    }
-
+    let key_array = batch.column(key_col_idx);
     let compiled_key = CompiledKeyColumn::compile(key_array.as_ref(), &params.key_column)?;
     let mut records = Vec::with_capacity(num_rows);
 
@@ -530,11 +546,11 @@ pub fn convert_record_batch(
         for col in &bin_columns {
             if col.is_null(row) {
                 if emit_nil_for_nulls {
-                    bins.push(Bin::new(col.name.clone(), Value::Nil));
+                    bins.push(Bin::new(col.name, Value::Nil));
                 }
             } else {
                 let val = col.extract_non_null(row)?;
-                bins.push(Bin::new(col.name.clone(), val));
+                bins.push(Bin::new(col.name, val));
             }
         }
 
@@ -544,6 +560,19 @@ pub fn convert_record_batch(
     }
 
     Ok(records)
+}
+
+/// Convert an entire Arrow `RecordBatch` into a vector of `PreparedRecord`s.
+pub fn convert_record_batch(
+    batch: &RecordBatch,
+    params: &WriteParameters,
+    max_bin_name_len: usize,
+) -> Result<Vec<PreparedRecord>> {
+    if batch.num_rows() == 0 {
+        return Ok(Vec::new());
+    }
+    let key_col_idx = validate_record_batch_schema(batch, params, max_bin_name_len)?;
+    convert_record_batch_with_key_index(batch, params, key_col_idx)
 }
 
 /// Result of comparing a single `PreparedRecord` from Spark against the record stored in Aerospike.
@@ -718,7 +747,7 @@ pub fn extract_value_with_options(
         return Ok(Value::Nil);
     }
     let compiled = CompiledBinColumn::compile(
-        String::new(),
+        "",
         array,
         ignore_nulls,
         auto_convert_strings,

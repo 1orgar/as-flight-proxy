@@ -73,15 +73,7 @@ class ArrowBatchConverter(
   private var currentRowCount: Int = 0
 
   def reset(): Unit = {
-    var i = 0
-    val fieldVectors = root.getFieldVectors
-    val numVecs = fieldVectors.size()
-    while (i < numVecs) {
-      val v = fieldVectors.get(i)
-      v.setInitialCapacity(effectiveInitialCapacity)
-      v.allocateNew()
-      i += 1
-    }
+    root.allocateNew()
     currentRowCount = 0
   }
 
@@ -221,7 +213,17 @@ class ArrowBatchConverter(
             else {
               val utf8 = getter.getUTF8String(ordinal)
               if (utf8 == null) v.setNull(targetIndex)
-              else v.setSafe(targetIndex, utf8.getBytes)
+              else {
+                val baseObj = utf8.getBaseObject
+                if (baseObj.isInstanceOf[Array[Byte]]) {
+                  val baseBytes = baseObj.asInstanceOf[Array[Byte]]
+                  val byteOffset =
+                    (utf8.getBaseOffset - org.apache.spark.unsafe.Platform.BYTE_ARRAY_OFFSET).toInt
+                  v.setSafe(targetIndex, baseBytes, byteOffset, utf8.numBytes())
+                } else {
+                  v.setSafe(targetIndex, utf8.getBytes)
+                }
+              }
             }
         }
 
