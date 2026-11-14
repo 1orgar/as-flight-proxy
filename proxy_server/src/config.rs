@@ -96,7 +96,10 @@ impl Default for ServerConfig {
 
 impl ServerConfig {
     /// Resolve the effective compression mode for a stream given an optional client override.
-    pub fn effective_compression(&self, client_override: Option<FlightCompression>) -> FlightCompression {
+    pub fn effective_compression(
+        &self,
+        client_override: Option<FlightCompression>,
+    ) -> FlightCompression {
         if !self.compression_enabled {
             return FlightCompression::None;
         }
@@ -180,7 +183,10 @@ impl FlightCompression {
     }
 
     pub fn from_headers(headers: &MetadataMap) -> Result<Option<Self>> {
-        match headers.get("x-as-compression").and_then(|v| v.to_str().ok()) {
+        match headers
+            .get("x-as-compression")
+            .and_then(|v| v.to_str().ok())
+        {
             Some(s) if !s.trim().is_empty() => Ok(Some(Self::from_str_insensitive(s)?)),
             _ => Ok(None),
         }
@@ -201,7 +207,10 @@ impl FlightCompression {
                 return Ok(Some(Self::validate_zstd_level(lvl)?));
             }
         }
-        if let Some(s) = headers.get("x-as-compression").and_then(|v| v.to_str().ok()) {
+        if let Some(s) = headers
+            .get("x-as-compression")
+            .and_then(|v| v.to_str().ok())
+        {
             if let Some(inline_lvl) = Self::extract_inline_level(s)? {
                 return Ok(Some(inline_lvl));
             }
@@ -267,7 +276,7 @@ pub struct RaftPeer {
     pub flight_addr: String,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 pub struct RaftConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
@@ -285,8 +294,34 @@ pub struct RaftConfig {
     /// Jobs not updated within `job_stats_ttl_secs` are automatically evicted.
     #[serde(default = "default_job_stats_ttl_secs")]
     pub job_stats_ttl_secs: u64,
+    /// Maximum number of committed entries kept in the in-memory Raft log before compacting into a snapshot.
+    #[serde(default = "default_max_raft_log_entries")]
+    pub max_log_entries: usize,
+    /// Optional shared HMAC-SHA256 secret used to authenticate inter-node Raft RPC frames.
+    #[serde(default)]
+    pub cluster_secret: Option<String>,
     #[serde(default)]
     pub peers: Vec<RaftPeer>,
+}
+
+impl std::fmt::Debug for RaftConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RaftConfig")
+            .field("enabled", &self.enabled)
+            .field("node_id", &self.node_id)
+            .field("listen_addr", &self.listen_addr)
+            .field("election_timeout_min_ms", &self.election_timeout_min_ms)
+            .field("election_timeout_max_ms", &self.election_timeout_max_ms)
+            .field("heartbeat_interval_ms", &self.heartbeat_interval_ms)
+            .field("job_stats_ttl_secs", &self.job_stats_ttl_secs)
+            .field("max_log_entries", &self.max_log_entries)
+            .field(
+                "cluster_secret",
+                &self.cluster_secret.as_ref().map(|_| "***"),
+            )
+            .field("peers", &self.peers)
+            .finish()
+    }
 }
 
 impl Default for RaftConfig {
@@ -299,6 +334,8 @@ impl Default for RaftConfig {
             election_timeout_max_ms: default_election_max_ms(),
             heartbeat_interval_ms: default_heartbeat_ms(),
             job_stats_ttl_secs: default_job_stats_ttl_secs(),
+            max_log_entries: default_max_raft_log_entries(),
+            cluster_secret: None,
             peers: Vec::new(),
         }
     }
@@ -313,7 +350,7 @@ pub struct TlsConfig {
     pub client_ca_path: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 pub struct AuthConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
@@ -325,6 +362,29 @@ pub struct AuthConfig {
     pub token_secret: String,
     #[serde(default = "default_token_ttl")]
     pub token_ttl_secs: u64,
+}
+
+impl std::fmt::Debug for AuthConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuthConfig")
+            .field("enabled", &self.enabled)
+            .field("username", &self.username)
+            .field("password", &"***")
+            .field("token_secret", &"***")
+            .field("token_ttl_secs", &self.token_ttl_secs)
+            .finish()
+    }
+}
+
+impl AuthConfig {
+    /// Returns `true` when authentication is enabled but built-in/example secrets are still in use.
+    pub fn uses_default_secrets(&self) -> bool {
+        self.enabled
+            && (self.password == default_password()
+                || self.password == "change_me_in_prod"
+                || self.token_secret == default_token_secret()
+                || self.token_secret == "super_secret_hmac_key_for_flight_bearer_tokens")
+    }
 }
 
 impl Default for AuthConfig {
@@ -339,10 +399,14 @@ impl Default for AuthConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 pub struct AerospikeConfig {
     #[serde(default = "default_as_hosts")]
     pub hosts: String,
+    #[serde(default)]
+    pub user: Option<String>,
+    #[serde(default)]
+    pub password: Option<String>,
     #[serde(default = "default_connect_timeout_ms")]
     pub connect_timeout_ms: u32,
     #[serde(default = "default_timeout_ms")]
@@ -357,10 +421,28 @@ pub struct AerospikeConfig {
     pub max_bin_name_len: usize,
 }
 
+impl std::fmt::Debug for AerospikeConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AerospikeConfig")
+            .field("hosts", &self.hosts)
+            .field("user", &self.user)
+            .field("password", &self.password.as_ref().map(|_| "***"))
+            .field("connect_timeout_ms", &self.connect_timeout_ms)
+            .field("timeout_ms", &self.timeout_ms)
+            .field("min_conns_per_node", &self.min_conns_per_node)
+            .field("max_conns_per_node", &self.max_conns_per_node)
+            .field("conn_pools_per_node", &self.conn_pools_per_node)
+            .field("max_bin_name_len", &self.max_bin_name_len)
+            .finish()
+    }
+}
+
 impl Default for AerospikeConfig {
     fn default() -> Self {
         Self {
             hosts: default_as_hosts(),
+            user: None,
+            password: None,
             connect_timeout_ms: default_connect_timeout_ms(),
             timeout_ms: default_timeout_ms(),
             min_conns_per_node: default_min_conns(),
@@ -381,6 +463,22 @@ pub struct WriterConfig {
     pub max_in_flight_records: usize,
     #[serde(default = "default_max_subbatches")]
     pub max_concurrent_subbatches_per_stream: usize,
+    /// Enable on-the-fly heuristic tuning of sub-batch size, stream concurrency, and micro-pacing
+    /// to maximize Aerospike write throughput while avoiding cluster queue wait / overload.
+    #[serde(default = "default_true")]
+    pub adaptive_batching: bool,
+    /// Minimum sub-batch size (records per Aerospike `batch_write` RPC) for adaptive tuning.
+    #[serde(default = "default_min_batch_write_size")]
+    pub min_batch_write_size: usize,
+    /// Maximum sub-batch size (records per Aerospike `batch_write` RPC) for adaptive tuning.
+    #[serde(default = "default_max_batch_write_size")]
+    pub max_batch_write_size: usize,
+    /// Target Aerospike sub-batch write latency (ms) before proactive cluster-wait avoidance triggers.
+    #[serde(default = "default_target_write_latency_ms")]
+    pub target_write_latency_ms: u64,
+    /// Soft payload byte budget per Aerospike `batch_write` RPC before dynamic scale adjustment.
+    #[serde(default = "default_target_batch_bytes")]
+    pub target_batch_bytes: usize,
 }
 
 impl Default for WriterConfig {
@@ -390,6 +488,11 @@ impl Default for WriterConfig {
             batch_write_size: default_batch_write_size(),
             max_in_flight_records: default_max_in_flight(),
             max_concurrent_subbatches_per_stream: default_max_subbatches(),
+            adaptive_batching: true,
+            min_batch_write_size: default_min_batch_write_size(),
+            max_batch_write_size: default_max_batch_write_size(),
+            target_write_latency_ms: default_target_write_latency_ms(),
+            target_batch_bytes: default_target_batch_bytes(),
         }
     }
 }
@@ -583,8 +686,8 @@ impl WriteParameters {
         let ignore_nulls = get_str("x-as-ignore-nulls")
             .map(|s| s.eq_ignore_ascii_case("true") || s == "1")
             .unwrap_or(false);
-        let use_batch_write = get_str("x-as-use-batch-write")
-            .map(|s| s.eq_ignore_ascii_case("true") || s == "1");
+        let use_batch_write =
+            get_str("x-as-use-batch-write").map(|s| s.eq_ignore_ascii_case("true") || s == "1");
         let validate_only = get_str("x-as-validate-only")
             .or_else(|| get_str("x-as-dq"))
             .map(|s| s.eq_ignore_ascii_case("true") || s == "1")
@@ -623,6 +726,14 @@ impl WriteParameters {
                 "key_column cannot be empty".to_string(),
             ));
         }
+        if let Some(ttl) = self.ttl_seconds {
+            if ttl < -2 || ttl > i64::from(u32::MAX) {
+                return Err(ProxyError::InvalidArgument(format!(
+                    "Invalid ttl_seconds {ttl}: expected -2 (DontUpdate), -1 (Never), 0 (NamespaceDefault), or 1..={}",
+                    u32::MAX
+                )));
+            }
+        }
         Ok(())
     }
 
@@ -631,7 +742,7 @@ impl WriteParameters {
             None | Some(0) => Expiration::NamespaceDefault,
             Some(-1) => Expiration::Never,
             Some(-2) => Expiration::DontUpdate,
-            Some(secs) if secs > 0 => Expiration::Seconds(secs as u32),
+            Some(secs) if secs > 0 => Expiration::Seconds(u32::try_from(secs).unwrap_or(u32::MAX)),
             Some(_) => Expiration::NamespaceDefault,
         }
     }
@@ -720,9 +831,7 @@ pub enum ReadModeSpec {
         partition_count: usize,
     },
     /// Direct `batch_get` lookup for a specific list of primary keys.
-    BatchKeys {
-        keys: Vec<KeyLiteral>,
-    },
+    BatchKeys { keys: Vec<KeyLiteral> },
 }
 
 /// JSON payload encoded inside `Ticket.ticket` for `DoGet` read streams.
@@ -766,7 +875,10 @@ impl ReadTicket {
             partition_count,
         } = self.read_mode
         {
-            if begin_partition >= 4096 || partition_count == 0 || begin_partition + partition_count > 4096 {
+            if begin_partition >= 4096
+                || partition_count == 0
+                || begin_partition + partition_count > 4096
+            {
                 return Err(ProxyError::InvalidArgument(format!(
                     "Invalid Aerospike partition range: begin={begin_partition}, count={partition_count} (must be within 0..4096)"
                 )));
@@ -871,6 +983,9 @@ fn default_heartbeat_ms() -> u64 {
 fn default_job_stats_ttl_secs() -> u64 {
     3600
 }
+fn default_max_raft_log_entries() -> usize {
+    4096
+}
 fn default_max_msg_mb() -> usize {
     64
 }
@@ -918,6 +1033,18 @@ fn default_max_bin_name_len() -> usize {
 }
 fn default_batch_write_size() -> usize {
     512
+}
+fn default_min_batch_write_size() -> usize {
+    16
+}
+fn default_max_batch_write_size() -> usize {
+    2048
+}
+fn default_target_write_latency_ms() -> u64 {
+    15
+}
+fn default_target_batch_bytes() -> usize {
+    262_144
 }
 fn default_max_in_flight() -> usize {
     16384

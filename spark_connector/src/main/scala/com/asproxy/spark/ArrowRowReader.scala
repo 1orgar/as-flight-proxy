@@ -3,7 +3,7 @@ package com.asproxy.spark
 import org.apache.arrow.vector._
 import org.apache.arrow.vector.complex.{ListVector, MapVector, StructVector}
 import org.apache.spark.sql.catalyst.InternalRow
-import org.apache.spark.sql.catalyst.expressions.GenericInternalRow
+import org.apache.spark.sql.catalyst.expressions.{GenericInternalRow, SpecificInternalRow}
 import org.apache.spark.sql.catalyst.util.{ArrayBasedMapData, GenericArrayData}
 import org.apache.spark.sql.types._
 import org.apache.spark.unsafe.types.UTF8String
@@ -11,25 +11,24 @@ import org.apache.spark.unsafe.types.UTF8String
 /**
  * Converts rows from an Apache Arrow `VectorSchemaRoot` into Spark Catalyst `InternalRow`s.
  *
- * Pre-compiles per-column reader functions (`Int => Any`) once per `VectorSchemaRoot` to avoid
- * per-row/per-cell `DataType` pattern matching and `FieldVector` type casts on the hot read path,
- * and reuses a mutable `GenericInternalRow` across rows within a batch.
+ * Pre-compiles unboxed per-column `RowFieldReader`s once per `VectorSchemaRoot` and writes
+ * primitives directly into a reusable `SpecificInternalRow` (`MutableInt`, `MutableLong`,
+ * `MutableFloat`, `MutableDouble`, etc.) without per-cell JVM heap boxing or `DataType` matching.
  */
 class ArrowRowReader(sparkSchema: StructType, root: VectorSchemaRoot) {
 
   private val fields: Array[StructField] = sparkSchema.fields
   private val numFields: Int = fields.length
-  private val columnReaders: Array[Int => Any] = fields.map { f =>
+  private val fieldReaders: Array[ArrowRowReader.RowFieldReader] = fields.map { f =>
     val vec = root.getVector(f.name)
-    ArrowRowReader.createColumnReader(vec, f.dataType)
+    ArrowRowReader.createRowFieldReader(vec, f.dataType)
   }
-  private val reusableValues: Array[Any] = new Array[Any](numFields)
-  private val reusableRow: GenericInternalRow = new GenericInternalRow(reusableValues)
+  private val reusableRow: SpecificInternalRow = new SpecificInternalRow(sparkSchema)
 
   def readRow(rowIdx: Int): InternalRow = {
     var i = 0
     while (i < numFields) {
-      reusableValues(i) = columnReaders(i)(rowIdx)
+      fieldReaders(i).readInto(rowIdx, reusableRow, i)
       i += 1
     }
     reusableRow
@@ -37,6 +36,263 @@ class ArrowRowReader(sparkSchema: StructType, root: VectorSchemaRoot) {
 }
 
 object ArrowRowReader {
+
+  private val EmptyByteArray: Array[Byte] = Array.emptyByteArray
+
+  /**
+   * Unboxed field reader writing directly into `SpecificInternalRow` / `InternalRow` slots.
+   */
+  trait RowFieldReader {
+    def readInto(rowIdx: Int, out: InternalRow, ordinal: Int): Unit
+  }
+
+  private val NullFieldReader: RowFieldReader = new RowFieldReader {
+    override def readInto(rowIdx: Int, out: InternalRow, ordinal: Int): Unit = {
+      out.setNullAt(ordinal)
+    }
+  }
+
+  @inline private def readUtf8String(v: VarCharVector, idx: Int): UTF8String = {
+    val offsetBuf = v.getOffsetBuffer
+    val startOffset = offsetBuf.getInt(idx.toLong * BaseVariableWidthVector.OFFSET_WIDTH)
+    val endOffset = offsetBuf.getInt((idx + 1).toLong * BaseVariableWidthVector.OFFSET_WIDTH)
+    val len = endOffset - startOffset
+    if (len <= 0) {
+      UTF8String.EMPTY_UTF8
+    } else {
+      val bytes = new Array[Byte](len)
+      v.getDataBuffer.getBytes(startOffset.toLong, bytes, 0, len)
+      UTF8String.fromBytes(bytes)
+    }
+  }
+
+  @inline private def readVarBinary(v: VarBinaryVector, idx: Int): Array[Byte] = {
+    val offsetBuf = v.getOffsetBuffer
+    val startOffset = offsetBuf.getInt(idx.toLong * BaseVariableWidthVector.OFFSET_WIDTH)
+    val endOffset = offsetBuf.getInt((idx + 1).toLong * BaseVariableWidthVector.OFFSET_WIDTH)
+    val len = endOffset - startOffset
+    if (len <= 0) {
+      EmptyByteArray
+    } else {
+      val bytes = new Array[Byte](len)
+      v.getDataBuffer.getBytes(startOffset.toLong, bytes, 0, len)
+      bytes
+    }
+  }
+
+  /**
+   * Pre-compiles an unboxed `RowFieldReader` for top-level and nested struct columns.
+   */
+  def createRowFieldReader(vector: FieldVector, dataType: DataType): RowFieldReader = {
+    if (vector == null) {
+      return NullFieldReader
+    }
+
+    dataType match {
+      case NullType =>
+        NullFieldReader
+
+      case BooleanType =>
+        val v = vector.asInstanceOf[BitVector]
+        new RowFieldReader {
+          override def readInto(rowIdx: Int, out: InternalRow, ordinal: Int): Unit = {
+            if (v.isNull(rowIdx)) out.setNullAt(ordinal)
+            else out.setBoolean(ordinal, v.get(rowIdx) != 0)
+          }
+        }
+
+      case ByteType =>
+        val v = vector.asInstanceOf[TinyIntVector]
+        new RowFieldReader {
+          override def readInto(rowIdx: Int, out: InternalRow, ordinal: Int): Unit = {
+            if (v.isNull(rowIdx)) out.setNullAt(ordinal)
+            else out.setByte(ordinal, v.get(rowIdx))
+          }
+        }
+
+      case ShortType =>
+        val v = vector.asInstanceOf[SmallIntVector]
+        new RowFieldReader {
+          override def readInto(rowIdx: Int, out: InternalRow, ordinal: Int): Unit = {
+            if (v.isNull(rowIdx)) out.setNullAt(ordinal)
+            else out.setShort(ordinal, v.get(rowIdx))
+          }
+        }
+
+      case IntegerType =>
+        vector match {
+          case v: IntVector =>
+            new RowFieldReader {
+              override def readInto(rowIdx: Int, out: InternalRow, ordinal: Int): Unit = {
+                if (v.isNull(rowIdx)) out.setNullAt(ordinal)
+                else out.setInt(ordinal, v.get(rowIdx))
+              }
+            }
+          case v: BigIntVector =>
+            new RowFieldReader {
+              override def readInto(rowIdx: Int, out: InternalRow, ordinal: Int): Unit = {
+                if (v.isNull(rowIdx)) out.setNullAt(ordinal)
+                else out.setInt(ordinal, v.get(rowIdx).toInt)
+              }
+            }
+        }
+
+      case DateType =>
+        val v = vector.asInstanceOf[DateDayVector]
+        new RowFieldReader {
+          override def readInto(rowIdx: Int, out: InternalRow, ordinal: Int): Unit = {
+            if (v.isNull(rowIdx)) out.setNullAt(ordinal)
+            else out.setInt(ordinal, v.get(rowIdx))
+          }
+        }
+
+      case LongType =>
+        vector match {
+          case v: BigIntVector =>
+            new RowFieldReader {
+              override def readInto(rowIdx: Int, out: InternalRow, ordinal: Int): Unit = {
+                if (v.isNull(rowIdx)) out.setNullAt(ordinal)
+                else out.setLong(ordinal, v.get(rowIdx))
+              }
+            }
+          case v: IntVector =>
+            new RowFieldReader {
+              override def readInto(rowIdx: Int, out: InternalRow, ordinal: Int): Unit = {
+                if (v.isNull(rowIdx)) out.setNullAt(ordinal)
+                else out.setLong(ordinal, v.get(rowIdx).toLong)
+              }
+            }
+        }
+
+      case TimestampType =>
+        vector match {
+          case v: TimeStampMicroTZVector =>
+            new RowFieldReader {
+              override def readInto(rowIdx: Int, out: InternalRow, ordinal: Int): Unit = {
+                if (v.isNull(rowIdx)) out.setNullAt(ordinal)
+                else out.setLong(ordinal, v.get(rowIdx))
+              }
+            }
+          case v: TimeStampMicroVector =>
+            new RowFieldReader {
+              override def readInto(rowIdx: Int, out: InternalRow, ordinal: Int): Unit = {
+                if (v.isNull(rowIdx)) out.setNullAt(ordinal)
+                else out.setLong(ordinal, v.get(rowIdx))
+              }
+            }
+          case v: TimeStampMilliTZVector =>
+            new RowFieldReader {
+              override def readInto(rowIdx: Int, out: InternalRow, ordinal: Int): Unit = {
+                if (v.isNull(rowIdx)) out.setNullAt(ordinal)
+                else out.setLong(ordinal, v.get(rowIdx) * 1000L)
+              }
+            }
+          case v: TimeStampMilliVector =>
+            new RowFieldReader {
+              override def readInto(rowIdx: Int, out: InternalRow, ordinal: Int): Unit = {
+                if (v.isNull(rowIdx)) out.setNullAt(ordinal)
+                else out.setLong(ordinal, v.get(rowIdx) * 1000L)
+              }
+            }
+        }
+
+      case FloatType =>
+        vector match {
+          case v: Float4Vector =>
+            new RowFieldReader {
+              override def readInto(rowIdx: Int, out: InternalRow, ordinal: Int): Unit = {
+                if (v.isNull(rowIdx)) out.setNullAt(ordinal)
+                else out.setFloat(ordinal, v.get(rowIdx))
+              }
+            }
+          case v: Float8Vector =>
+            new RowFieldReader {
+              override def readInto(rowIdx: Int, out: InternalRow, ordinal: Int): Unit = {
+                if (v.isNull(rowIdx)) out.setNullAt(ordinal)
+                else out.setFloat(ordinal, v.get(rowIdx).toFloat)
+              }
+            }
+        }
+
+      case DoubleType =>
+        vector match {
+          case v: Float8Vector =>
+            new RowFieldReader {
+              override def readInto(rowIdx: Int, out: InternalRow, ordinal: Int): Unit = {
+                if (v.isNull(rowIdx)) out.setNullAt(ordinal)
+                else out.setDouble(ordinal, v.get(rowIdx))
+              }
+            }
+          case v: Float4Vector =>
+            new RowFieldReader {
+              override def readInto(rowIdx: Int, out: InternalRow, ordinal: Int): Unit = {
+                if (v.isNull(rowIdx)) out.setNullAt(ordinal)
+                else out.setDouble(ordinal, v.get(rowIdx).toDouble)
+              }
+            }
+        }
+
+      case StringType =>
+        val v = vector.asInstanceOf[VarCharVector]
+        new RowFieldReader {
+          override def readInto(rowIdx: Int, out: InternalRow, ordinal: Int): Unit = {
+            if (v.isNull(rowIdx)) out.setNullAt(ordinal)
+            else out.update(ordinal, readUtf8String(v, rowIdx))
+          }
+        }
+
+      case BinaryType =>
+        val v = vector.asInstanceOf[VarBinaryVector]
+        new RowFieldReader {
+          override def readInto(rowIdx: Int, out: InternalRow, ordinal: Int): Unit = {
+            if (v.isNull(rowIdx)) out.setNullAt(ordinal)
+            else out.update(ordinal, readVarBinary(v, rowIdx))
+          }
+        }
+
+      case st @ StructType(structFields) =>
+        val structVec = vector.asInstanceOf[StructVector]
+        val numStructFields = structFields.length
+        val childReaders: Array[RowFieldReader] = new Array[RowFieldReader](numStructFields)
+        var fIdx = 0
+        while (fIdx < numStructFields) {
+          val sf = structFields(fIdx)
+          val childByName = structVec.getChild(sf.name)
+          val childVec = if (childByName != null) {
+            childByName.asInstanceOf[FieldVector]
+          } else {
+            structVec.getChildByOrdinal(fIdx).asInstanceOf[FieldVector]
+          }
+          childReaders(fIdx) = createRowFieldReader(childVec, sf.dataType)
+          fIdx += 1
+        }
+        val reusableStructRow = new SpecificInternalRow(st)
+        new RowFieldReader {
+          override def readInto(rowIdx: Int, out: InternalRow, ordinal: Int): Unit = {
+            if (structVec.isNull(rowIdx)) {
+              out.setNullAt(ordinal)
+            } else {
+              var i = 0
+              while (i < numStructFields) {
+                childReaders(i).readInto(rowIdx, reusableStructRow, i)
+                i += 1
+              }
+              out.update(ordinal, reusableStructRow)
+            }
+          }
+        }
+
+      case other =>
+        val boxedReader = createColumnReader(vector, other)
+        new RowFieldReader {
+          override def readInto(rowIdx: Int, out: InternalRow, ordinal: Int): Unit = {
+            val value = boxedReader(rowIdx)
+            if (value == null) out.setNullAt(ordinal)
+            else out.update(ordinal, value)
+          }
+        }
+    }
+  }
 
   /**
    * Pre-compiles a specialized `Int => Any` reader function for a given `(FieldVector, DataType)` pair.
@@ -107,16 +363,11 @@ object ArrowRowReader {
 
       case StringType =>
         val v = vector.asInstanceOf[VarCharVector]
-        (idx: Int) =>
-          if (v.isNull(idx)) null
-          else {
-            val bytes = v.get(idx)
-            if (bytes == null) null else UTF8String.fromBytes(bytes)
-          }
+        (idx: Int) => if (v.isNull(idx)) null else readUtf8String(v, idx)
 
       case BinaryType =>
         val v = vector.asInstanceOf[VarBinaryVector]
-        (idx: Int) => if (v.isNull(idx)) null else v.get(idx)
+        (idx: Int) => if (v.isNull(idx)) null else readVarBinary(v, idx)
 
       case DateType =>
         val v = vector.asInstanceOf[DateDayVector]

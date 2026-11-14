@@ -86,6 +86,8 @@ compression_level = 1
 | `election_timeout_max_ms` | `u64` | `300` | Максимальный таймаут перевыборов лидера (мс) |
 | `heartbeat_interval_ms` | `u64` | `50` | Интервал отправки heartbeat-сообщений от Лидера (мс) |
 | `job_stats_ttl_secs` | `u64` | `3600` | Время жизни (TTL в секундах) статистики завершённых джобов в памяти Raft до автоматического удаления |
+| `max_log_entries` | `usize` | `4096` | Максимальное число закоммиченных записей в in-memory логе Raft до автоматической компактификации в снэпшот (`InstallSnapshot`) |
+| `cluster_secret` | `Option<String>` | `None` | Опциональный общий секрет HMAC-SHA256 для взаимной аутентификации внутренних Raft RPC фреймов на порту `:8816` |
 | `peers` | `Array<RaftPeer>` | `[]` | Список всех равноправных нод кластера (`node_id`, `raft_addr`, `flight_addr`) |
 
 ```toml
@@ -97,6 +99,8 @@ election_timeout_min_ms = 150
 election_timeout_max_ms = 300
 heartbeat_interval_ms = 50
 job_stats_ttl_secs = 3600
+max_log_entries = 4096
+# cluster_secret = "shared_raft_cluster_hmac_secret"
 
 [[raft.peers]]
 node_id = 1
@@ -184,14 +188,19 @@ max_bin_name_len = 15
 
 ---
 
-### 3.6. `[writer]` — MPP-батчинг и параллелизм
+### 3.6. `[writer]` — MPP-батчинг, параллелизм и адаптивная эвристика на лету
 
 | Параметр | Тип | По умолчанию | Описание |
 | :--- | :---: | :---: | :--- |
 | `use_batch_write` | `bool` | `true` | Использовать нативный пакетный протокол `Client::batch` (`BatchWrite`) вместо одиночных `Put` |
-| `batch_write_size` | `usize` | `512` | Количество записей в одном MPP под-батче `BatchWrite` / `BatchRead` |
+| `batch_write_size` | `usize` | `512` | Базовое количество записей в одном MPP под-батче `BatchWrite` / `BatchRead` |
 | `max_in_flight_records` | `usize` | `16384` | Глобальный лимит одновременно летящих в Aerospike записей на данной ноде прокси (семафор Backpressure) |
-| `max_concurrent_subbatches_per_stream` | `usize` | `16` | Максимальное число параллельных под-батчей внутри одного стрима `DoPut` |
+| `max_concurrent_subbatches_per_stream` | `usize` | `16` | Базовый лимит параллельных под-батчей внутри одного стрима `DoPut` / `DoExchange` |
+| `adaptive_batching` | `bool` | `true` | Включает замкнутый контур динамического подбора размера под-батча, параллелизма и micro-pacing на лету (`AdaptiveBatchTuner`) для максимизации RPS и предотвращения `wait` кластера Aerospike |
+| `min_batch_write_size` | `usize` | `16` | Нижняя граница динамического размера под-батча при адаптивном дроблении |
+| `max_batch_write_size` | `usize` | `2048` | Верхняя граница динамического размера под-батча при масштабировании на быстрых кластерах |
+| `target_write_latency_ms` | `u64` | `15` | Целевой порог латентности одного `BatchWrite` RPC (мс), превышение которого запускает упреждающее снижение нагрузки **до** появления `DEVICE_OVERLOAD` |
+| `target_batch_bytes` | `usize` | `262144` | Целевой бюджет сериализованного размера одного под-батча в байтах (`256 КБ`, согласован с пулом сокетных буферов Aerospike) |
 
 ```toml
 [writer]
@@ -199,6 +208,11 @@ use_batch_write = true
 batch_write_size = 512
 max_in_flight_records = 16384
 max_concurrent_subbatches_per_stream = 16
+adaptive_batching = true
+min_batch_write_size = 16
+max_batch_write_size = 2048
+target_write_latency_ms = 15
+target_batch_bytes = 262144
 ```
 
 ---
@@ -241,7 +255,7 @@ AS_PROXY_NODE_ID=3 ./as_proxy_server --config /etc/as_proxy/proxy.toml
 
 ## 5. Рекомендации по тюнингу производительности и оптимальные сочетания параметров (`proxy.toml` + `spark_connector`)
 
-Производительность сквозного конвейера **Spark → Arrow Flight → `as_proxy_server` → Aerospike** зависит от согласованности параметров на стороне коннектора и прокси-сервера. Начиная с версии `0.4.3`, прокси автоматически масштабирует размер под-батча по числу бинов (`bin_weight = ceil(num_bins / 10)`), коалесцирует обновления статуса Raft в конец стрима (`propose_batch` без блокировок между стримами) и удерживает буферы сокетов Aerospike до `256 КБ` (`buffer_reclaim_threshold = 262144`) без переаллокаций.
+Производительность сквозного конвейера **Spark → Arrow Flight → `as_proxy_server` → Aerospike** зависит от согласованности параметров на стороне коннектора и прокси-сервера. Начиная с версии `0.4.4`, прокси использует адаптивную эвристику на лету (`AdaptiveBatchTuner`) для автоматического подбора размера под-батча, параллелизма и micro-pacing (предотвращая `wait` кластера Aerospike), коалесцирует обновления статуса Raft в конец стрима (`propose_batch` без блокировок между стримами) и удерживает буферы сокетов Aerospike до `256 КБ` (`buffer_reclaim_threshold = 262144`) без переаллокаций.
 
 ### 5.1. Сводная матрица оптимальных параметров по сценариям (Use Cases)
 
@@ -263,10 +277,13 @@ AS_PROXY_NODE_ID=3 ./as_proxy_server --config /etc/as_proxy/proxy.toml
      $$\text{StreamsPerPod} \approx \frac{\text{ActiveSparkTasks} \times \text{connector.writerThreads}}{\text{ProxyPods}}$$
    * Если у вас **160 активных задач Spark** (`40` экзекьюторов по `4` ядра) и **4 пода прокси**, то при `connector.writerThreads = 2` на каждый под прокси приходится `80` одновременных стримов `DoPut`.
    * Если под прокси имеет **1–2 vCPU**, ставьте `connector.writerThreads = "1"` или `"2"` и `writer.max_concurrent_subbatches_per_stream = 4..8`. Завышение `writerThreads` до `4..8` на 160 ядрах создаёт `640..1280` конкурентных стримов, которые конкурируют за кванты CPU планировщика Tokio.
-2. **Выбор `connector.batchSize` и `writer.batch_write_size` в зависимости от ширины таблицы**:
-   * Прокси автоматически делит каждый входящий `RecordBatch` на под-батчи размера:
-     $$\text{chunk\_size} = \max\left(16, \left\lfloor \frac{\text{batch\_write\_size}}{\lceil \text{num\_bins} / 10 \rceil} \right\rfloor\right)$$
-   * Для **100 бинов** при `batch_write_size = 512` размер одного `BatchWrite` составляет `51` запись (`~5100` бинов). Для **300 бинов** — `17` записей (`~5100` бинов). Это гарантирует, что сериализованный буфер каждой команды Aerospike не превышает `256 КБ` (`buffer_reclaim_threshold`) и не вызывает лишних аллокаций памяти.
+2. **Адаптивный подбор параметров батчевания на лету (`AdaptiveBatchTuner`) и выбор `connector.batchSize`**:
+   * При `writer.adaptive_batching = true` (по умолчанию) прокси-сервер автоматически вычисляет оптимальный `chunk_size`, число параллельных под-батчей `max_concurrency`, micro-pacing и дробление ретраев на каждом срезе `RecordBatch`:
+     * **Геометрия батча и выравнивание хвостов**: базовый размер ограничивается минимумом из `batch_write_size`, `target_batch_bytes / effective_row_bytes` (`256 КБ`) и `24 000 / num_bins`, после чего остаток строк делится равномерно без мелких «хвостовых» RPC.
+     * **BBR/Vegas-детектор раздувания очередей (Proactive Cluster Wait Avoidance)**: контроллер отслеживает минимальный базовый RTT на единицу работы и текущее отношение `queue_inflation = ema_unit_latency / min_unit_latency`. При росте `queue_inflation > 1.55` или превышении `target_write_latency_ms` прокси плавно снижает параллелизм/размер под-батча и включает микро-пейсинг (`100..3000 мкс`) **ещё до того**, как кластер Aerospike уйдёт в `wait` или вернёт `DEVICE_OVERLOAD`.
+     * **Справедливое деление параллелизма между стримами (Fair-Share Fan-In)**: при большом числе одновременных `DoPut`-стримов (например, `80..160` задач Spark на под) глобальный бюджет параллельных `BatchWrite` делится между активными стримами, не допуская переполнения пулов соединений Aerospike.
+     * **Поиск максимума RPS (Hill-Climbing)**: когда кластер свободен от очередей (`queue_inflation <= 1.35`), контроллер плавно масштабирует `chunk_size` (вплоть до `max_batch_write_size`) и параллелизм по градиенту пропускной способности (`goodput`).
+     * **Наблюдаемость в Prometheus (`/metrics`)**: `as_proxy_adaptive_batch_size`, `as_proxy_adaptive_concurrency`, `as_proxy_adaptive_pacing_micros`, `as_proxy_adaptive_queue_inflation_permille`, `as_proxy_cluster_wait_events_total`.
    * На стороне Spark выбирайте `connector.batchSize` так, чтобы произведение `batchSize × num_bins` составляло **`100 000 .. 400 000` ячеек**:
      * `10` бинов → `batchSize = 8192`
      * `100` бинов → `batchSize = 2048..4096`

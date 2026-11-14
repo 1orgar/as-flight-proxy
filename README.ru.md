@@ -26,7 +26,7 @@
 | **[2. Конфигурация `proxy_server`](docs/ru/proxy-configuration.md)** | **[Proxy Server Configuration](docs/en/proxy-configuration.md)** | Полный справочник `config.toml`, аргументов CLI, переменных окружения, настройки TLS/mTLS, пулов соединений Aerospike и тюнинга Linux. |
 | **[3. Справочник `spark_connector` и примеры](docs/ru/spark-connector.md)** | **[Spark Connector Guide & Examples](docs/en/spark-connector.md)** | Все опции `.format("aerospike-flight")`, `AerospikeFlightLookup` (Scala + PySpark), `AerospikeLoadStatus`, примеры для записи, DQ, чтения и Python `pyarrow.flight`. |
 | **[4. Прямые вызовы Flight из Python](docs/ru/flight-operations.md)** | **[Direct Flight Operations (Python)](docs/en/flight-operations.md)** | Как напрямую из Python (`pyarrow.flight`) проверять статус Raft и джобов, сбрасывать мету, вычитывать данные в `pyarrow.Table` / `pandas`, делать `DoExchange` Lookup и `DoPut`. |
-| **[5. Мониторинг, логи и траблшутинг](docs/ru/observability.md)** | **[Observability, Metrics & Logging](docs/en/observability.md)** | Справочник из 21 метрики Prometheus, готовые PromQL-запросы, примеры логов Driver / Executor и решение типовых проблем. |
+| **[5. Мониторинг, логи и траблшутинг](docs/ru/observability.md)** | **[Observability, Metrics & Logging](docs/en/observability.md)** | Справочник из 26 метрик Prometheus, готовые PromQL-запросы, примеры логов Driver / Executor и решение типовых проблем. |
 
 ---
 
@@ -129,9 +129,9 @@ flowchart LR
    * **На уровне буферов Arrow IPC (`ZSTD` / `LZ4_FRAME`)**: нативное сжатие off-heap буферов колонок через JNI (`com.github.luben.zstd.Zstd.compressUnsafe` / `decompressUnsafe`) в `spark_connector` и `arrow-ipc` в `proxy_server`.
    * **На уровне gRPC-конвертов (`zstd`, `gzip`)**: сжатие HTTP/2 фреймов в Tonic и Netty gRPC.
    * **Полное отключение компрессии**: задайте `flight.compression.enabled = false` (или `flight.compression = none`) на клиенте или `compression_enabled = false` в `config.toml` прокси-сервера.
-2. **Оптимизации горячего пути (включая широкие таблицы до `300+` бинов в `0.4.3`)**:
+2. **Оптимизации горячего пути и адаптивное батчевание на лету (включая широкие таблицы до `300+` бинов в `0.4.4`)**:
    * В `spark_connector`: специализированные небоксированные функции записи примитивов (`RowColumnWriter`), прямой перенос `UTF8String` в `VarCharVector` без промежуточного `byte[]` (`getBaseObject`), сохранение выученной ёмкости буферов при `reset()` и конвейерная отправка `DoPut` со скользящим окном (`maxInFlightBatches = 2`).
-   * В `proxy_server`: удержание буферов сокетов Aerospike до `256 КБ` (`buffer_reclaim_threshold = 262144`), однократная валидация схемы на весь `RecordBatch` с заимствованными ссылками `&str` на имена бинов, адаптивная нарезка `BatchWrite` по ширине таблицы (`bin_weight = ceil(num_bins / 10)`), коалесцирование обновлений статуса в Raft (`propose_batch` без межканальных блокировок) и `Release`-профиль с `lto = "thin"`, `codegen-units = 1`, `opt-level = 3`.
+   * В `proxy_server`: адаптивная эвристика батчевания на лету и упреждающее предотвращение `wait` кластера Aerospike (`AdaptiveBatchTuner` с учётом геометрии строки, BBR/Vegas-детектора раздувания очередей, fair-share параллелизма стримов и поиска максимума RPS по градиенту `goodput`), удержание буферов сокетов Aerospike до `256 КБ` (`buffer_reclaim_threshold = 262144`), однократная валидация схемы на весь `RecordBatch` с заимствованными ссылками `&str` на имена бинов, коалесцирование обновлений статуса в Raft (`propose_batch` + компактификация лога `InstallSnapshot`) и `Release`-профиль с `lto = "thin"`, `codegen-units = 1`, `opt-level = 3`.
 
 ### Оптимальные сочетания параметров (`spark_connector` + `proxy.toml`) по сценариям
 
@@ -173,6 +173,7 @@ election_timeout_min_ms = 150
 election_timeout_max_ms = 300
 heartbeat_interval_ms = 50
 job_stats_ttl_secs = 3600
+max_log_entries = 4096
 
 [tls]
 enabled = false
@@ -198,6 +199,11 @@ use_batch_write = true
 batch_write_size = 512
 max_in_flight_records = 16384
 max_concurrent_subbatches_per_stream = 16
+adaptive_batching = true
+min_batch_write_size = 16
+max_batch_write_size = 2048
+target_write_latency_ms = 15
+target_batch_bytes = 262144
 
 [retry]
 max_other_retries = 5
@@ -348,11 +354,11 @@ df = (
 
 ## 8. Мониторинг и метрики Prometheus
 
-> 📖 Полный справочник по всем 21 метрикам, PromQL-запросам и логам см. в **[Мониторинге и наблюдаемости](docs/ru/observability.md)**.
+> 📖 Полный справочник по всем 26 метрикам, PromQL-запросам и логам см. в **[Мониторинге и наблюдаемости](docs/ru/observability.md)**.
 
 На порту `server.metrics_addr` (по умолчанию `:9090`) доступны:
 * `GET /healthz` — проверка связности прокси с кластером Aerospike (`200 OK` / `503 Service Unavailable`).
-* `GET /metrics` — 21 метрика Prometheus, охватывающая запись (`DoPut`), чтение (`DoGet`), `DoExchange` Lookup, DQ-валидацию, ретраи перегрузки, пулы и состояние Raft.
+* `GET /metrics` — 26 метрик Prometheus, охватывающих запись (`DoPut`), адаптивный тюнер батчевания (`AdaptiveBatchTuner`), чтение (`DoGet`), `DoExchange` Lookup, DQ-валидацию, ретраи перегрузки, пулы и состояние Raft.
 
 ---
 
@@ -375,7 +381,7 @@ sbt "set ThisBuild / coverageEnabled := false" assembly
 При каждом пуше в `main` и создании тега `v*` workflow [`.github/workflows/ci.yml`](.github/workflows/ci.yml) автоматически проверяет покрытие (`>= 85%`) и публикует 3 релизных артефакта:
 1. `as_proxy_server-linux-x86_64.zip` — ZIP-архив с бинарником `as_proxy_server` для Linux `x86_64` и примером конфигурации `config.example.toml`.
 2. `as_proxy_server-linux-arm64.zip` — ZIP-архив с бинарником `as_proxy_server` для Linux `ARM64` (`aarch64`) и `config.example.toml`.
-3. `spark-aerospike-flight-connector-assembly-0.4.3.jar` — Fat-JAR коннектора для Spark 3.5 (Scala 2.12).
+3. `spark-aerospike-flight-connector-assembly-0.4.4.jar` — Fat-JAR коннектора для Spark 3.5 (Scala 2.12).
 
 ### Запуск полного E2E-стенда (Docker Compose)
 ```bash
@@ -385,7 +391,7 @@ curl -sL "https://github.com/1orgar/as-flight-proxy/releases/latest/download/as_
 unzip -o e2e/artifacts/proxy.zip -d e2e/artifacts/
 mv "e2e/artifacts/as_proxy_server-linux-${ARCH}" e2e/artifacts/as_proxy_server
 chmod +x e2e/artifacts/as_proxy_server
-curl -sL "https://github.com/1orgar/as-flight-proxy/releases/latest/download/spark-aerospike-flight-connector-assembly-0.4.3.jar" -o e2e/artifacts/spark-aerospike-flight-connector-assembly-0.4.3.jar
+curl -sL "https://github.com/1orgar/as-flight-proxy/releases/latest/download/spark-aerospike-flight-connector-assembly-0.4.4.jar" -o e2e/artifacts/spark-aerospike-flight-connector-assembly-0.4.4.jar
 
 docker compose -f docker-compose.e2e.yml up --abort-on-container-exit --exit-code-from spark-e2e
 docker compose -f docker-compose.e2e.yml down

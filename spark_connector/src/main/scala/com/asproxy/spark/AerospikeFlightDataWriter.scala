@@ -231,25 +231,54 @@ class AerospikeFlightDataWriter(
     try {
       workerRoot = VectorSchemaRoot.create(arrowSchema, workerAllocator)
       val loader = new VectorLoader(workerRoot)
-      val endpoint = options.endpointFor(partitionId, threadIdx)
-      flightClient = AerospikeLoadStatus.createFlightClient(workerAllocator, endpoint, options)
-
-      val callOptions = AerospikeLoadStatus.buildCallOptions(flightClient, options)
       val descriptor = FlightDescriptor.command(options.toFlightDescriptorJsonBytes)
 
-      val putListener = new SyncPutListener()
-      val streamListener = flightClient.startPut(
-        descriptor,
-        workerRoot,
-        putListener,
-        callOptions: _*
-      )
-      FlightCompressionHelper.configureOutboundStream(
-        streamListener,
-        workerRoot,
-        options.compression,
-        options.compressionLevel
-      )
+      var endpoint: HostEndpoint = options.endpointFor(partitionId, threadIdx)
+      var putListener: SyncPutListener = null
+      var streamListener: FlightClient.ClientStreamListener = null
+      var connectErr: Throwable = null
+      var attempt = 0
+      while (attempt < options.hosts.size && streamListener == null) {
+        val candidate = options.endpointFor(partitionId, threadIdx + attempt)
+        try {
+          flightClient = AerospikeLoadStatus.createFlightClient(workerAllocator, candidate, options)
+          val callOptions = AerospikeLoadStatus.buildCallOptions(flightClient, options)
+          val candidatePutListener = new SyncPutListener()
+          val candidateStream = flightClient.startPut(
+            descriptor,
+            workerRoot,
+            candidatePutListener,
+            callOptions: _*
+          )
+          FlightCompressionHelper.configureOutboundStream(
+            candidateStream,
+            workerRoot,
+            options.compression,
+            options.compressionLevel
+          )
+          endpoint = candidate
+          putListener = candidatePutListener
+          streamListener = candidateStream
+        } catch {
+          case t: Throwable =>
+            connectErr = t
+            logWarning(
+              s"[Executor][Write] Failed to open DoPut stream on ${candidate.host}:${candidate.port} " +
+                s"for partition=$partitionId, worker=$threadIdx (attempt ${attempt + 1}/${options.hosts.size}): ${t.getMessage}"
+            )
+            if (flightClient != null) {
+              try { flightClient.close() } catch { case _: Throwable => }
+              flightClient = null
+            }
+            attempt += 1
+        }
+      }
+      if (streamListener == null) {
+        throw new RuntimeException(
+          s"Failed to open Arrow Flight DoPut stream across endpoints ${options.hosts.mkString(", ")}",
+          connectErr
+        )
+      }
 
       try {
         val maxInFlightBatches = 2

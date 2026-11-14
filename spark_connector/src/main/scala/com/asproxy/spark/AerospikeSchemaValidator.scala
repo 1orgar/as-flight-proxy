@@ -40,7 +40,19 @@ object AerospikeSchemaValidator extends Logging {
    * Throws `IllegalArgumentException` with a complete list of ФЛК violations if any check fails.
    */
   def validate(schema: StructType, options: AerospikeFlightOptions): Unit = {
-    options.validateWriteTarget()
+    validate(schema, options, requireWriteJobId = true)
+  }
+
+  def validate(
+      schema: StructType,
+      options: AerospikeFlightOptions,
+      requireWriteJobId: Boolean
+  ): Unit = {
+    if (requireWriteJobId) {
+      options.validateWriteTarget()
+    } else {
+      options.validateReadOrLookupTarget()
+    }
 
     if (schema == null || schema.fields.isEmpty) {
       throw new IllegalArgumentException(

@@ -86,6 +86,8 @@ compression_level = 1
 | `election_timeout_max_ms` | `u64` | `300` | Maximum randomized election timeout in milliseconds |
 | `heartbeat_interval_ms` | `u64` | `50` | Leader heartbeat interval in milliseconds |
 | `job_stats_ttl_secs` | `u64` | `3600` | Time-to-live (in seconds) for Spark job statistics in Raft state before automatic eviction |
+| `max_log_entries` | `usize` | `4096` | Maximum number of committed entries retained in the in-memory Raft log before automatic log compaction into a snapshot (`InstallSnapshot`) |
+| `cluster_secret` | `Option<String>` | `None` | Optional shared HMAC-SHA256 secret to authenticate inter-node Raft RPC frames on `:8816` |
 | `peers` | `Array<RaftPeer>` | `[]` | List of all proxy nodes in the cluster (`node_id`, `raft_addr`, `flight_addr`) |
 
 ```toml
@@ -97,6 +99,8 @@ election_timeout_min_ms = 150
 election_timeout_max_ms = 300
 heartbeat_interval_ms = 50
 job_stats_ttl_secs = 3600
+max_log_entries = 4096
+# cluster_secret = "shared_raft_cluster_hmac_secret"
 
 [[raft.peers]]
 node_id = 1
@@ -184,14 +188,19 @@ max_bin_name_len = 15
 
 ---
 
-### 3.6. `[writer]` — MPP Batching & Concurrency
+### 3.6. `[writer]` — MPP Batching, Concurrency & On-the-Fly Adaptive Heuristic
 
 | Parameter | Type | Default | Description |
 | :--- | :---: | :---: | :--- |
 | `use_batch_write` | `bool` | `true` | Uses Aerospike's native `Client::batch` (`BatchWrite`) API instead of single-key `Put` calls |
-| `batch_write_size` | `usize` | `512` | Number of records grouped into a single Aerospike `BatchWrite` / `BatchRead` sub-batch |
+| `batch_write_size` | `usize` | `512` | Baseline number of records grouped into an Aerospike `BatchWrite` / `BatchRead` sub-batch |
 | `max_in_flight_records` | `usize` | `16384` | Global semaphore limit on total records concurrently in flight to Aerospike across all active streams on this proxy node |
-| `max_concurrent_subbatches_per_stream` | `usize` | `16` | Maximum number of sub-batches executed concurrently within a single `DoPut` stream |
+| `max_concurrent_subbatches_per_stream` | `usize` | `16` | Baseline limit on sub-batches executed concurrently within a single `DoPut` / `DoExchange` stream |
+| `adaptive_batching` | `bool` | `true` | Enables the closed-loop on-the-fly `AdaptiveBatchTuner` controller that dynamically adjusts sub-batch size, concurrency, retry slicing, and micro-pacing to maximize RPS and prevent Aerospike cluster `wait` |
+| `min_batch_write_size` | `usize` | `16` | Lower bound on dynamically tuned write sub-batch size |
+| `max_batch_write_size` | `usize` | `2048` | Upper bound on dynamically tuned write sub-batch size when scaling up on fast clusters |
+| `target_write_latency_ms` | `u64` | `15` | Target `BatchWrite` RPC latency threshold (ms) above which proactive cluster-wait throttling engages **before** `DEVICE_OVERLOAD` errors occur |
+| `target_batch_bytes` | `usize` | `262144` | Target serialized payload budget per sub-batch in bytes (`256 KB`, aligned with pooled Aerospike socket buffers) |
 
 ```toml
 [writer]
@@ -199,6 +208,11 @@ use_batch_write = true
 batch_write_size = 512
 max_in_flight_records = 16384
 max_concurrent_subbatches_per_stream = 16
+adaptive_batching = true
+min_batch_write_size = 16
+max_batch_write_size = 2048
+target_write_latency_ms = 15
+target_batch_bytes = 262144
 ```
 
 ---
@@ -241,7 +255,7 @@ AS_PROXY_NODE_ID=3 ./as_proxy_server --config /etc/as_proxy/proxy.toml
 
 ## 5. Performance Tuning & Optimal Parameter Combinations (`proxy.toml` + `spark_connector`)
 
-End-to-end throughput across **Spark → Arrow Flight → `as_proxy_server` → Aerospike** depends on aligning connector and proxy settings with your table width and cluster topology. Starting in `0.4.3`, the proxy automatically scales sub-batch size by bin count (`bin_weight = ceil(num_bins / 10)`), coalesces Raft job status updates per stream (`propose_batch` with zero cross-stream lock contention), and retains pooled Aerospike socket buffers up to `256 KB` (`buffer_reclaim_threshold = 262144`) without heap reallocation thrashing.
+End-to-end throughput across **Spark → Arrow Flight → `as_proxy_server` → Aerospike** depends on aligning connector and proxy settings with your table width and cluster topology. Starting in `0.4.4`, the proxy uses the closed-loop on-the-fly `AdaptiveBatchTuner` heuristic to dynamically tune sub-batch size, concurrency, and micro-pacing (proactively preventing Aerospike cluster `wait`), coalesces Raft job status updates per stream (`propose_batch` with zero cross-stream lock contention), and retains pooled Aerospike socket buffers up to `256 KB` (`buffer_reclaim_threshold = 262144`) without heap reallocation thrashing.
 
 ### 5.1. Optimal Parameter Matrix by Workload (Use Cases)
 
@@ -263,10 +277,13 @@ End-to-end throughput across **Spark → Arrow Flight → `as_proxy_server` → 
      $$\text{StreamsPerPod} \approx \frac{\text{ActiveSparkTasks} \times \text{connector.writerThreads}}{\text{ProxyPods}}$$
    * For example, with **160 active Spark tasks** (`40` executors × `4` cores) and **4 proxy pods**, setting `connector.writerThreads = 2` produces `80` active streams per proxy pod.
    * On **1–2 vCPU proxy pods**, keep `connector.writerThreads = "1"` or `"2"` and `writer.max_concurrent_subbatches_per_stream = 4..8` so Tokio worker threads spend time doing socket I/O rather than context-switching across thousands of sub-batch tasks.
-2. **Choosing `connector.batchSize` and `writer.batch_write_size` for Wide Tables (`100–300+` bins)**:
-   * The proxy automatically scales each Aerospike `BatchWrite` sub-batch using:
-     $$\text{chunk\_size} = \max\left(16, \left\lfloor \frac{\text{batch\_write\_size}}{\lceil \text{num\_bins} / 10 \rceil} \right\rfloor\right)$$
-   * For **100 bins** (`batch_write_size = 512`), each sub-batch contains `51` records (`~5100` bins). For **300 bins**, each sub-batch contains `17` records (`~5100` bins), keeping per-node wire buffers under the `256 KB` `buffer_reclaim_threshold`.
+2. **On-the-Fly Adaptive Batching (`AdaptiveBatchTuner`) & Choosing `connector.batchSize`**:
+   * When `writer.adaptive_batching = true` (default), the proxy dynamically tunes `chunk_size`, per-stream `max_concurrency`, micro-pacing, and overload retry slicing on every `RecordBatch`:
+     * **Workload Geometry & Tail Balancing**: baseline capacity is bounded by `min(batch_write_size, target_batch_bytes / effective_row_bytes, 24_000 / num_bins)`, and remaining rows are evenly balanced across sub-batches to avoid tiny tail RPCs.
+     * **BBR/Vegas Queue-Inflation Avoidance**: tracks baseline work-normalized RTT and `queue_inflation = ema_unit_latency / min_unit_latency`. When `queue_inflation > 1.55` or RPC latency exceeds `target_write_latency_ms`, the tuner trims concurrency/batch size and injects micro-pacing (`100..3000 µs`) **before** Aerospike enters queue `wait` or emits `DEVICE_OVERLOAD`.
+     * **Global Fair-Share Stream Concurrency**: under high Spark task fan-in (`80..160` active `DoPut` streams per pod), the global Aerospike batch-RPC budget is fair-shared across active streams so connection pools are never swamped.
+     * **Throughput-Gradient Hill-Climbing**: when the cluster is wait-free (`queue_inflation <= 1.35`), the tuner scales `chunk_size` (up to `max_batch_write_size`) and concurrency along positive goodput gradients.
+     * **Prometheus Observability (`/metrics`)**: `as_proxy_adaptive_batch_size`, `as_proxy_adaptive_concurrency`, `as_proxy_adaptive_pacing_micros`, `as_proxy_adaptive_queue_inflation_permille`, `as_proxy_cluster_wait_events_total`.
    * On the Spark side, aim for `batchSize × num_bins` between **`100,000` and `400,000` cells**:
      * `10` bins → `batchSize = 8192`
      * `100` bins → `batchSize = 2048..4096`

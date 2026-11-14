@@ -28,7 +28,7 @@ class AerospikeFlightDataSource extends TableProvider with DataSourceRegister {
   override def supportsExternalMetadata(): Boolean = true
 
   override def inferSchema(options: CaseInsensitiveStringMap): StructType = {
-    val parsedOpts = AerospikeFlightOptions.fromSparkOptions(options)
+    val parsedOpts = AerospikeFlightOptions.fromSparkReadOptions(options)
     parsedOpts.lookupSourceView match {
       case Some(viewName) =>
         val sourceDf = SparkSession.active.table(viewName)
@@ -56,7 +56,8 @@ class AerospikeFlightDataSource extends TableProvider with DataSourceRegister {
       partitioning: Array[Transform],
       properties: util.Map[String, String]
   ): Table = {
-    val options = AerospikeFlightOptions.fromMap(properties.asScala.toMap)
+    val rawProps = properties.asScala.toMap
+    val options = AerospikeFlightOptions.fromTableOrReadMap(rawProps)
     val effectiveSchema = options.lookupSourceView match {
       case Some(viewName) if schema != null && schema.fields.nonEmpty =>
         val sourceDf = SparkSession.active.table(viewName)
@@ -75,22 +76,27 @@ class AerospikeFlightDataSource extends TableProvider with DataSourceRegister {
           )
         val binsOnlyFields = outSchema.fields.filterNot(f => sourceDf.schema.fields.exists(_.name == f.name))
         if (binsOnlyFields.nonEmpty) {
-          AerospikeSchemaValidator.validate(StructType(keyField +: binsOnlyFields), options)
+          AerospikeSchemaValidator.validate(
+            StructType(keyField +: binsOnlyFields),
+            options,
+            requireWriteJobId = false
+          )
         }
         outSchema
       case _ =>
         if (schema != null && schema.fields.nonEmpty) {
-          AerospikeSchemaValidator.validate(schema, options)
+          AerospikeSchemaValidator.validate(schema, options, requireWriteJobId = false)
         }
         schema
     }
-    new AerospikeFlightTable(effectiveSchema, options)
+    new AerospikeFlightTable(effectiveSchema, options, rawProps)
   }
 }
 
 class AerospikeFlightTable(
     val tableSchema: StructType,
-    val options: AerospikeFlightOptions
+    val options: AerospikeFlightOptions,
+    val rawProperties: Map[String, String] = Map.empty
 ) extends Table
     with SupportsRead
     with SupportsWrite {
@@ -109,17 +115,48 @@ class AerospikeFlightTable(
     ).asJava
   }
 
-  override def newScanBuilder(scanOptions: CaseInsensitiveStringMap): ScanBuilder = {
-    val mergedMap = options match {
-      case _ if scanOptions.isEmpty => options
-      case _ =>
-        AerospikeFlightOptions.fromSparkOptions(scanOptions)
+  private def mergeWithBaseProperties(overrides: Map[String, String]): Map[String, String] = {
+    val baseProps: Map[String, String] = if (rawProperties.nonEmpty) {
+      rawProperties
+    } else {
+      val fallback = scala.collection.mutable.LinkedHashMap[String, String](
+        "flight.hosts" -> options.hosts.map(_.toString).mkString(","),
+        "aerospike.namespace" -> options.namespace,
+        "aerospike.set" -> options.setName,
+        "aerospike.keyColumn" -> options.keyColumn,
+        "aerospike.writeMode" -> options.writeMode
+      )
+      if (options.hasExplicitJobId) {
+        fallback.put("connector.jobId", options.jobId)
+      }
+      fallback.toMap
     }
-    new AerospikeFlightScanBuilder(tableSchema, mergedMap)
+    val baseLowerKeys = baseProps.map { case (k, v) => k.toLowerCase -> (k -> v) }
+    val mergedLower = overrides.foldLeft(baseLowerKeys) { case (acc, (k, v)) =>
+      acc.updated(k.toLowerCase, k -> v)
+    }
+    mergedLower.values.toMap
+  }
+
+  override def newScanBuilder(scanOptions: CaseInsensitiveStringMap): ScanBuilder = {
+    val effectiveOptions = if (scanOptions == null || scanOptions.isEmpty) {
+      options
+    } else {
+      val scanMap = scanOptions.asCaseSensitiveMap().asScala.toMap
+      AerospikeFlightOptions.fromTableOrReadMap(mergeWithBaseProperties(scanMap))
+    }
+    new AerospikeFlightScanBuilder(tableSchema, effectiveOptions)
   }
 
   override def newWriteBuilder(info: LogicalWriteInfo): WriteBuilder = {
-    AerospikeSchemaValidator.validate(info.schema(), options)
-    new AerospikeFlightWriteBuilder(info.schema(), options)
+    val writeOpts = if (info.options() == null || info.options().isEmpty) {
+      options
+    } else {
+      val writeMap = info.options().asCaseSensitiveMap().asScala.toMap
+      AerospikeFlightOptions.fromMap(mergeWithBaseProperties(writeMap), requireWriteTarget = true)
+    }
+    writeOpts.validateWriteTarget()
+    AerospikeSchemaValidator.validate(info.schema(), writeOpts)
+    new AerospikeFlightWriteBuilder(info.schema(), writeOpts)
   }
 }

@@ -1,7 +1,9 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
+use tokio::sync::Semaphore;
 use tracing::{error, info};
 
 use crate::raft::{RaftNode, RaftRole};
@@ -25,6 +27,11 @@ pub struct ProxyMetrics {
     pub write_latency_count: AtomicU64,
     pub read_latency_micros_sum: AtomicU64,
     pub read_latency_count: AtomicU64,
+    pub adaptive_batch_size: AtomicU64,
+    pub adaptive_concurrency: AtomicU64,
+    pub adaptive_pacing_micros: AtomicU64,
+    pub adaptive_queue_inflation_permille: AtomicU64,
+    pub cluster_wait_events_total: AtomicU64,
 }
 
 impl ProxyMetrics {
@@ -33,7 +40,8 @@ impl ProxyMetrics {
     }
 
     pub fn inc_records_written(&self, count: u64) {
-        self.records_written_total.fetch_add(count, Ordering::Relaxed);
+        self.records_written_total
+            .fetch_add(count, Ordering::Relaxed);
     }
 
     pub fn inc_batches_processed(&self) {
@@ -69,7 +77,8 @@ impl ProxyMetrics {
     }
 
     pub fn inc_overload_retries(&self, count: u64) {
-        self.overload_retries_total.fetch_add(count, Ordering::Relaxed);
+        self.overload_retries_total
+            .fetch_add(count, Ordering::Relaxed);
     }
 
     pub fn inc_other_retries(&self, count: u64) {
@@ -77,7 +86,8 @@ impl ProxyMetrics {
     }
 
     pub fn inc_failed_records(&self, count: u64) {
-        self.failed_records_total.fetch_add(count, Ordering::Relaxed);
+        self.failed_records_total
+            .fetch_add(count, Ordering::Relaxed);
     }
 
     pub fn add_in_flight(&self, delta: i64) {
@@ -98,6 +108,28 @@ impl ProxyMetrics {
         self.read_latency_micros_sum
             .fetch_add(micros, Ordering::Relaxed);
         self.read_latency_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn set_adaptive_state(
+        &self,
+        batch_size: u64,
+        concurrency: u64,
+        pacing_micros: u64,
+        queue_inflation_permille: u64,
+    ) {
+        self.adaptive_batch_size
+            .store(batch_size, Ordering::Relaxed);
+        self.adaptive_concurrency
+            .store(concurrency, Ordering::Relaxed);
+        self.adaptive_pacing_micros
+            .store(pacing_micros, Ordering::Relaxed);
+        self.adaptive_queue_inflation_permille
+            .store(queue_inflation_permille, Ordering::Relaxed);
+    }
+
+    pub fn inc_cluster_wait_events(&self) {
+        self.cluster_wait_events_total
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn render_prometheus(
@@ -124,6 +156,13 @@ impl ProxyMetrics {
         let read_lat_sum_sec =
             self.read_latency_micros_sum.load(Ordering::Relaxed) as f64 / 1_000_000.0;
         let read_lat_count = self.read_latency_count.load(Ordering::Relaxed);
+        let adaptive_batch = self.adaptive_batch_size.load(Ordering::Relaxed);
+        let adaptive_conc = self.adaptive_concurrency.load(Ordering::Relaxed);
+        let adaptive_pacing = self.adaptive_pacing_micros.load(Ordering::Relaxed);
+        let adaptive_q_inf = self
+            .adaptive_queue_inflation_permille
+            .load(Ordering::Relaxed);
+        let wait_events = self.cluster_wait_events_total.load(Ordering::Relaxed);
         let connected_val = u8::from(aerospike_connected);
         let (raft_term, raft_is_leader, raft_commit_idx) = raft_info.unwrap_or((0, false, 0));
         let leader_val = u8::from(raft_is_leader);
@@ -180,6 +219,21 @@ impl ProxyMetrics {
              # HELP as_proxy_read_duration_seconds_count Total count of Aerospike read/lookup sub-batches\n\
              # TYPE as_proxy_read_duration_seconds_count counter\n\
              as_proxy_read_duration_seconds_count {read_lat_count}\n\
+             # HELP as_proxy_adaptive_batch_size Dynamically tuned Aerospike sub-batch write size (records)\n\
+             # TYPE as_proxy_adaptive_batch_size gauge\n\
+             as_proxy_adaptive_batch_size {adaptive_batch}\n\
+             # HELP as_proxy_adaptive_concurrency Dynamically tuned per-stream sub-batch write concurrency\n\
+             # TYPE as_proxy_adaptive_concurrency gauge\n\
+             as_proxy_adaptive_concurrency {adaptive_conc}\n\
+             # HELP as_proxy_adaptive_pacing_micros Current micro-pacing delay (microseconds) applied to avoid Aerospike cluster wait\n\
+             # TYPE as_proxy_adaptive_pacing_micros gauge\n\
+             as_proxy_adaptive_pacing_micros {adaptive_pacing}\n\
+             # HELP as_proxy_adaptive_queue_inflation_permille Observed Aerospike write latency inflation vs baseline RTT in permille (1000 = 1.0x, >1550 = cluster queue wait)\n\
+             # TYPE as_proxy_adaptive_queue_inflation_permille gauge\n\
+             as_proxy_adaptive_queue_inflation_permille {adaptive_q_inf}\n\
+             # HELP as_proxy_cluster_wait_events_total Total proactive Aerospike cluster-wait avoidance or overload backoff adjustments\n\
+             # TYPE as_proxy_cluster_wait_events_total counter\n\
+             as_proxy_cluster_wait_events_total {wait_events}\n\
              # HELP as_proxy_aerospike_connected Whether the Aerospike client is connected to the cluster\n\
              # TYPE as_proxy_aerospike_connected gauge\n\
              as_proxy_aerospike_connected {connected_val}\n\
@@ -207,10 +261,9 @@ where
     F: Fn() -> bool + Send + Sync + 'static,
 {
     let listener = TcpListener::bind(listen_addr).await?;
-    info!(
-        "Observability HTTP server listening on http://{listen_addr} (/metrics, /healthz)"
-    );
+    info!("Observability HTTP server listening on http://{listen_addr} (/metrics, /healthz)");
     let health_check = Arc::new(health_check);
+    let conn_semaphore = Arc::new(Semaphore::new(128));
 
     loop {
         let (mut socket, _) = match listener.accept().await {
@@ -220,72 +273,80 @@ where
                 continue;
             }
         };
+        let _ = socket.set_nodelay(true);
+        let Ok(permit) = Arc::clone(&conn_semaphore).try_acquire_owned() else {
+            continue;
+        };
 
         let metrics = Arc::clone(&metrics);
         let raft_node = raft_node.clone();
         let health_check = Arc::clone(&health_check);
 
         tokio::spawn(async move {
-            let mut buf = [0u8; 1024];
-            let n = match socket.read(&mut buf).await {
-                Ok(0) | Err(_) => return,
-                Ok(n) => n,
-            };
+            let _permit = permit;
+            let _ = tokio::time::timeout(Duration::from_secs(5), async {
+                let mut buf = [0u8; 1024];
+                let n = match socket.read(&mut buf).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(n) => n,
+                };
 
-            let req = String::from_utf8_lossy(&buf[..n]);
-            let path = req
-                .lines()
-                .next()
-                .and_then(|line| line.split_whitespace().nth(1))
-                .unwrap_or("/");
+                let req = String::from_utf8_lossy(&buf[..n]);
+                let path = req
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_whitespace().nth(1))
+                    .unwrap_or("/");
 
-            let is_healthy = health_check();
+                let is_healthy = health_check();
 
-            let (status_line, content_type, body) = match path {
-                "/healthz" | "/health" | "/readyz" => {
-                    if is_healthy {
+                let (status_line, content_type, body) = match path {
+                    "/healthz" | "/health" | "/readyz" => {
+                        if is_healthy {
+                            (
+                                "HTTP/1.1 200 OK",
+                                "application/json",
+                                "{\"status\":\"ok\"}\n".to_string(),
+                            )
+                        } else {
+                            (
+                                "HTTP/1.1 503 Service Unavailable",
+                                "application/json",
+                                "{\"status\":\"unhealthy\"}\n".to_string(),
+                            )
+                        }
+                    }
+                    "/metrics" => {
+                        let raft_info = if let Some(ref r) = raft_node {
+                            let snap = r.get_cluster_snapshot().await;
+                            Some((
+                                snap.current_term,
+                                snap.role == RaftRole::Leader,
+                                snap.commit_index,
+                            ))
+                        } else {
+                            None
+                        };
                         (
                             "HTTP/1.1 200 OK",
-                            "application/json",
-                            "{\"status\":\"ok\"}\n".to_string(),
-                        )
-                    } else {
-                        (
-                            "HTTP/1.1 503 Service Unavailable",
-                            "application/json",
-                            "{\"status\":\"unhealthy\"}\n".to_string(),
+                            "text/plain; version=0.0.4; charset=utf-8",
+                            metrics.render_prometheus(is_healthy, raft_info),
                         )
                     }
-                }
-                "/metrics" => {
-                    let raft_info = if let Some(ref r) = raft_node {
-                        let snap = r.get_cluster_snapshot().await;
-                        Some((
-                            snap.current_term,
-                            snap.role == RaftRole::Leader,
-                            snap.commit_index,
-                        ))
-                    } else {
-                        None
-                    };
-                    (
-                        "HTTP/1.1 200 OK",
-                        "text/plain; version=0.0.4; charset=utf-8",
-                        metrics.render_prometheus(is_healthy, raft_info),
-                    )
-                }
-                _ => (
-                    "HTTP/1.1 404 Not Found",
-                    "text/plain; charset=utf-8",
-                    "Not Found. Available endpoints: /metrics, /healthz\n".to_string(),
-                ),
-            };
+                    _ => (
+                        "HTTP/1.1 404 Not Found",
+                        "text/plain; charset=utf-8",
+                        "Not Found. Available endpoints: /metrics, /healthz\n".to_string(),
+                    ),
+                };
 
-            let response = format!(
-                "{status_line}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            );
-            let _ = socket.write_all(response.as_bytes()).await;
+                let response = format!(
+                    "{status_line}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+            })
+            .await;
         });
     }
 }

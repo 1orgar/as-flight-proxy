@@ -71,31 +71,51 @@ class ZstdArrowCodec(val compressionLevel: Int = ZstdArrowCodec.DefaultCompressi
       allocator: BufferAllocator,
       compressedBuffer: ArrowBuf
   ): ArrowBuf = {
+    if (compressedBuffer.readableBytes() < CompressionUtil.SIZE_OF_UNCOMPRESSED_LENGTH) {
+      throw new IllegalArgumentException(
+        s"Arrow IPC ZSTD buffer too short (${compressedBuffer.readableBytes()} bytes)"
+      )
+    }
     val decompressedLength = readUncompressedLength(compressedBuffer)
+    if (decompressedLength < 0L || decompressedLength > Int.MaxValue.toLong) {
+      throw new IllegalArgumentException(
+        s"Invalid Arrow IPC ZSTD uncompressed length: $decompressedLength"
+      )
+    }
     val uncompressedBuffer = allocator.buffer(decompressedLength)
     if (decompressedLength == 0L) {
       return uncompressedBuffer
     }
 
-    val compressedOffset =
-      compressedBuffer.readerIndex() + CompressionUtil.SIZE_OF_UNCOMPRESSED_LENGTH
-    val compressedSize =
-      compressedBuffer.readableBytes() - CompressionUtil.SIZE_OF_UNCOMPRESSED_LENGTH
+    try {
+      val compressedOffset =
+        compressedBuffer.readerIndex() + CompressionUtil.SIZE_OF_UNCOMPRESSED_LENGTH
+      val compressedSize =
+        compressedBuffer.readableBytes() - CompressionUtil.SIZE_OF_UNCOMPRESSED_LENGTH
 
-    val srcAddr = compressedBuffer.memoryAddress() + compressedOffset
-    val dstAddr = uncompressedBuffer.memoryAddress()
+      val srcAddr = compressedBuffer.memoryAddress() + compressedOffset
+      val dstAddr = uncompressedBuffer.memoryAddress()
 
-    val decompressedBytes =
-      Zstd.decompressUnsafe(dstAddr, decompressedLength, srcAddr, compressedSize)
-    if (Zstd.isError(decompressedBytes)) {
-      uncompressedBuffer.close()
-      throw new RuntimeException(
-        s"Arrow IPC ZSTD decompression failed: ${Zstd.getErrorName(decompressedBytes)}"
-      )
+      val decompressedBytes =
+        Zstd.decompressUnsafe(dstAddr, decompressedLength, srcAddr, compressedSize)
+      if (Zstd.isError(decompressedBytes)) {
+        throw new RuntimeException(
+          s"Arrow IPC ZSTD decompression failed: ${Zstd.getErrorName(decompressedBytes)}"
+        )
+      }
+      if (decompressedBytes != decompressedLength) {
+        throw new RuntimeException(
+          s"Arrow IPC ZSTD uncompressed size mismatch: expected $decompressedLength bytes, got $decompressedBytes"
+        )
+      }
+
+      uncompressedBuffer.writerIndex(decompressedBytes)
+      uncompressedBuffer
+    } catch {
+      case t: Throwable =>
+        uncompressedBuffer.close()
+        throw t
     }
-
-    uncompressedBuffer.writerIndex(decompressedBytes)
-    uncompressedBuffer
   }
 }
 
@@ -116,11 +136,16 @@ object Lz4FrameArrowCodec extends AbstractCompressionCodec {
       allocator: BufferAllocator,
       uncompressedBuffer: ArrowBuf
   ): ArrowBuf = {
-    val uncompressedSize = uncompressedBuffer.readableBytes().toInt
+    val rawSize = uncompressedBuffer.readableBytes()
+    require(
+      rawSize >= 0L && rawSize <= Int.MaxValue.toLong,
+      s"Arrow IPC LZ4_FRAME uncompressed buffer size out of range: $rawSize"
+    )
+    val uncompressedSize = rawSize.toInt
     val rawBytes = new Array[Byte](uncompressedSize)
     uncompressedBuffer.getBytes(uncompressedBuffer.readerIndex(), rawBytes)
 
-    val baos = new ByteArrayOutputStream( math.max(64, uncompressedSize / 2) )
+    val baos = new ByteArrayOutputStream(math.max(64, uncompressedSize / 2))
     val lz4Out = new LZ4FrameOutputStream(baos)
     lz4Out.write(rawBytes)
     lz4Out.close()
@@ -144,39 +169,58 @@ object Lz4FrameArrowCodec extends AbstractCompressionCodec {
       allocator: BufferAllocator,
       compressedBuffer: ArrowBuf
   ): ArrowBuf = {
-    val decompressedLength = readUncompressedLength(compressedBuffer).toInt
+    if (compressedBuffer.readableBytes() < CompressionUtil.SIZE_OF_UNCOMPRESSED_LENGTH) {
+      throw new IllegalArgumentException(
+        s"Arrow IPC LZ4_FRAME buffer too short (${compressedBuffer.readableBytes()} bytes)"
+      )
+    }
+    val rawDecompressedLength = readUncompressedLength(compressedBuffer)
+    if (rawDecompressedLength < 0L || rawDecompressedLength > Int.MaxValue.toLong) {
+      throw new IllegalArgumentException(
+        s"Invalid Arrow IPC LZ4_FRAME uncompressed length: $rawDecompressedLength"
+      )
+    }
+    val decompressedLength = rawDecompressedLength.toInt
     val uncompressedBuffer = allocator.buffer(decompressedLength)
     if (decompressedLength == 0) {
       return uncompressedBuffer
     }
 
-    val compressedOffset =
-      compressedBuffer.readerIndex() + CompressionUtil.SIZE_OF_UNCOMPRESSED_LENGTH
-    val compressedSize =
-      (compressedBuffer.readableBytes() - CompressionUtil.SIZE_OF_UNCOMPRESSED_LENGTH).toInt
+    var lz4In: LZ4FrameInputStream = null
+    try {
+      val compressedOffset =
+        compressedBuffer.readerIndex() + CompressionUtil.SIZE_OF_UNCOMPRESSED_LENGTH
+      val compressedSize =
+        (compressedBuffer.readableBytes() - CompressionUtil.SIZE_OF_UNCOMPRESSED_LENGTH).toInt
 
-    val compressedBytes = new Array[Byte](compressedSize)
-    compressedBuffer.getBytes(compressedOffset, compressedBytes)
+      val compressedBytes = new Array[Byte](compressedSize)
+      compressedBuffer.getBytes(compressedOffset, compressedBytes)
 
-    val lz4In = new LZ4FrameInputStream(new ByteArrayInputStream(compressedBytes))
-    val outBytes = new Array[Byte](decompressedLength)
-    var totalRead = 0
-    while (totalRead < decompressedLength) {
-      val read = lz4In.read(outBytes, totalRead, decompressedLength - totalRead)
-      if (read < 0) {
-        uncompressedBuffer.close()
-        lz4In.close()
-        throw new RuntimeException(
-          s"Arrow IPC LZ4_FRAME truncated stream: expected $decompressedLength bytes, got $totalRead"
-        )
+      lz4In = new LZ4FrameInputStream(new ByteArrayInputStream(compressedBytes))
+      val outBytes = new Array[Byte](decompressedLength)
+      var totalRead = 0
+      while (totalRead < decompressedLength) {
+        val read = lz4In.read(outBytes, totalRead, decompressedLength - totalRead)
+        if (read < 0) {
+          throw new RuntimeException(
+            s"Arrow IPC LZ4_FRAME truncated stream: expected $decompressedLength bytes, got $totalRead"
+          )
+        }
+        totalRead += read
       }
-      totalRead += read
-    }
-    lz4In.close()
 
-    uncompressedBuffer.setBytes(0, outBytes, 0, decompressedLength)
-    uncompressedBuffer.writerIndex(decompressedLength)
-    uncompressedBuffer
+      uncompressedBuffer.setBytes(0, outBytes, 0, decompressedLength)
+      uncompressedBuffer.writerIndex(decompressedLength)
+      uncompressedBuffer
+    } catch {
+      case t: Throwable =>
+        uncompressedBuffer.close()
+        throw t
+    } finally {
+      if (lz4In != null) {
+        try { lz4In.close() } catch { case _: Throwable => }
+      }
+    }
   }
 }
 

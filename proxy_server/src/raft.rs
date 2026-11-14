@@ -1,17 +1,23 @@
+use hmac::{Hmac, Mac};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
+use sha2::Sha256;
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{Mutex, RwLock, watch};
+use tokio::sync::{Mutex, RwLock, Semaphore, watch};
 use tracing::{debug, info, warn};
 
 use crate::config::RaftConfig;
 use crate::error::{ProxyError, Result};
 use crate::writer::DqMismatchSample;
+
+type HmacSha256 = Hmac<Sha256>;
+const MAX_RAFT_FRAME_BYTES: usize = 16 * 1024 * 1024;
+const HMAC_TAG_LEN: usize = 32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -344,6 +350,13 @@ enum RaftRpcRequest {
         entries: Vec<LogEntry>,
         leader_commit: u64,
     },
+    InstallSnapshot {
+        term: u64,
+        leader_id: u64,
+        last_included_index: u64,
+        last_included_term: u64,
+        state: ClusterMetadataState,
+    },
     Propose {
         command: MetadataCommand,
     },
@@ -363,6 +376,10 @@ enum RaftRpcResponse {
         success: bool,
         match_index: u64,
     },
+    InstallSnapshot {
+        term: u64,
+        match_index: u64,
+    },
     Propose {
         success: bool,
         leader_id: Option<u64>,
@@ -375,7 +392,10 @@ struct RaftVolatileCore {
     voted_for: Option<u64>,
     role: RaftRole,
     leader_id: Option<u64>,
-    log: Vec<LogEntry>, // 1-indexed via LogEntry.index
+    base_index: u64,
+    base_term: u64,
+    snapshot_state: ClusterMetadataState,
+    log: Vec<LogEntry>, // Entries at indices (base_index + 1) ..= (base_index + log.len())
     commit_index: u64,
     last_applied: u64,
     next_index: BTreeMap<u64, u64>,
@@ -394,6 +414,9 @@ impl RaftVolatileCore {
                 RaftRole::Follower
             },
             leader_id: if single_node { Some(node_id) } else { None },
+            base_index: 0,
+            base_term: 0,
+            snapshot_state: ClusterMetadataState::default(),
             log: Vec::new(),
             commit_index: 0,
             last_applied: 0,
@@ -403,20 +426,30 @@ impl RaftVolatileCore {
         }
     }
 
+    #[inline]
+    fn last_log_index(&self) -> u64 {
+        self.base_index + self.log.len() as u64
+    }
+
     fn last_log_index_and_term(&self) -> (u64, u64) {
         self.log
             .last()
             .map(|e| (e.index, e.term))
-            .unwrap_or((0, 0))
+            .unwrap_or((self.base_index, self.base_term))
     }
 
     fn term_at(&self, index: u64) -> Option<u64> {
         if index == 0 {
-            return Some(0);
+            Some(0)
+        } else if index == self.base_index {
+            Some(self.base_term)
+        } else if index > self.base_index {
+            self.log
+                .get((index - self.base_index - 1) as usize)
+                .map(|e| e.term)
+        } else {
+            None
         }
-        self.log
-            .get((index - 1) as usize)
-            .map(|e| e.term)
     }
 }
 
@@ -425,15 +458,13 @@ pub struct RaftNode {
     config: RaftConfig,
     core: Mutex<RaftVolatileCore>,
     state_machine: RwLock<ClusterMetadataState>,
+    conn_semaphore: Arc<Semaphore>,
     shutdown_tx: watch::Sender<bool>,
 }
 
 impl RaftNode {
     pub fn new(config: RaftConfig) -> Arc<Self> {
-        let has_remote_peers = config
-            .peers
-            .iter()
-            .any(|p| p.node_id != config.node_id);
+        let has_remote_peers = config.peers.iter().any(|p| p.node_id != config.node_id);
         let core = RaftVolatileCore::new(!has_remote_peers, config.node_id);
         let (shutdown_tx, _) = watch::channel(false);
 
@@ -441,8 +472,15 @@ impl RaftNode {
             config,
             core: Mutex::new(core),
             state_machine: RwLock::new(ClusterMetadataState::default()),
+            conn_semaphore: Arc::new(Semaphore::new(256)),
             shutdown_tx,
         })
+    }
+
+    /// Returns `(in_memory_log_len, compacted_base_index)` for observability and testing.
+    pub async fn log_compaction_stats(&self) -> (usize, u64) {
+        let core = self.core.lock().await;
+        (core.log.len(), core.base_index)
     }
 
     pub fn node_id(&self) -> u64 {
@@ -491,9 +529,19 @@ impl RaftNode {
                     accept_res = listener.accept() => {
                         match accept_res {
                             Ok((stream, _)) => {
+                                let _ = stream.set_nodelay(true);
+                                let Ok(permit) = Arc::clone(&node_for_accept.conn_semaphore).try_acquire_owned() else {
+                                    warn!("Raft listener connection limit reached; dropping incoming connection");
+                                    continue;
+                                };
                                 let node = Arc::clone(&node_for_accept);
                                 tokio::spawn(async move {
-                                    let _ = node.handle_connection(stream).await;
+                                    let _permit = permit;
+                                    let _ = tokio::time::timeout(
+                                        Duration::from_secs(5),
+                                        node.handle_connection(stream),
+                                    )
+                                    .await;
                                 });
                             }
                             Err(e) => {
@@ -604,9 +652,7 @@ impl RaftNode {
             };
 
             if role == RaftRole::Leader {
-                return self
-                    .append_and_replicate_batch_as_leader(commands)
-                    .await;
+                return self.append_and_replicate_batch_as_leader(commands).await;
             }
 
             if let Some(lid) = leader_id {
@@ -620,9 +666,13 @@ impl RaftNode {
                             commands: commands.clone(),
                         }
                     };
-                    if let Ok(RaftRpcResponse::Propose {
-                        success: true, ..
-                    }) = send_rpc(&peer.raft_addr, &req, 1500).await
+                    if let Ok(RaftRpcResponse::Propose { success: true, .. }) = send_rpc(
+                        &peer.raft_addr,
+                        &req,
+                        self.config.cluster_secret.as_deref(),
+                        1500,
+                    )
+                    .await
                     {
                         return Ok(());
                     }
@@ -709,14 +759,14 @@ impl RaftNode {
             }
             let term = core.current_term;
             for command in commands {
-                let next_idx = core.log.len() as u64 + 1;
+                let next_idx = core.last_log_index() + 1;
                 core.log.push(LogEntry {
                     index: next_idx,
                     term,
                     command,
                 });
             }
-            let last_idx = core.log.len() as u64;
+            let last_idx = core.last_log_index();
             if remote_peers.is_empty() {
                 core.commit_index = last_idx;
             }
@@ -816,6 +866,7 @@ impl RaftNode {
 
         let mut futs = Vec::with_capacity(remote_peers.len());
         let vote_rpc_timeout_ms = self.config.election_timeout_min_ms.max(400);
+        let secret = self.config.cluster_secret.clone();
         for peer in remote_peers {
             let req = RaftRpcRequest::RequestVote {
                 term,
@@ -823,7 +874,16 @@ impl RaftNode {
                 last_log_index,
                 last_log_term,
             };
-            futs.push(async move { send_rpc(&peer.raft_addr, &req, vote_rpc_timeout_ms).await });
+            let peer_secret = secret.clone();
+            futs.push(async move {
+                send_rpc(
+                    &peer.raft_addr,
+                    &req,
+                    peer_secret.as_deref(),
+                    vote_rpc_timeout_ms,
+                )
+                .await
+            });
         }
 
         let responses = futures::future::join_all(futs).await;
@@ -857,7 +917,7 @@ impl RaftNode {
             {
                 core.role = RaftRole::Leader;
                 core.leader_id = Some(self.config.node_id);
-                let next_idx = core.log.len() as u64 + 1;
+                let next_idx = core.last_log_index() + 1;
                 for peer in &self.config.peers {
                     if peer.node_id != self.config.node_id {
                         core.next_index.insert(peer.node_id, next_idx);
@@ -866,10 +926,7 @@ impl RaftNode {
                 }
                 info!(
                     node_id = self.config.node_id,
-                    term,
-                    votes_granted,
-                    total_nodes,
-                    "Node elected Raft Leader"
+                    term, votes_granted, total_nodes, "Node elected Raft Leader"
                 );
                 true
             } else {
@@ -897,6 +954,7 @@ impl RaftNode {
         }
 
         let mut rpc_tasks = Vec::with_capacity(remote_peers.len());
+        let secret = self.config.cluster_secret.clone();
         {
             let core = self.core.lock().await;
             if core.role != RaftRole::Leader {
@@ -913,28 +971,46 @@ impl RaftNode {
                     .copied()
                     .unwrap_or(1)
                     .max(1);
-                let prev_log_index = next_idx - 1;
-                let prev_log_term = core.term_at(prev_log_index).unwrap_or(0);
-                let entries: Vec<LogEntry> = if (next_idx as usize) <= core.log.len() {
-                    let start_idx = next_idx as usize - 1;
-                    let end_idx = (start_idx + 1024).min(core.log.len());
-                    core.log[start_idx..end_idx].to_vec()
-                } else {
-                    Vec::new()
-                };
 
-                let req = RaftRpcRequest::AppendEntries {
-                    term,
-                    leader_id,
-                    prev_log_index,
-                    prev_log_term,
-                    entries,
-                    leader_commit,
+                let req = if next_idx <= core.base_index {
+                    RaftRpcRequest::InstallSnapshot {
+                        term,
+                        leader_id,
+                        last_included_index: core.base_index,
+                        last_included_term: core.base_term,
+                        state: core.snapshot_state.clone(),
+                    }
+                } else {
+                    let prev_log_index = next_idx - 1;
+                    let prev_log_term = core.term_at(prev_log_index).unwrap_or(0);
+                    let entries: Vec<LogEntry> = if next_idx <= core.last_log_index() {
+                        let start_idx = (next_idx - core.base_index - 1) as usize;
+                        let end_idx = (start_idx + 1024).min(core.log.len());
+                        core.log[start_idx..end_idx].to_vec()
+                    } else {
+                        Vec::new()
+                    };
+
+                    RaftRpcRequest::AppendEntries {
+                        term,
+                        leader_id,
+                        prev_log_index,
+                        prev_log_term,
+                        entries,
+                        leader_commit,
+                    }
                 };
 
                 let append_rpc_timeout_ms = self.config.election_timeout_min_ms.max(500);
+                let peer_secret = secret.clone();
                 rpc_tasks.push(async move {
-                    let res = send_rpc(&peer.raft_addr, &req, append_rpc_timeout_ms).await;
+                    let res = send_rpc(
+                        &peer.raft_addr,
+                        &req,
+                        peer_secret.as_deref(),
+                        append_rpc_timeout_ms,
+                    )
+                    .await;
                     (peer.node_id, next_idx, res)
                 });
             }
@@ -947,30 +1023,49 @@ impl RaftNode {
         }
 
         for (peer_id, attempted_next_idx, res) in results {
-            if let Ok(RaftRpcResponse::AppendEntries {
-                term: peer_term,
-                success,
-                match_index,
-            }) = res
-            {
-                if peer_term > core.current_term {
-                    core.current_term = peer_term;
-                    core.role = RaftRole::Follower;
-                    core.voted_for = None;
-                    core.leader_id = None;
-                    return;
+            match res {
+                Ok(RaftRpcResponse::AppendEntries {
+                    term: peer_term,
+                    success,
+                    match_index,
+                }) => {
+                    if peer_term > core.current_term {
+                        core.current_term = peer_term;
+                        core.role = RaftRole::Follower;
+                        core.voted_for = None;
+                        core.leader_id = None;
+                        return;
+                    }
+                    if success {
+                        let prev_match = core.match_index.get(&peer_id).copied().unwrap_or(0);
+                        if match_index >= prev_match {
+                            core.match_index.insert(peer_id, match_index);
+                            core.next_index.insert(peer_id, match_index + 1);
+                        }
+                    } else {
+                        let fallback = attempted_next_idx.saturating_sub(1).max(1);
+                        let fast_backtrack = (match_index + 1).min(fallback).max(1);
+                        core.next_index.insert(peer_id, fast_backtrack);
+                    }
                 }
-                if success {
+                Ok(RaftRpcResponse::InstallSnapshot {
+                    term: peer_term,
+                    match_index,
+                }) => {
+                    if peer_term > core.current_term {
+                        core.current_term = peer_term;
+                        core.role = RaftRole::Follower;
+                        core.voted_for = None;
+                        core.leader_id = None;
+                        return;
+                    }
                     let prev_match = core.match_index.get(&peer_id).copied().unwrap_or(0);
                     if match_index >= prev_match {
                         core.match_index.insert(peer_id, match_index);
                         core.next_index.insert(peer_id, match_index + 1);
                     }
-                } else {
-                    let fallback = attempted_next_idx.saturating_sub(1).max(1);
-                    let fast_backtrack = (match_index + 1).min(fallback).max(1);
-                    core.next_index.insert(peer_id, fast_backtrack);
                 }
+                _ => {}
             }
         }
 
@@ -983,7 +1078,7 @@ impl RaftNode {
             .count()
             + 1;
         let majority = (total_nodes / 2) + 1;
-        let max_log_idx = core.log.len() as u64;
+        let max_log_idx = core.last_log_index();
 
         for n in ((core.commit_index + 1)..=max_log_idx).rev() {
             if core.term_at(n) == Some(core.current_term) {
@@ -1002,26 +1097,34 @@ impl RaftNode {
     }
 
     async fn apply_committed_entries(&self) {
-        let entries_to_apply: Vec<MetadataCommand> = {
-            let mut core = self.core.lock().await;
-            if core.commit_index <= core.last_applied {
-                return;
-            }
-            let start = core.last_applied as usize;
-            let end = (core.commit_index as usize).min(core.log.len());
-            let cmds = core.log[start..end]
-                .iter()
-                .map(|e| e.command.clone())
-                .collect();
-            core.last_applied = end as u64;
-            cmds
-        };
+        let mut core = self.core.lock().await;
+        if core.commit_index <= core.last_applied {
+            return;
+        }
+        let start_idx = core.last_applied.max(core.base_index);
+        let end_idx = core.commit_index.min(core.last_log_index());
+        if end_idx <= start_idx {
+            return;
+        }
 
-        if !entries_to_apply.is_empty() {
-            let mut sm = self.state_machine.write().await;
-            for cmd in &entries_to_apply {
-                sm.apply(cmd);
-            }
+        // Lock order is strictly `core` -> `state_machine` so committed commands are applied
+        // sequentially in exact Raft log index order without races across concurrent tasks.
+        let mut sm = self.state_machine.write().await;
+        let start_offset = (start_idx - core.base_index) as usize;
+        let end_offset = (end_idx - core.base_index) as usize;
+        for entry in &core.log[start_offset..end_offset] {
+            sm.apply(&entry.command);
+        }
+        core.last_applied = end_idx;
+
+        let max_keep = self.config.max_log_entries.max(8);
+        if core.log.len() > max_keep && core.last_applied > core.base_index {
+            let drain_count = (core.last_applied - core.base_index) as usize;
+            let new_base_term = core.log[drain_count - 1].term;
+            core.log.drain(0..drain_count);
+            core.base_index = core.last_applied;
+            core.base_term = new_base_term;
+            core.snapshot_state = sm.clone();
         }
     }
 
@@ -1030,7 +1133,7 @@ impl RaftNode {
             Ok(l) => l as usize,
             Err(_) => return Ok(()),
         };
-        if len == 0 || len > 16 * 1024 * 1024 {
+        if len == 0 || len > MAX_RAFT_FRAME_BYTES {
             return Ok(());
         }
 
@@ -1040,21 +1143,23 @@ impl RaftNode {
             .await
             .map_err(|e| ProxyError::Internal(format!("Raft read error: {e}")))?;
 
-        let req: RaftRpcRequest = serde_json::from_slice(&buf)
+        let secret = self.config.cluster_secret.as_deref();
+        let json_slice = decode_raft_frame(&buf, secret)
+            .map_err(|e| ProxyError::Unauthenticated(format!("Raft auth error: {e}")))?;
+
+        let req: RaftRpcRequest = serde_json::from_slice(json_slice)
             .map_err(|e| ProxyError::Internal(format!("Raft decode error: {e}")))?;
 
         let resp = self.process_rpc(req).await;
         let resp_bytes = serde_json::to_vec(&resp)
             .map_err(|e| ProxyError::Internal(format!("Raft encode error: {e}")))?;
+        let frame = encode_raft_frame(&resp_bytes, secret)
+            .map_err(|e| ProxyError::Internal(format!("Raft frame encode error: {e}")))?;
 
         stream
-            .write_u32(resp_bytes.len() as u32)
+            .write_all(&frame)
             .await
-            .map_err(|e| ProxyError::Internal(format!("Raft write len error: {e}")))?;
-        stream
-            .write_all(&resp_bytes)
-            .await
-            .map_err(|e| ProxyError::Internal(format!("Raft write body error: {e}")))?;
+            .map_err(|e| ProxyError::Internal(format!("Raft write error: {e}")))?;
 
         Ok(())
     }
@@ -1079,8 +1184,7 @@ impl RaftNode {
                 let log_ok = (last_log_term > my_last_term)
                     || (last_log_term == my_last_term && last_log_index >= my_last_idx);
 
-                let vote_ok =
-                    core.voted_for.is_none() || core.voted_for == Some(candidate_id);
+                let vote_ok = core.voted_for.is_none() || core.voted_for == Some(candidate_id);
 
                 if term == core.current_term && log_ok && vote_ok {
                     core.voted_for = Some(candidate_id);
@@ -1123,44 +1227,105 @@ impl RaftNode {
                     core.leader_id = Some(leader_id);
                     core.last_leader_contact_ms = now_ms();
 
-                    if prev_log_index > 0 {
+                    if prev_log_index < core.base_index {
+                        let bridges_snapshot = entries
+                            .iter()
+                            .any(|e| e.index == core.base_index && e.term == core.base_term);
+                        let all_compacted =
+                            entries.last().map(|e| e.index).unwrap_or(prev_log_index)
+                                <= core.base_index;
+                        if !bridges_snapshot && !all_compacted {
+                            return RaftRpcResponse::AppendEntries {
+                                term: core.current_term,
+                                success: false,
+                                match_index: core.base_index,
+                            };
+                        }
+                    } else if prev_log_index > 0 {
                         match core.term_at(prev_log_index) {
                             Some(t) if t == prev_log_term => {}
                             _ => {
                                 return RaftRpcResponse::AppendEntries {
                                     term: core.current_term,
                                     success: false,
-                                    match_index: core.log.len() as u64,
+                                    match_index: core.last_log_index(),
                                 };
                             }
                         }
                     }
 
                     for entry in entries {
-                        let idx = entry.index as usize;
-                        if idx <= core.log.len() {
-                            if core.log[idx - 1].term != entry.term {
-                                core.log.truncate(idx - 1);
+                        if entry.index <= core.base_index {
+                            continue;
+                        }
+                        let rel_idx = (entry.index - core.base_index) as usize;
+                        if rel_idx <= core.log.len() {
+                            if core.log[rel_idx - 1].term != entry.term {
+                                core.log.truncate(rel_idx - 1);
                                 core.log.push(entry);
                             }
-                        } else {
+                        } else if rel_idx == core.log.len() + 1 {
                             core.log.push(entry);
                         }
                     }
 
                     if leader_commit > core.commit_index {
-                        core.commit_index = leader_commit.min(core.log.len() as u64);
+                        core.commit_index = leader_commit.min(core.last_log_index());
                     }
 
                     RaftRpcResponse::AppendEntries {
                         term: core.current_term,
                         success: true,
-                        match_index: core.log.len() as u64,
+                        match_index: core.last_log_index(),
                     }
                 };
 
                 self.apply_committed_entries().await;
                 resp
+            }
+
+            RaftRpcRequest::InstallSnapshot {
+                term,
+                leader_id,
+                last_included_index,
+                last_included_term,
+                state,
+            } => {
+                let mut core = self.core.lock().await;
+                if term < core.current_term {
+                    return RaftRpcResponse::InstallSnapshot {
+                        term: core.current_term,
+                        match_index: core.last_applied,
+                    };
+                }
+                if term > core.current_term || core.role != RaftRole::Follower {
+                    core.current_term = term;
+                    core.role = RaftRole::Follower;
+                    core.voted_for = None;
+                }
+                core.leader_id = Some(leader_id);
+                core.last_leader_contact_ms = now_ms();
+
+                if last_included_index <= core.last_applied {
+                    return RaftRpcResponse::InstallSnapshot {
+                        term: core.current_term,
+                        match_index: core.last_log_index(),
+                    };
+                }
+
+                let mut sm = self.state_machine.write().await;
+                core.log.clear();
+                core.base_index = last_included_index;
+                core.base_term = last_included_term;
+                core.snapshot_state = state.clone();
+                core.commit_index = core.commit_index.max(last_included_index);
+                core.last_applied = last_included_index;
+                *sm = state;
+
+                RaftRpcResponse::InstallSnapshot {
+                    term: core.current_term,
+                    match_index: last_included_index,
+                }
             }
 
             RaftRpcRequest::Propose { command } => {
@@ -1169,7 +1334,10 @@ impl RaftNode {
                     (core.role, core.leader_id)
                 };
                 if role == RaftRole::Leader {
-                    match self.append_and_replicate_batch_as_leader(vec![command]).await {
+                    match self
+                        .append_and_replicate_batch_as_leader(vec![command])
+                        .await
+                    {
                         Ok(()) => RaftRpcResponse::Propose {
                             success: true,
                             leader_id: Some(self.config.node_id),
@@ -1220,32 +1388,81 @@ impl RaftNode {
     }
 }
 
+fn encode_raft_frame(
+    json_bytes: &[u8],
+    cluster_secret: Option<&str>,
+) -> std::result::Result<Vec<u8>, String> {
+    let secret = cluster_secret.map(str::trim).filter(|s| !s.is_empty());
+    let body_len = match secret {
+        Some(_) => HMAC_TAG_LEN.saturating_add(json_bytes.len()),
+        None => json_bytes.len(),
+    };
+    if body_len == 0 || body_len > MAX_RAFT_FRAME_BYTES {
+        return Err(format!(
+            "Raft RPC payload size {body_len} exceeds limit {MAX_RAFT_FRAME_BYTES}"
+        ));
+    }
+
+    let mut frame = Vec::with_capacity(4 + body_len);
+    frame.extend_from_slice(&(body_len as u32).to_be_bytes());
+    if let Some(sec) = secret {
+        let mut mac = HmacSha256::new_from_slice(sec.as_bytes()).map_err(|e| e.to_string())?;
+        mac.update(json_bytes);
+        let tag = mac.finalize().into_bytes();
+        frame.extend_from_slice(&tag);
+    }
+    frame.extend_from_slice(json_bytes);
+    Ok(frame)
+}
+
+fn decode_raft_frame<'a>(
+    buf: &'a [u8],
+    cluster_secret: Option<&str>,
+) -> std::result::Result<&'a [u8], String> {
+    match cluster_secret.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(sec) => {
+            if buf.len() <= HMAC_TAG_LEN {
+                return Err("Raft frame too short for HMAC-SHA256 tag".to_string());
+            }
+            let (tag, payload) = buf.split_at(HMAC_TAG_LEN);
+            let mut mac = HmacSha256::new_from_slice(sec.as_bytes()).map_err(|e| e.to_string())?;
+            mac.update(payload);
+            mac.verify_slice(tag)
+                .map_err(|_| "Invalid Raft cluster_secret HMAC signature".to_string())?;
+            Ok(payload)
+        }
+        None => Ok(buf),
+    }
+}
+
 async fn send_rpc(
     addr: &str,
     req: &RaftRpcRequest,
+    cluster_secret: Option<&str>,
     timeout_ms: u64,
 ) -> std::result::Result<RaftRpcResponse, String> {
     let payload = serde_json::to_vec(req).map_err(|e| e.to_string())?;
+    let frame = encode_raft_frame(&payload, cluster_secret)?;
     let fut = async {
         let mut stream = TcpStream::connect(addr)
             .await
             .map_err(|e| format!("connect {addr}: {e}"))?;
-        stream
-            .write_u32(payload.len() as u32)
-            .await
-            .map_err(|e| e.to_string())?;
-        stream
-            .write_all(&payload)
-            .await
-            .map_err(|e| e.to_string())?;
+        let _ = stream.set_nodelay(true);
+        stream.write_all(&frame).await.map_err(|e| e.to_string())?;
 
         let resp_len = stream.read_u32().await.map_err(|e| e.to_string())? as usize;
+        if resp_len == 0 || resp_len > MAX_RAFT_FRAME_BYTES {
+            return Err(format!(
+                "Invalid Raft RPC response length {resp_len} from {addr}"
+            ));
+        }
         let mut resp_buf = vec![0u8; resp_len];
         stream
             .read_exact(&mut resp_buf)
             .await
             .map_err(|e| e.to_string())?;
-        serde_json::from_slice::<RaftRpcResponse>(&resp_buf).map_err(|e| e.to_string())
+        let json_slice = decode_raft_frame(&resp_buf, cluster_secret)?;
+        serde_json::from_slice::<RaftRpcResponse>(json_slice).map_err(|e| e.to_string())
     };
 
     tokio::time::timeout(Duration::from_millis(timeout_ms), fut)

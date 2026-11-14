@@ -6,8 +6,9 @@ import org.apache.arrow.memory.{BufferAllocator, RootAllocator}
 import org.apache.arrow.vector.VectorSchemaRoot
 import org.apache.spark.TaskContext
 import org.apache.spark.internal.Logging
-import org.apache.spark.sql.{DataFrame, SparkSession}
+import org.apache.spark.sql.{DataFrame, SparkInternalBridge, SparkSession}
 import org.apache.spark.sql.catalyst.InternalRow
+import org.apache.spark.sql.catalyst.expressions.UnsafeProjection
 import org.apache.spark.sql.types._
 
 import java.nio.charset.StandardCharsets
@@ -24,6 +25,14 @@ import scala.collection.JavaConverters._
  */
 object AerospikeFlightLookup extends Logging {
 
+  trait CloseableRowIterator extends Iterator[InternalRow] with AutoCloseable
+
+  private val EmptyCloseableRowIterator: CloseableRowIterator = new CloseableRowIterator {
+    override def hasNext: Boolean = false
+    override def next(): InternalRow = throw new NoSuchElementException("Empty lookup partition")
+    override def close(): Unit = ()
+  }
+
   /**
    * Enrich `keysDf` by fetching the specified `binsSchema` columns from Aerospike for each row's
    * primary key (`aerospike.keyColumn`).
@@ -36,7 +45,7 @@ object AerospikeFlightLookup extends Logging {
       binsSchema: StructType,
       options: Map[String, String]
   ): DataFrame = {
-    val parsedOpts = AerospikeFlightOptions.fromMap(options, requireWriteTarget = true)
+    val parsedOpts = AerospikeFlightOptions.fromTableOrReadMap(options)
     lookupWithOptions(keysDf, binsSchema, parsedOpts)
   }
 
@@ -88,6 +97,89 @@ object AerospikeFlightLookup extends Logging {
     lookup(keysDf, binsSchema, options.asScala.toMap)
   }
 
+  private def withJoinTypeOption(
+      options: scala.collection.Map[String, String],
+      joinType: String
+  ): Map[String, String] = {
+    val cleaned = options.filterNot { case (k, _) =>
+      val lower = k.toLowerCase
+      lower == "aerospike.lookup.jointype" || lower == "aerospike.lookup.join_type"
+    }.toMap
+    cleaned + ("aerospike.lookup.joinType" -> joinType)
+  }
+
+  /**
+   * Convenience `enrich` overloads matching PySpark (`PythonUtils.toScalaMap` or `java.util.Map`)
+   * and Scala callers with `(keysDf, options, binsSchema[, joinType])` argument order.
+   */
+  def enrich(
+      keysDf: DataFrame,
+      options: scala.collection.Map[String, String],
+      binsSchema: StructType,
+      joinType: String
+  ): DataFrame = {
+    lookup(keysDf, binsSchema, withJoinTypeOption(options, joinType))
+  }
+
+  def enrich(
+      keysDf: DataFrame,
+      options: scala.collection.Map[String, String],
+      binsSchema: StructType
+  ): DataFrame = {
+    lookup(keysDf, binsSchema, options.toMap)
+  }
+
+  def enrich(
+      keysDf: DataFrame,
+      options: scala.collection.Map[String, String],
+      binsSchemaDdlOrJson: String,
+      joinType: String
+  ): DataFrame = {
+    lookup(keysDf, parseBinsSchema(binsSchemaDdlOrJson), withJoinTypeOption(options, joinType))
+  }
+
+  def enrich(
+      keysDf: DataFrame,
+      options: scala.collection.Map[String, String],
+      binsSchemaDdlOrJson: String
+  ): DataFrame = {
+    lookup(keysDf, parseBinsSchema(binsSchemaDdlOrJson), options.toMap)
+  }
+
+  def enrich(
+      keysDf: DataFrame,
+      options: util.Map[String, String],
+      binsSchema: StructType,
+      joinType: String
+  ): DataFrame = {
+    lookup(keysDf, binsSchema, withJoinTypeOption(options.asScala, joinType))
+  }
+
+  def enrich(
+      keysDf: DataFrame,
+      options: util.Map[String, String],
+      binsSchema: StructType
+  ): DataFrame = {
+    lookup(keysDf, binsSchema, options.asScala.toMap)
+  }
+
+  def enrich(
+      keysDf: DataFrame,
+      options: util.Map[String, String],
+      binsSchemaDdlOrJson: String,
+      joinType: String
+  ): DataFrame = {
+    lookup(keysDf, parseBinsSchema(binsSchemaDdlOrJson), withJoinTypeOption(options.asScala, joinType))
+  }
+
+  def enrich(
+      keysDf: DataFrame,
+      options: util.Map[String, String],
+      binsSchemaDdlOrJson: String
+  ): DataFrame = {
+    lookup(keysDf, parseBinsSchema(binsSchemaDdlOrJson), options.asScala.toMap)
+  }
+
   def parseBinsSchema(ddlOrJson: String): StructType = {
     val trimmed = Option(ddlOrJson).map(_.trim).getOrElse("")
     require(trimmed.nonEmpty, "binsSchema string cannot be empty")
@@ -103,7 +195,7 @@ object AerospikeFlightLookup extends Logging {
       rawBinsSchema: StructType,
       options: AerospikeFlightOptions
   ): DataFrame = {
-    options.validateWriteTarget()
+    options.validateReadOrLookupTarget()
     val inputSchema = keysDf.schema
     if (!inputSchema.fields.exists(_.name == options.keyColumn)) {
       throw new IllegalArgumentException(
@@ -124,7 +216,7 @@ object AerospikeFlightLookup extends Logging {
 
     // Validate PK + requested bins against Aerospike rules (bin name length <= 15, valid types, etc.)
     val validationSchema = StructType(keyField +: effectiveBinsFields)
-    AerospikeSchemaValidator.validate(validationSchema, options)
+    AerospikeSchemaValidator.validate(validationSchema, options, requireWriteJobId = false)
 
     val outputSchema = buildOutputSchema(inputSchema, binsOnlySchema, options.keyColumn, options.lookupJoinType)
 
@@ -139,23 +231,21 @@ object AerospikeFlightLookup extends Logging {
     val spark = keysDf.sparkSession
     val inputRdd = keysDf.queryExecution.toRdd
 
-    val enrichedRowRdd = inputRdd.mapPartitionsWithIndex { (partitionIdx, rowIter) =>
-      val internalIter = enrichPartitionIterator(
+    val enrichedInternalRdd = inputRdd.mapPartitionsWithIndex { (partitionIdx, rowIter) =>
+      val internalIter = enrichPartitionIteratorInternal(
         partitionIndex = partitionIdx,
         inputRows = rowIter,
         inputSchema = inputSchema,
         binsOnlySchema = binsOnlySchema,
         outputSchema = outputSchema,
-        options = options
+        options = options,
+        copyRows = false
       )
-      val deserializer = org.apache.spark.sql.catalyst.encoders
-        .ExpressionEncoder(outputSchema)
-        .resolveAndBind()
-        .createDeserializer()
-      internalIter.map(deserializer.apply)
+      val unsafeProj = UnsafeProjection.create(outputSchema)
+      internalIter.map(row => unsafeProj(row): InternalRow)
     }
 
-    spark.createDataFrame(enrichedRowRdd, outputSchema)
+    SparkInternalBridge.createDataFrame(spark, enrichedInternalRdd, outputSchema)
   }
 
   def buildOutputSchema(
@@ -173,7 +263,7 @@ object AerospikeFlightLookup extends Logging {
 
   /**
    * Streams `inputRows` in Arrow batches over `DoExchange` to `as_proxy_server` and returns
-   * an iterator of enriched `InternalRow`s matching `outputSchema`.
+   * a closeable iterator of enriched `InternalRow`s matching `outputSchema`.
    */
   def enrichPartitionIterator(
       partitionIndex: Int,
@@ -182,10 +272,30 @@ object AerospikeFlightLookup extends Logging {
       binsOnlySchema: StructType,
       outputSchema: StructType,
       options: AerospikeFlightOptions
-  ): Iterator[InternalRow] = {
+  ): CloseableRowIterator = {
+    enrichPartitionIteratorInternal(
+      partitionIndex = partitionIndex,
+      inputRows = inputRows,
+      inputSchema = inputSchema,
+      binsOnlySchema = binsOnlySchema,
+      outputSchema = outputSchema,
+      options = options,
+      copyRows = true
+    )
+  }
+
+  private[spark] def enrichPartitionIteratorInternal(
+      partitionIndex: Int,
+      inputRows: Iterator[InternalRow],
+      inputSchema: StructType,
+      binsOnlySchema: StructType,
+      outputSchema: StructType,
+      options: AerospikeFlightOptions,
+      copyRows: Boolean
+  ): CloseableRowIterator = {
     if (!inputRows.hasNext) {
       logDebug(s"[Executor][Lookup] Skipping empty partition=$partitionIndex for '${options.namespace}.${options.setName}'")
-      return Iterator.empty
+      return EmptyCloseableRowIterator
     }
 
     val startTimeMs = System.currentTimeMillis()
@@ -245,6 +355,7 @@ object AerospikeFlightLookup extends Logging {
     val inputBatchesSent = new AtomicLong(0L)
     val outputRowsReceived = new AtomicLong(0L)
     val outputBatchesReceived = new AtomicLong(0L)
+    @volatile var cancelled = false
 
     val senderAllocator = allocator.newChildAllocator(s"lookup-sender-p$partitionIndex", 0L, Long.MaxValue)
     val inputArrowSchema = ArrowSchemaConverter.toArrowSchema(inputSchema)
@@ -273,31 +384,37 @@ object AerospikeFlightLookup extends Logging {
               options.compressionLevel
             )
             batchConverter.reset()
-            while (inputRows.hasNext) {
+            while (!cancelled && inputRows.hasNext) {
               val row = inputRows.next()
               batchConverter.appendRow(row)
               inputRowsSent.incrementAndGet()
               if (batchConverter.rowCount >= options.readBatchSize) {
                 batchConverter.finishBatch()
-                writer.putNext()
-                inputBatchesSent.incrementAndGet()
+                if (!cancelled) {
+                  writer.putNext()
+                  inputBatchesSent.incrementAndGet()
+                }
                 batchConverter.reset()
               }
             }
-            if (batchConverter.rowCount > 0) {
+            if (!cancelled && batchConverter.rowCount > 0) {
               batchConverter.finishBatch()
               writer.putNext()
               inputBatchesSent.incrementAndGet()
             }
-            writer.completed()
+            if (!cancelled) {
+              writer.completed()
+            }
           } catch {
             case t: Throwable =>
-              logError(
-                s"[Executor][Lookup] DoExchange sender thread failed in partition=$partitionIndex on $connectedEndpointStr: ${t.getMessage}",
-                t
-              )
-              senderError.compareAndSet(null, t)
-              try { writer.error(t) } catch { case _: Throwable => }
+              if (!cancelled) {
+                logError(
+                  s"[Executor][Lookup] DoExchange sender thread failed in partition=$partitionIndex on $connectedEndpointStr: ${t.getMessage}",
+                  t
+                )
+                senderError.compareAndSet(null, t)
+                try { writer.error(t) } catch { case _: Throwable => }
+              }
           } finally {
             try { inputRoot.close() } catch { case _: Throwable => }
             try { senderAllocator.close() } catch { case _: Throwable => }
@@ -309,25 +426,36 @@ object AerospikeFlightLookup extends Logging {
     senderThread.setDaemon(true)
     senderThread.start()
 
-    var closed = false
+    @volatile var closed = false
+    val closeLock = new AnyRef
     def closeAll(): Unit = {
-      if (!closed) {
-        closed = true
-        try { senderThread.join(5000L) } catch { case _: Throwable => }
-        if (exchange != null) {
-          try { exchange.close() } catch { case _: Throwable => }
+      closeLock.synchronized {
+        if (!closed) {
+          closed = true
+          cancelled = true
+          // Cancel reader and close exchange first to unblock senderThread if waiting on gRPC flow control
+          if (reader != null) {
+            try { reader.cancel("Lookup stream closed", null) } catch { case _: Throwable => }
+          }
+          if (exchange != null) {
+            try { exchange.close() } catch { case _: Throwable => }
+          }
+          if (Thread.currentThread() ne senderThread) {
+            try { senderThread.interrupt() } catch { case _: Throwable => }
+            try { senderThread.join(5000L) } catch { case _: Throwable => }
+          }
+          if (flightClient != null) {
+            try { flightClient.close() } catch { case _: Throwable => }
+          }
+          try { allocator.close() } catch { case _: Throwable => }
+          val elapsedMs = math.max(0L, System.currentTimeMillis() - startTimeMs)
+          logInfo(
+            s"[Executor][Lookup] Closed DoExchange stream for partition=$partitionIndex on $connectedEndpointStr: " +
+              s"inputRowsSent=${inputRowsSent.get()}, inputBatchesSent=${inputBatchesSent.get()}, " +
+              s"outputRowsReceived=${outputRowsReceived.get()}, outputBatchesReceived=${outputBatchesReceived.get()}, " +
+              s"elapsedMs=$elapsedMs"
+          )
         }
-        if (flightClient != null) {
-          try { flightClient.close() } catch { case _: Throwable => }
-        }
-        try { allocator.close() } catch { case _: Throwable => }
-        val elapsedMs = math.max(0L, System.currentTimeMillis() - startTimeMs)
-        logInfo(
-          s"[Executor][Lookup] Closed DoExchange stream for partition=$partitionIndex on $connectedEndpointStr: " +
-            s"inputRowsSent=${inputRowsSent.get()}, inputBatchesSent=${inputBatchesSent.get()}, " +
-            s"outputRowsReceived=${outputRowsReceived.get()}, outputBatchesReceived=${outputBatchesReceived.get()}, " +
-            s"elapsedMs=$elapsedMs"
-        )
       }
     }
 
@@ -335,14 +463,14 @@ object AerospikeFlightLookup extends Logging {
       tc.addTaskCompletionListener[Unit](_ => closeAll())
     }
 
-    new Iterator[InternalRow] {
+    new CloseableRowIterator {
       private var rowReader: ArrowRowReader = _
       private var currentIdx: Int = 0
       private var currentCount: Int = 0
       private var finished: Boolean = false
 
       override def hasNext: Boolean = {
-        if (finished) return false
+        if (finished || closed) return false
         while (currentIdx >= currentCount) {
           val sendErr = senderError.get()
           if (sendErr != null) {
@@ -354,8 +482,8 @@ object AerospikeFlightLookup extends Logging {
               reader.next()
             } catch {
               case t: Throwable =>
-                closeAll()
                 val cause = Option(senderError.get()).getOrElse(t)
+                closeAll()
                 throw new RuntimeException(s"Arrow Flight DoExchange reader failed: ${cause.getMessage}", cause)
             }
           if (!hasMoreBatches) {
@@ -384,10 +512,16 @@ object AerospikeFlightLookup extends Logging {
         if (!hasNext) {
           throw new NoSuchElementException("End of DoExchange lookup stream")
         }
-        val row = rowReader.readRow(currentIdx).copy()
+        val rawRow = rowReader.readRow(currentIdx)
+        val row = if (copyRows) rawRow.copy() else rawRow
         currentIdx += 1
         outputRowsReceived.incrementAndGet()
         row
+      }
+
+      override def close(): Unit = {
+        finished = true
+        closeAll()
       }
     }
   }

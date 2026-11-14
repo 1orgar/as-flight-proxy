@@ -52,15 +52,20 @@ The connector registers custom metrics visible directly in the **Spark SQL UI** 
 
 ## 3. Proxy Server Prometheus Metrics (`:9090/metrics`)
 
-Each `as_proxy_server` instance exposes **21 Prometheus metrics** on `GET http://<proxy-host>:9090/metrics`:
+Each `as_proxy_server` instance exposes **26 Prometheus metrics** on `GET http://<proxy-host>:9090/metrics`:
 
-### Write Metrics (`DoPut`)
+### Write & On-the-Fly Adaptive Batching Metrics (`DoPut` / `AdaptiveBatchTuner`)
 | Metric Name | Type | Description |
 | :--- | :---: | :--- |
 | `as_proxy_records_written_total` | `counter` | Total number of records successfully written to Aerospike |
 | `as_proxy_batches_processed_total` | `counter` | Total number of Arrow `RecordBatch`es processed on write |
 | `as_proxy_write_duration_seconds_sum` | `counter` | Cumulative time spent executing Aerospike write sub-batches (seconds) |
 | `as_proxy_write_duration_seconds_count` | `counter` | Total number of Aerospike write sub-batch operations executed |
+| `as_proxy_adaptive_batch_size` | `gauge` | Dynamically tuned Aerospike `BatchWrite` sub-batch size (records) |
+| `as_proxy_adaptive_concurrency` | `gauge` | Dynamically tuned per-stream sub-batch write concurrency |
+| `as_proxy_adaptive_pacing_micros` | `gauge` | Current micro-pacing delay (microseconds) applied to avoid Aerospike cluster `wait` |
+| `as_proxy_adaptive_queue_inflation_permille` | `gauge` | Observed Aerospike write latency inflation vs baseline RTT in permille (`1000` = `1.0x`, `> 1550` = cluster queue wait) |
+| `as_proxy_cluster_wait_events_total` | `counter` | Total proactive Aerospike cluster-wait avoidance or overload backoff adjustments |
 
 ### Read & Lookup Metrics (`DoGet` / `DoExchange` / `GetSchema`)
 | Metric Name | Type | Description |

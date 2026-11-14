@@ -21,6 +21,10 @@ election_timeout_max_ms = 300
 heartbeat_interval_ms = 50
 # TTL (in seconds) for storing Spark job statistics in Raft state before automatic eviction
 job_stats_ttl_secs = 3600
+# Maximum number of committed entries kept in the in-memory Raft log before compacting into a snapshot
+max_log_entries = 4096
+# Optional shared HMAC-SHA256 secret to authenticate inter-node Raft RPC frames on listen_addr
+# cluster_secret = "change_me_raft_cluster_hmac_secret"
 # Example 3-node cluster of equal proxy peers:
 # [[raft.peers]]
 # node_id = 1
@@ -50,6 +54,8 @@ token_ttl_secs = 86400
 
 [aerospike]
 hosts = "127.0.0.1:3000"
+# user = "aerospike_user"
+# password = "aerospike_password"
 connect_timeout_ms = 5000
 timeout_ms = 2000
 min_conns_per_node = 16
@@ -62,6 +68,12 @@ use_batch_write = true
 batch_write_size = 512
 max_in_flight_records = 16384
 max_concurrent_subbatches_per_stream = 16
+# On-the-fly adaptive batching & Aerospike cluster queue-wait avoidance heuristic
+adaptive_batching = true
+min_batch_write_size = 16
+max_batch_write_size = 2048
+target_write_latency_ms = 15
+target_batch_bytes = 262144
 
 [retry]
 # Overload errors (DEVICE_OVERLOAD, KEY_BUSY, NO_AVAILABLE_CONNECTIONS_TO_NODE, MAX_RETRIES_EXCEEDED)

@@ -48,14 +48,24 @@ case class AerospikeFlightOptions(
     lookupJoinType: String = "left",
     compression: String = "zstd",
     compressionLevel: Int = 1,
-    autoConvertStrings: Boolean = false
+    autoConvertStrings: Boolean = false,
+    hasExplicitJobId: Boolean = true,
+    maxLookupViewRows: Long = 1000000L
 ) extends Serializable {
 
   require(jobId.trim.nonEmpty, "'connector.jobId' cannot be empty")
   require(hosts.nonEmpty, "'flight.hosts' must contain at least one host:port endpoint")
+  require(timeoutMs >= 0L, s"'flight.timeoutMs' must be >= 0 (got $timeoutMs)")
+  ttlSeconds.foreach { ttl =>
+    require(
+      ttl >= -2L && ttl <= 4294967295L,
+      s"'aerospike.ttl' must be -2 (DontUpdate), -1 (Never), 0 (NamespaceDefault), or 1..4294967295 seconds (got $ttl)"
+    )
+  }
   require(batchSize > 0, s"'connector.batchSize' must be > 0 (got $batchSize)")
   require(writerThreads > 0, s"'connector.writerThreads' must be > 0 (got $writerThreads)")
   require(queueCapacity > 0, s"'connector.queueCapacity' must be > 0 (got $queueCapacity)")
+  require(maxLookupViewRows > 0L, s"'aerospike.lookup.maxViewRows' must be > 0 (got $maxLookupViewRows)")
   require(
     compressionLevel >= ZstdArrowCodec.MinCompressionLevel &&
       compressionLevel <= ZstdArrowCodec.MaxCompressionLevel,
@@ -77,10 +87,27 @@ case class AerospikeFlightOptions(
   require(readSampleSize > 0, s"'aerospike.read.sampleSize' must be > 0 (got $readSampleSize)")
 
   def validateWriteTarget(): Unit = {
-    require(jobId.trim.nonEmpty, "'connector.jobId' cannot be empty")
+    if (!hasExplicitJobId || jobId.trim.isEmpty) {
+      throw new IllegalArgumentException(
+        "Missing required option 'connector.jobId' (or 'aerospike.jobId')"
+      )
+    }
     require(namespace.trim.nonEmpty, "'aerospike.namespace' cannot be empty")
     require(keyColumn.trim.nonEmpty, "'aerospike.keyColumn' cannot be empty")
     AerospikeSchemaValidator.validateNamespaceAndSet(namespace, setName)
+  }
+
+  def validateReadOrLookupTarget(): Unit = {
+    require(namespace.trim.nonEmpty, "'aerospike.namespace' cannot be empty")
+    require(keyColumn.trim.nonEmpty, "'aerospike.keyColumn' cannot be empty")
+    AerospikeSchemaValidator.validateNamespaceAndSet(namespace, setName)
+  }
+
+  override def toString: String = {
+    val maskedPass = if (password != null && password.nonEmpty) "***" else ""
+    s"AerospikeFlightOptions(jobId=$jobId, hosts=${hosts.mkString("[", ",", "]")}, username=$username, " +
+      s"password=$maskedPass, tlsEnabled=$tlsEnabled, namespace=$namespace, setName=$setName, " +
+      s"keyColumn=$keyColumn, writeMode=$writeMode, compression=$compression:$compressionLevel)"
   }
 
   /**
@@ -103,7 +130,7 @@ case class AerospikeFlightOptions(
    * to distribute load evenly across all proxy instances.
    */
   def endpointFor(partitionId: Int, threadIndex: Int): HostEndpoint = {
-    val idx = math.abs(partitionId + threadIndex) % hosts.size
+    val idx = Math.floorMod(partitionId.toLong + threadIndex.toLong, hosts.size.toLong).toInt
     hosts(idx)
   }
 
@@ -148,11 +175,27 @@ object AerospikeFlightOptions {
     fromMap(options.asCaseSensitiveMap().asScala.toMap, requireWriteTarget = true)
   }
 
+  def fromSparkReadOptions(options: CaseInsensitiveStringMap): AerospikeFlightOptions = {
+    fromTableOrReadMap(options.asCaseSensitiveMap().asScala.toMap)
+  }
+
+  def fromTableOrReadMap(raw: Map[String, String]): AerospikeFlightOptions = {
+    fromMapInternal(raw, requireTarget = true, requireJobId = false)
+  }
+
   def forStatusQuery(raw: Map[String, String]): AerospikeFlightOptions = {
     fromMap(raw, requireWriteTarget = false)
   }
 
   def fromMap(raw: Map[String, String], requireWriteTarget: Boolean = true): AerospikeFlightOptions = {
+    fromMapInternal(raw, requireTarget = requireWriteTarget, requireJobId = requireWriteTarget)
+  }
+
+  private def fromMapInternal(
+      raw: Map[String, String],
+      requireTarget: Boolean,
+      requireJobId: Boolean
+  ): AerospikeFlightOptions = {
     val ci = raw.map { case (k, v) => k.toLowerCase -> v }
 
     def get(key: String): Option[String] = ci.get(key.toLowerCase).map(_.trim).filter(_.nonEmpty)
@@ -160,22 +203,21 @@ object AerospikeFlightOptions {
     def getRequired(key: String): String =
       get(key).getOrElse(throw new IllegalArgumentException(s"Missing required option '$key'"))
 
-    val jobId = if (requireWriteTarget) {
-      get("connector.jobId")
-        .orElse(get("aerospike.job_id"))
-        .orElse(get("aerospike.jobId"))
-        .orElse(get("job.id"))
-        .getOrElse(
-          throw new IllegalArgumentException(
-            "Missing required option 'connector.jobId' (or 'aerospike.jobId')"
-          )
+    val explicitJobIdOpt = get("connector.jobId")
+      .orElse(get("aerospike.job_id"))
+      .orElse(get("aerospike.jobId"))
+      .orElse(get("job.id"))
+
+    val jobId = explicitJobIdOpt match {
+      case Some(jid) => jid
+      case None if requireJobId =>
+        throw new IllegalArgumentException(
+          "Missing required option 'connector.jobId' (or 'aerospike.jobId')"
         )
-    } else {
-      get("connector.jobId")
-        .orElse(get("aerospike.job_id"))
-        .orElse(get("aerospike.jobId"))
-        .orElse(get("job.id"))
-        .getOrElse("status-query")
+      case None if requireTarget =>
+        s"read-${UUID.randomUUID().toString.substring(0, 8)}"
+      case None =>
+        "status-query"
     }
 
     val rawHosts = get("flight.hosts")
@@ -213,9 +255,9 @@ object AerospikeFlightOptions {
       .getOrElse("60000")
       .toLong
 
-    val namespace = if (requireWriteTarget) getRequired("aerospike.namespace") else getOrElse("aerospike.namespace", "")
+    val namespace = if (requireTarget) getRequired("aerospike.namespace") else getOrElse("aerospike.namespace", "")
     val setName = getOrElse("aerospike.set", "")
-    val keyColumn = if (requireWriteTarget) {
+    val keyColumn = if (requireTarget) {
       get("aerospike.keyColumn")
         .orElse(get("aerospike.key_column"))
         .getOrElse(throw new IllegalArgumentException("Missing required option 'aerospike.keyColumn' (or 'aerospike.key_column')"))
@@ -334,6 +376,11 @@ object AerospikeFlightOptions {
       .getOrElse("false")
       .toBoolean
 
+    val maxLookupViewRows = get("aerospike.lookup.maxViewRows")
+      .orElse(get("aerospike.lookup.max_view_rows"))
+      .map(_.toLong)
+      .getOrElse(1000000L)
+
     AerospikeFlightOptions(
       jobId = jobId,
       hosts = hosts,
@@ -368,7 +415,9 @@ object AerospikeFlightOptions {
       lookupJoinType = lookupJoinType,
       compression = compression,
       compressionLevel = compressionLevel,
-      autoConvertStrings = autoConvertStrings
+      autoConvertStrings = autoConvertStrings,
+      hasExplicitJobId = explicitJobIdOpt.isDefined || !requireTarget,
+      maxLookupViewRows = maxLookupViewRows
     )
   }
 
@@ -385,7 +434,26 @@ object AerospikeFlightOptions {
           )
         }
         val host = entry.substring(0, lastColon).trim
-        val port = entry.substring(lastColon + 1).trim.toInt
+        if (host.isEmpty) {
+          throw new IllegalArgumentException(
+            s"Invalid empty hostname in endpoint '$entry' in 'flight.hosts'"
+          )
+        }
+        val portStr = entry.substring(lastColon + 1).trim
+        val port =
+          try {
+            portStr.toInt
+          } catch {
+            case _: NumberFormatException =>
+              throw new IllegalArgumentException(
+                s"Invalid port '$portStr' in endpoint '$entry' in 'flight.hosts'"
+              )
+          }
+        if (port < 1 || port > 65535) {
+          throw new IllegalArgumentException(
+            s"Port out of range (1..65535) in endpoint '$entry' in 'flight.hosts'"
+          )
+        }
         HostEndpoint(host, port)
       }
       .toSeq

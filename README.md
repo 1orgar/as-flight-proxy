@@ -26,7 +26,7 @@ Detailed bilingual guides covering architecture, configuration, all parameters, 
 | **[2. Proxy Server Configuration](docs/en/proxy-configuration.md)** | **[Конфигурация `proxy_server`](docs/ru/proxy-configuration.md)** | Full reference for `config.toml`, CLI flags, environment variables, TLS/mTLS setup, Aerospike connection pools, concurrency tuning, and Linux kernel tuning. |
 | **[3. Spark Connector Guide & Examples](docs/en/spark-connector.md)** | **[Справочник `spark_connector`](docs/ru/spark-connector.md)** | Complete `.format("aerospike-flight")` options reference, `AerospikeFlightLookup` (Scala + PySpark), `AerospikeLoadStatus`, and examples for Write, DQ, Read, and Python `pyarrow.flight`. |
 | **[4. Direct Flight Operations (Python)](docs/en/flight-operations.md)** | **[Прямые вызовы Flight из Python](docs/ru/flight-operations.md)** | Calling Arrow Flight methods directly from Python (`pyarrow.flight`): querying Raft cluster & job status, resetting jobs, reading into `pyarrow.Table` / `pandas`, `DoExchange` lookup, and `DoPut`. |
-| **[5. Observability, Metrics & Logging](docs/en/observability.md)** | **[Мониторинг и логи](docs/ru/observability.md)** | Reference for all 21 Prometheus metrics, ready-to-use PromQL queries, Driver & Executor log guides, and troubleshooting playbook. |
+| **[5. Observability, Metrics & Logging](docs/en/observability.md)** | **[Мониторинг и логи](docs/ru/observability.md)** | Reference for all 26 Prometheus metrics, ready-to-use PromQL queries, Driver & Executor log guides, and troubleshooting playbook. |
 
 ---
 
@@ -129,9 +129,9 @@ The connector and proxy server implement end-to-end hot-path optimizations and c
    * **Arrow IPC Body Compression (`ZSTD` / `LZ4_FRAME`)**: Native off-heap buffer compression via JNI (`com.github.luben.zstd.Zstd.compressUnsafe` / `decompressUnsafe`) in `spark_connector` and `arrow-ipc` in `proxy_server`.
    * **gRPC Envelope Compression (`zstd`, `gzip`)**: HTTP/2 frame-level compression in Tonic and Netty gRPC.
    * **Disabling Compression**: Set `flight.compression.enabled = false` (or `flight.compression = none`) on the Spark connector, or `compression_enabled = false` in the proxy server's `config.toml`.
-2. **Hot-Path Optimizations (including wide tables up to `300+` bins in `0.4.3`)**:
+2. **Hot-Path Optimizations & On-the-Fly Adaptive Batching (including wide tables up to `300+` bins in `0.4.4`)**:
    * **Spark Connector**: Unboxed primitive column writers (`RowColumnWriter`), zero-copy `UTF8String` to `VarCharVector` transfer via `getBaseObject`, preserved vector buffer capacity across `reset()`, and sliding-window `DoPut` pipelining (`maxInFlightBatches = 2`).
-   * **Rust Proxy Server**: Pooled Aerospike socket buffer retention up to `256 KB` (`buffer_reclaim_threshold = 262144`), single-pass `RecordBatch` schema validation with borrowed `&str` bin names, adaptive bin-aware sub-batch slicing (`bin_weight = ceil(num_bins / 10)`), stream-coalesced Raft job updates (`propose_batch` with zero cross-stream lock contention), and a Cargo release profile with `lto = "thin"`, `codegen-units = 1`, `opt-level = 3`, and `strip = true`.
+   * **Rust Proxy Server**: Closed-loop on-the-fly write batching & Aerospike cluster-wait avoidance (`AdaptiveBatchTuner` combining row geometry, BBR/Vegas latency-inflation detection, global fair-share stream concurrency, and goodput hill-climbing), pooled Aerospike socket buffer retention up to `256 KB` (`buffer_reclaim_threshold = 262144`), single-pass `RecordBatch` schema validation with borrowed `&str` bin names, stream-coalesced Raft job updates (`propose_batch` + `InstallSnapshot` log compaction), and a Cargo release profile with `lto = "thin"`, `codegen-units = 1`, `opt-level = 3`, and `strip = true`.
 
 ### Optimal Parameter Combinations (`spark_connector` + `proxy.toml`) by Workload
 
@@ -173,6 +173,7 @@ election_timeout_min_ms = 150
 election_timeout_max_ms = 300
 heartbeat_interval_ms = 50
 job_stats_ttl_secs = 3600
+max_log_entries = 4096
 
 [tls]
 enabled = false
@@ -198,6 +199,11 @@ use_batch_write = true
 batch_write_size = 512
 max_in_flight_records = 16384
 max_concurrent_subbatches_per_stream = 16
+adaptive_batching = true
+min_batch_write_size = 16
+max_batch_write_size = 2048
+target_write_latency_ms = 15
+target_batch_bytes = 262144
 
 [retry]
 max_other_retries = 5
@@ -348,11 +354,11 @@ df = (
 
 ## 8. Monitoring & Prometheus Metrics
 
-> 📖 See **[Observability, Metrics & Logging](docs/en/observability.md)** for the complete catalog of 21 metrics, PromQL queries, and Driver/Executor log formats.
+> 📖 See **[Observability, Metrics & Logging](docs/en/observability.md)** for the complete catalog of 26 metrics, PromQL queries, and Driver/Executor log formats.
 
 On `server.metrics_addr` (default `:9090`), the proxy server exposes:
 * `GET /healthz` — Aerospike cluster connectivity probe (`200 OK` / `503 Service Unavailable`).
-* `GET /metrics` — 21 Prometheus metrics covering writes (`DoPut`), reads (`DoGet`), `DoExchange` Lookups, DQ validation, overload retries, in-flight concurrency, and Raft state.
+* `GET /metrics` — 26 Prometheus metrics covering writes (`DoPut`), on-the-fly adaptive batching (`AdaptiveBatchTuner`), reads (`DoGet`), `DoExchange` Lookups, DQ validation, overload retries, in-flight concurrency, and Raft state.
 
 ---
 
@@ -375,7 +381,7 @@ sbt "set ThisBuild / coverageEnabled := false" assembly
 On every push to `main` and `v*` tag, [`.github/workflows/ci.yml`](.github/workflows/ci.yml) enforces `>= 85%` test coverage and publishes 3 release artifacts:
 1. `as_proxy_server-linux-x86_64.zip` — ZIP archive containing the stripped `as_proxy_server` binary for Linux `x86_64` and `config.example.toml`.
 2. `as_proxy_server-linux-arm64.zip` — ZIP archive containing the stripped `as_proxy_server` binary for Linux `ARM64` (`aarch64`) and `config.example.toml`.
-3. `spark-aerospike-flight-connector-assembly-0.4.3.jar` — Shaded Fat-JAR connector for Apache Spark 3.5 (Scala 2.12).
+3. `spark-aerospike-flight-connector-assembly-0.4.4.jar` — Shaded Fat-JAR connector for Apache Spark 3.5 (Scala 2.12).
 
 ### Running the Full E2E Benchmark & Verification Suite (Docker Compose)
 ```bash
@@ -385,7 +391,7 @@ curl -sL "https://github.com/1orgar/as-flight-proxy/releases/latest/download/as_
 unzip -o e2e/artifacts/proxy.zip -d e2e/artifacts/
 mv "e2e/artifacts/as_proxy_server-linux-${ARCH}" e2e/artifacts/as_proxy_server
 chmod +x e2e/artifacts/as_proxy_server
-curl -sL "https://github.com/1orgar/as-flight-proxy/releases/latest/download/spark-aerospike-flight-connector-assembly-0.4.3.jar" -o e2e/artifacts/spark-aerospike-flight-connector-assembly-0.4.3.jar
+curl -sL "https://github.com/1orgar/as-flight-proxy/releases/latest/download/spark-aerospike-flight-connector-assembly-0.4.4.jar" -o e2e/artifacts/spark-aerospike-flight-connector-assembly-0.4.4.jar
 
 docker compose -f docker-compose.e2e.yml up --abort-on-container-exit --exit-code-from spark-e2e
 docker compose -f docker-compose.e2e.yml down

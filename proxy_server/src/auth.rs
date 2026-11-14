@@ -3,7 +3,7 @@ use base64::Engine;
 use base64::engine::general_purpose::{STANDARD as BASE64_STD, URL_SAFE_NO_PAD as BASE64_URL};
 use hmac::{Hmac, Mac};
 use prost::Message;
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 use std::time::{SystemTime, UNIX_EPOCH};
 use subtle::ConstantTimeEq;
 use tonic::metadata::MetadataMap;
@@ -64,9 +64,9 @@ impl Authenticator {
             return Ok(self.config.username.clone());
         }
 
-        let (payload_b64, sig_b64) = token.split_once('.').ok_or_else(|| {
-            ProxyError::Unauthenticated("Malformed Bearer token".to_string())
-        })?;
+        let (payload_b64, sig_b64) = token
+            .split_once('.')
+            .ok_or_else(|| ProxyError::Unauthenticated("Malformed Bearer token".to_string()))?;
 
         let expected_sig = self.sign_payload(payload_b64)?;
         if !constant_time_eq_str(sig_b64.as_bytes(), expected_sig.as_bytes()) {
@@ -143,11 +143,7 @@ impl Authenticator {
     /// Authenticate a `Handshake` request using either the `authorization` header
     /// or `HandshakeRequest.payload` (Arrow Flight `BasicAuth` protobuf or `user:pass`).
     /// Returns a freshly issued `Bearer` token.
-    pub fn authenticate_handshake(
-        &self,
-        metadata: &MetadataMap,
-        payload: &[u8],
-    ) -> Result<String> {
+    pub fn authenticate_handshake(&self, metadata: &MetadataMap, payload: &[u8]) -> Result<String> {
         if !self.config.enabled {
             return self.issue_token(&self.config.username);
         }
@@ -226,10 +222,12 @@ fn strip_prefix_case_insensitive<'a>(s: &'a str, prefix: &str) -> Option<&'a str
     }
 }
 
-/// Constant-time byte comparison that handles different slice lengths without early exit on content.
+/// Constant-time byte comparison that conceals both content and slice length by comparing
+/// fixed-size SHA-256 digests alongside constant-time length equality.
 fn constant_time_eq_str(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    bool::from(a.ct_eq(b))
+    let digest_a = Sha256::digest(a);
+    let digest_b = Sha256::digest(b);
+    let digest_eq = digest_a.ct_eq(&digest_b);
+    let len_eq = (a.len() as u64).ct_eq(&(b.len() as u64));
+    bool::from(digest_eq & len_eq)
 }

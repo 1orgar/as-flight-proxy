@@ -37,7 +37,9 @@ impl From<ProxyError> for Status {
             ProxyError::Config(msg) => Status::internal(format!("Config error: {msg}")),
             ProxyError::Unauthenticated(msg) => Status::unauthenticated(msg),
             ProxyError::InvalidArgument(msg) => Status::invalid_argument(msg),
-            ProxyError::Conversion(msg) => Status::invalid_argument(format!("Data conversion error: {msg}")),
+            ProxyError::Conversion(msg) => {
+                Status::invalid_argument(format!("Data conversion error: {msg}"))
+            }
             ProxyError::Flight(flight_err) => match flight_err {
                 FlightError::Tonic(status) => *status,
                 other => Status::invalid_argument(format!("Arrow Flight error: {other}")),

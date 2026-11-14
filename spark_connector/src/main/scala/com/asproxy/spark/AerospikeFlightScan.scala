@@ -111,7 +111,7 @@ object KeyLiteralSpec {
  */
 object AerospikeFlightSchemaInferrer extends Logging {
   def inferSchema(options: AerospikeFlightOptions): StructType = {
-    options.validateWriteTarget()
+    options.validateReadOrLookupTarget()
     val startMs = System.currentTimeMillis()
     val reqMap = new util.LinkedHashMap[String, Any]()
     reqMap.put("namespace", options.namespace)
@@ -318,17 +318,45 @@ class AerospikeFlightScan(
           options.keyColumn,
           options.lookupJoinType
         )
+        val maxViewRows = options.maxLookupViewRows
         val partitionRows: Array[Array[InternalRow]] = sourceDf.queryExecution.toRdd
           .mapPartitions { iter =>
             val proj = org.apache.spark.sql.catalyst.expressions.UnsafeProjection.create(inputSchema)
-            Iterator.single(iter.map(r => proj(r).copy().asInstanceOf[InternalRow]).toArray)
+            val buf = new ArrayBuffer[InternalRow]()
+            var count = 0L
+            while (iter.hasNext) {
+              count += 1L
+              if (count > maxViewRows) {
+                throw new IllegalArgumentException(
+                  s"Lookup source view '$viewName' exceeded 'aerospike.lookup.maxViewRows' ($maxViewRows) in a single partition. " +
+                    "Use AerospikeFlightLookup.lookup(keysDf, ...) / AerospikeFlightLookup.enrich(...) for zero-driver-collection distributed MPP lookups, " +
+                    "or increase 'aerospike.lookup.maxViewRows'."
+                )
+              }
+              buf += proj(iter.next()).copy().asInstanceOf[InternalRow]
+            }
+            Iterator.single(buf.toArray)
           }
           .collect()
 
+        var totalCollectedRows = 0L
+        var pIdx = 0
+        while (pIdx < partitionRows.length) {
+          totalCollectedRows += partitionRows(pIdx).length.toLong
+          if (totalCollectedRows > maxViewRows) {
+            throw new IllegalArgumentException(
+              s"Lookup source view '$viewName' has more than 'aerospike.lookup.maxViewRows' ($maxViewRows) total rows. " +
+                "Use AerospikeFlightLookup.lookup(keysDf, ...) / AerospikeFlightLookup.enrich(...) for zero-driver-collection distributed MPP lookups, " +
+                "or increase 'aerospike.lookup.maxViewRows'."
+            )
+          }
+          pIdx += 1
+        }
+
         logInfo(
           s"[Driver][ScanPlan] Planned DoExchange Lookup scan on '${options.namespace}.${options.setName}' " +
-            s"from view='$viewName': partitions=${partitionRows.length}, joinType='${options.lookupJoinType}', " +
-            s"lookupBins=[${binsFields.map(_.name).mkString(", ")}]"
+            s"from view='$viewName': partitions=${partitionRows.length}, totalRows=$totalCollectedRows, " +
+            s"joinType='${options.lookupJoinType}', lookupBins=[${binsFields.map(_.name).mkString(", ")}]"
         )
 
         partitionRows.zipWithIndex.map { case (rows, idx) =>
@@ -422,14 +450,16 @@ class AerospikeFlightLookupPartitionReader(
     options: AerospikeFlightOptions
 ) extends PartitionReader[InternalRow] {
 
-  private val iter: Iterator[InternalRow] = AerospikeFlightLookup.enrichPartitionIterator(
-    partitionIndex = partition.partitionIndex,
-    inputRows = partition.rows.iterator,
-    inputSchema = partition.inputSchema,
-    binsOnlySchema = partition.binsOnlySchema,
-    outputSchema = readSchema,
-    options = options
-  )
+  private val iter: AerospikeFlightLookup.CloseableRowIterator =
+    AerospikeFlightLookup.enrichPartitionIteratorInternal(
+      partitionIndex = partition.partitionIndex,
+      inputRows = partition.rows.iterator,
+      inputSchema = partition.inputSchema,
+      binsOnlySchema = partition.binsOnlySchema,
+      outputSchema = readSchema,
+      options = options,
+      copyRows = false
+    )
 
   private var currentRow: InternalRow = _
 
@@ -444,7 +474,9 @@ class AerospikeFlightLookupPartitionReader(
 
   override def get(): InternalRow = currentRow
 
-  override def close(): Unit = {}
+  override def close(): Unit = {
+    iter.close()
+  }
 }
 
 class AerospikeFlightPartitionReader(

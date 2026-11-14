@@ -1,6 +1,4 @@
 use aerospike::{Bin, FloatValue, Key, Value};
-use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
 use arrow_array::builder::{
     BinaryBuilder, BooleanBuilder, Date32Builder, Decimal128Builder, Float32Builder,
     Float64Builder, Int8Builder, Int16Builder, Int32Builder, Int64Builder, StringBuilder,
@@ -17,7 +15,7 @@ use arrow_array::{
     Array, ArrayRef, BinaryArray, BinaryViewArray, Decimal128Array, Decimal256Array,
     FixedSizeBinaryArray, FixedSizeListArray, LargeBinaryArray, LargeListArray, LargeStringArray,
     ListArray, MapArray, NullArray, RecordBatch, RecordBatchOptions, StringArray, StringViewArray,
-    StructArray, UInt32Array,
+    StructArray, make_array, new_empty_array,
 };
 use arrow_buffer::{NullBuffer, OffsetBuffer};
 use arrow_flight::{IpcMessage, SchemaAsIpc, SchemaResult};
@@ -26,6 +24,8 @@ use arrow_schema::{DataType, Field, Fields, Schema, TimeUnit};
 use base64::Engine;
 use bytes::Bytes;
 use indexmap::IndexMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use crate::config::{LookupJoinType, TypeMismatchMode, WriteMode, WriteParameters};
 use crate::error::{ProxyError, Result};
@@ -104,7 +104,9 @@ impl<'a> CompiledKeyColumn<'a> {
                 array
                     .as_any()
                     .downcast_ref::<BinaryArray>()
-                    .ok_or_else(|| ProxyError::Conversion("Failed to downcast Binary key".into()))?,
+                    .ok_or_else(|| {
+                        ProxyError::Conversion("Failed to downcast Binary key".into())
+                    })?,
             )),
             DataType::LargeBinary => Ok(Self::LargeBinary(
                 array
@@ -369,7 +371,15 @@ impl<'a> CompiledBinColumn<'a> {
             CompiledValueExtractor::UInt8(vals) => Ok(Value::Int(i64::from(vals[row]))),
             CompiledValueExtractor::UInt16(vals) => Ok(Value::Int(i64::from(vals[row]))),
             CompiledValueExtractor::UInt32(vals) => Ok(Value::Int(i64::from(vals[row]))),
-            CompiledValueExtractor::UInt64(vals) => Ok(Value::Int(vals[row] as i64)),
+            CompiledValueExtractor::UInt64(vals) => {
+                let v = i64::try_from(vals[row]).map_err(|_| {
+                    ProxyError::Conversion(format!(
+                        "UInt64 value {} in column '{}' at row {row} overflows i64::MAX",
+                        vals[row], self.name
+                    ))
+                })?;
+                Ok(Value::Int(v))
+            }
             CompiledValueExtractor::Float32(vals) => {
                 Ok(Value::Float(FloatValue::from(f64::from(vals[row]))))
             }
@@ -424,11 +434,7 @@ pub fn validate_record_batch_schema(
         ProxyError::InvalidArgument(format!(
             "Key column '{}' not found in Arrow schema (available columns: {:?})",
             params.key_column,
-            schema
-                .fields()
-                .iter()
-                .map(|f| f.name())
-                .collect::<Vec<_>>()
+            schema.fields().iter().map(|f| f.name()).collect::<Vec<_>>()
         ))
     })?;
 
@@ -656,10 +662,7 @@ pub fn values_equal_dq(expected: &Value, actual: &Value) -> bool {
         (Value::String(a), Value::String(b)) => a == b,
         (Value::Blob(a), Value::Blob(b)) | (Value::Hll(a), Value::Hll(b)) => a == b,
         (Value::List(a), Value::List(b)) => {
-            a.len() == b.len()
-                && a.iter()
-                    .zip(b.iter())
-                    .all(|(x, y)| values_equal_dq(x, y))
+            a.len() == b.len() && a.iter().zip(b.iter()).all(|(x, y)| values_equal_dq(x, y))
         }
         (Value::OrderedMap(a), Value::OrderedMap(b)) => {
             a.len() == b.len()
@@ -746,12 +749,7 @@ pub fn extract_value_with_options(
     if array.is_null(row) {
         return Ok(Value::Nil);
     }
-    let compiled = CompiledBinColumn::compile(
-        "",
-        array,
-        ignore_nulls,
-        auto_convert_strings,
-    )?;
+    let compiled = CompiledBinColumn::compile("", array, ignore_nulls, auto_convert_strings)?;
     compiled.extract_non_null(row)
 }
 
@@ -893,7 +891,9 @@ fn validate_bin_name_chars(name: &str) -> Option<&'static str> {
             return Some("contains reserved Aerospike delimiter (':' or ';')");
         }
         if b > 0x7E {
-            return Some("contains non-ASCII character (only printable ASCII 0x21..0x7E is allowed)");
+            return Some(
+                "contains non-ASCII character (only printable ASCII 0x21..0x7E is allowed)",
+            );
         }
     }
     None
@@ -917,7 +917,9 @@ pub fn encode_arrow_schema_ipc_base64(schema: &Schema) -> Result<String> {
 pub fn decode_arrow_schema_ipc_base64(b64: &str) -> Result<Arc<Schema>> {
     let raw = base64::engine::general_purpose::STANDARD
         .decode(b64.trim())
-        .map_err(|e| ProxyError::InvalidArgument(format!("Invalid base64 in schema_ipc_base64: {e}")))?;
+        .map_err(|e| {
+            ProxyError::InvalidArgument(format!("Invalid base64 in schema_ipc_base64: {e}"))
+        })?;
     let schema = Schema::try_from(IpcMessage(Bytes::from(raw))).map_err(|e| {
         ProxyError::InvalidArgument(format!("Failed to decode Arrow Schema from IPC bytes: {e}"))
     })?;
@@ -1000,11 +1002,7 @@ pub fn infer_arrow_schema_from_records(key_column: &str, records: &[ScannedRecor
     let mut fields = Vec::with_capacity(1 + bin_types.len());
     fields.push(Field::new(key_column, key_type, false));
     for (bin_name, dt_opt) in bin_types {
-        fields.push(Field::new(
-            bin_name,
-            dt_opt.unwrap_or(DataType::Utf8),
-            true,
-        ));
+        fields.push(Field::new(bin_name, dt_opt.unwrap_or(DataType::Utf8), true));
     }
 
     Schema::new(fields)
@@ -1084,10 +1082,8 @@ pub fn records_to_record_batch(
             )?;
             columns.push(col);
         } else {
-            let values: Vec<Option<&Value>> = records
-                .iter()
-                .map(|r| r.bins.get(field.name()))
-                .collect();
+            let values: Vec<Option<&Value>> =
+                records.iter().map(|r| r.bins.get(field.name())).collect();
             let col = build_array_from_values(
                 field.name(),
                 field.data_type(),
@@ -1100,6 +1096,85 @@ pub fn records_to_record_batch(
 
     RecordBatch::try_new(Arc::clone(schema), columns)
         .map_err(|e| ProxyError::Conversion(e.to_string()))
+}
+
+/// Build an Arrow `RecordBatch` directly from `BatchKeys` lookup `keys` and `outcomes`
+/// without allocating intermediate `IndexMap` / `ScannedRecord` wrappers.
+pub fn batch_outcomes_to_record_batch(
+    schema: &Arc<Schema>,
+    key_column: &str,
+    keys: &[Key],
+    outcomes: &[RecordReadOutcome],
+    type_mismatch_mode: TypeMismatchMode,
+) -> Result<Option<RecordBatch>> {
+    let found: Vec<(&Key, &HashMap<String, Value>)> = keys
+        .iter()
+        .zip(outcomes.iter())
+        .filter_map(|(k, o)| match o {
+            RecordReadOutcome::Found(map) => Some((k, map)),
+            _ => None,
+        })
+        .collect();
+
+    if found.is_empty() {
+        return Ok(None);
+    }
+
+    let num_rows = found.len();
+    if schema.fields().is_empty() {
+        let opts = RecordBatchOptions::new().with_row_count(Some(num_rows));
+        let rb = RecordBatch::try_new_with_options(Arc::clone(schema), Vec::new(), &opts)
+            .map_err(|e| ProxyError::Conversion(e.to_string()))?;
+        return Ok(Some(rb));
+    }
+
+    let mut columns: Vec<ArrayRef> = Vec::with_capacity(schema.fields().len());
+    let mut values_buf: Vec<Option<&Value>> = Vec::with_capacity(num_rows);
+
+    for field in schema.fields() {
+        if field.name() == key_column {
+            let mut owned_keys: Vec<Option<Value>> = Vec::with_capacity(num_rows);
+            for &(k, _) in &found {
+                if let Some(uk) = k.user_key() {
+                    owned_keys.push(Some(uk.clone()));
+                } else {
+                    let digest = k.digest();
+                    match field.data_type() {
+                        DataType::Binary => owned_keys.push(Some(Value::Blob(digest.to_vec()))),
+                        DataType::Utf8 => {
+                            let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+                            owned_keys.push(Some(Value::String(hex)));
+                        }
+                        _ => owned_keys.push(None),
+                    }
+                }
+            }
+            let refs: Vec<Option<&Value>> = owned_keys.iter().map(|v| v.as_ref()).collect();
+            let col = build_array_from_values(
+                field.name(),
+                field.data_type(),
+                &refs,
+                type_mismatch_mode,
+            )?;
+            columns.push(col);
+        } else {
+            values_buf.clear();
+            for &(_, map) in &found {
+                values_buf.push(map.get(field.name()));
+            }
+            let col = build_array_from_values(
+                field.name(),
+                field.data_type(),
+                &values_buf,
+                type_mismatch_mode,
+            )?;
+            columns.push(col);
+        }
+    }
+
+    let rb = RecordBatch::try_new(Arc::clone(schema), columns)
+        .map_err(|e| ProxyError::Conversion(e.to_string()))?;
+    Ok(Some(rb))
 }
 
 /// Build an enriched Arrow `RecordBatch` for `do_exchange` by combining the incoming `input_batch`
@@ -1138,41 +1213,35 @@ pub fn build_lookup_record_batch(
     let mut out_columns: Vec<ArrayRef> = Vec::new();
 
     // 1. Keep (or filter for inner join) all existing columns from input_batch
-    if join_type == LookupJoinType::Left {
+    if join_type == LookupJoinType::Left || selected_indices.len() == num_rows {
         for col in input_batch.columns() {
             out_columns.push(Arc::clone(col));
         }
     } else {
-        let idx_arr = UInt32Array::from(
-            selected_indices
-                .iter()
-                .map(|&i| i as u32)
-                .collect::<Vec<u32>>(),
-        );
         for col in input_batch.columns() {
-            let taken = take_array_by_indices(col.as_ref(), &idx_arr)?;
+            let taken = take_array_by_indices(col.as_ref(), &selected_indices)?;
             out_columns.push(taken);
         }
     }
 
     // 2. Append requested bin columns (skipping key_column if already present in input_batch)
+    let mut values: Vec<Option<&Value>> = Vec::with_capacity(selected_indices.len());
     for bin_field in bins_schema.fields() {
         if bin_field.name() == key_column && input_schema.index_of(key_column).is_ok() {
             continue;
         }
         // Always nullable in Left join mode
         let nullable = bin_field.is_nullable() || join_type == LookupJoinType::Left;
-        out_fields.push(Arc::new(
-            bin_field.as_ref().clone().with_nullable(nullable),
-        ));
+        out_fields.push(Arc::new(bin_field.as_ref().clone().with_nullable(nullable)));
 
-        let values: Vec<Option<&Value>> = selected_indices
-            .iter()
-            .map(|&row_idx| match &outcomes[row_idx] {
+        values.clear();
+        for &row_idx in &selected_indices {
+            let v = match &outcomes[row_idx] {
                 RecordReadOutcome::Found(map) => map.get(bin_field.name()),
                 _ => None,
-            })
-            .collect();
+            };
+            values.push(v);
+        }
 
         let arr = build_array_from_values(
             bin_field.name(),
@@ -1189,20 +1258,30 @@ pub fn build_lookup_record_batch(
     Ok(Some(batch))
 }
 
-fn take_array_by_indices(array: &dyn Array, indices: &UInt32Array) -> Result<ArrayRef> {
-    let row_indices: Vec<usize> = (0..indices.len())
-        .map(|i| indices.value(i) as usize)
-        .collect();
-    let mut vals: Vec<Option<Value>> = Vec::with_capacity(row_indices.len());
-    for &r in &row_indices {
-        if array.is_null(r) {
-            vals.push(None);
+fn take_array_by_indices(array: &dyn Array, row_indices: &[usize]) -> Result<ArrayRef> {
+    if row_indices.is_empty() {
+        return Ok(new_empty_array(array.data_type()));
+    }
+    let data = array.to_data();
+    let mut mutable =
+        arrow_data::transform::MutableArrayData::new(vec![&data], false, row_indices.len());
+    let mut start = row_indices[0];
+    let mut end = start + 1;
+    for &idx in &row_indices[1..] {
+        if idx == end {
+            end += 1;
         } else {
-            vals.push(Some(extract_value(array, r, false)?));
+            mutable
+                .try_extend(0, start, end)
+                .map_err(|e| ProxyError::Conversion(e.to_string()))?;
+            start = idx;
+            end = idx + 1;
         }
     }
-    let refs: Vec<Option<&Value>> = vals.iter().map(|v| v.as_ref()).collect();
-    build_array_from_values("input_col", array.data_type(), &refs, TypeMismatchMode::Fail)
+    mutable
+        .try_extend(0, start, end)
+        .map_err(|e| ProxyError::Conversion(e.to_string()))?;
+    Ok(make_array(mutable.freeze()))
 }
 
 fn build_key_array_from_records(
@@ -1408,12 +1487,17 @@ pub fn build_array_from_values(
             Ok(Arc::new(b.finish()))
         }
         DataType::Decimal128(precision, scale) => {
+            if *precision == 0 || *precision > 38 {
+                return Err(ProxyError::Conversion(format!(
+                    "Invalid Decimal128 precision {precision} in column '{col_name}' (must be 1..=38)"
+                )));
+            }
             let mut b = Decimal128Builder::with_capacity(len)
                 .with_data_type(DataType::Decimal128(*precision, *scale));
             for (row, val_opt) in values.iter().enumerate() {
                 match val_opt {
                     None | Some(Value::Nil) => b.append_null(),
-                    Some(Value::String(s)) => match parse_decimal128(s, *scale) {
+                    Some(Value::String(s)) => match parse_decimal128(s, *precision, *scale) {
                         Ok(scaled) => b.append_value(scaled),
                         Err(_) => handle_mismatch(
                             col_name,
@@ -1424,10 +1508,17 @@ pub fn build_array_from_values(
                             || b.append_null(),
                         )?,
                     },
-                    Some(Value::Int(i)) => {
-                        let factor = 10_i128.pow((*scale).max(0) as u32);
-                        b.append_value((*i as i128).saturating_mul(factor));
-                    }
+                    Some(Value::Int(i)) => match scale_int_to_decimal128(*i, *precision, *scale) {
+                        Ok(scaled) => b.append_value(scaled),
+                        Err(_) => handle_mismatch(
+                            col_name,
+                            data_type,
+                            &Value::Int(*i),
+                            row,
+                            type_mismatch_mode,
+                            || b.append_null(),
+                        )?,
+                    },
                     Some(other) => handle_mismatch(
                         col_name,
                         data_type,
@@ -1498,8 +1589,8 @@ pub fn build_array_from_values(
             Ok(Arc::new(b.finish()))
         }
         DataType::Timestamp(TimeUnit::Microsecond, tz) => {
-            let mut b = TimestampMicrosecondBuilder::with_capacity(len)
-                .with_timezone_opt(tz.clone());
+            let mut b =
+                TimestampMicrosecondBuilder::with_capacity(len).with_timezone_opt(tz.clone());
             for (row, val_opt) in values.iter().enumerate() {
                 match val_opt {
                     None | Some(Value::Nil) => b.append_null(),
@@ -1517,8 +1608,8 @@ pub fn build_array_from_values(
             Ok(Arc::new(b.finish()))
         }
         DataType::Timestamp(TimeUnit::Millisecond, tz) => {
-            let mut b = TimestampMillisecondBuilder::with_capacity(len)
-                .with_timezone_opt(tz.clone());
+            let mut b =
+                TimestampMillisecondBuilder::with_capacity(len).with_timezone_opt(tz.clone());
             for (row, val_opt) in values.iter().enumerate() {
                 match val_opt {
                     None | Some(Value::Nil) => b.append_null(),
@@ -1554,8 +1645,8 @@ pub fn build_array_from_values(
             Ok(Arc::new(b.finish()))
         }
         DataType::Timestamp(TimeUnit::Nanosecond, tz) => {
-            let mut b = TimestampNanosecondBuilder::with_capacity(len)
-                .with_timezone_opt(tz.clone());
+            let mut b =
+                TimestampNanosecondBuilder::with_capacity(len).with_timezone_opt(tz.clone());
             for (row, val_opt) in values.iter().enumerate() {
                 match val_opt {
                     None | Some(Value::Nil) => b.append_null(),
@@ -1596,10 +1687,17 @@ pub fn build_array_from_values(
                         offsets.push(child_vals.len() as i32);
                     }
                     Some(other) => {
-                        handle_mismatch(col_name, data_type, other, row, type_mismatch_mode, || {
-                            nulls.push(false);
-                            offsets.push(*offsets.last().unwrap());
-                        })?;
+                        handle_mismatch(
+                            col_name,
+                            data_type,
+                            other,
+                            row,
+                            type_mismatch_mode,
+                            || {
+                                nulls.push(false);
+                                offsets.push(*offsets.last().unwrap());
+                            },
+                        )?;
                     }
                 }
             }
@@ -1666,10 +1764,17 @@ pub fn build_array_from_values(
                         offsets.push(map_keys.len() as i32);
                     }
                     Some(other) => {
-                        handle_mismatch(col_name, data_type, other, row, type_mismatch_mode, || {
-                            nulls.push(false);
-                            offsets.push(*offsets.last().unwrap());
-                        })?;
+                        handle_mismatch(
+                            col_name,
+                            data_type,
+                            other,
+                            row,
+                            type_mismatch_mode,
+                            || {
+                                nulls.push(false);
+                                offsets.push(*offsets.last().unwrap());
+                            },
+                        )?;
                     }
                 }
             }
@@ -1733,12 +1838,19 @@ pub fn build_array_from_values(
                         }
                     }
                     Some(other) => {
-                        handle_mismatch(col_name, data_type, other, row, type_mismatch_mode, || {
-                            nulls.push(false);
-                            for fv in &mut per_field_vals {
-                                fv.push(None);
-                            }
-                        })?;
+                        handle_mismatch(
+                            col_name,
+                            data_type,
+                            other,
+                            row,
+                            type_mismatch_mode,
+                            || {
+                                nulls.push(false);
+                                for fv in &mut per_field_vals {
+                                    fv.push(None);
+                                }
+                            },
+                        )?;
                     }
                 }
             }
@@ -1783,7 +1895,30 @@ fn handle_mismatch<F: FnOnce()>(
     }
 }
 
-fn parse_decimal128(s: &str, scale: i8) -> std::result::Result<i128, ()> {
+fn validate_decimal128_precision(unscaled: i128, precision: u8) -> std::result::Result<i128, ()> {
+    if precision == 0 || precision > 38 {
+        return Err(());
+    }
+    let limit = 10_i128.checked_pow(u32::from(precision)).ok_or(())?;
+    if unscaled <= -limit || unscaled >= limit {
+        return Err(());
+    }
+    Ok(unscaled)
+}
+
+fn scale_int_to_decimal128(val: i64, precision: u8, scale: i8) -> std::result::Result<i128, ()> {
+    let base = i128::from(val);
+    let unscaled = if scale >= 0 {
+        let factor = 10_i128.checked_pow(scale as u32).ok_or(())?;
+        base.checked_mul(factor).ok_or(())?
+    } else {
+        let divisor = 10_i128.checked_pow((-(scale as i32)) as u32).ok_or(())?;
+        base / divisor
+    };
+    validate_decimal128_precision(unscaled, precision)
+}
+
+fn parse_decimal128(s: &str, precision: u8, scale: i8) -> std::result::Result<i128, ()> {
     let trimmed = s.trim();
     if trimmed.is_empty() {
         return Err(());
@@ -1801,18 +1936,46 @@ fn parse_decimal128(s: &str, scale: i8) -> std::result::Result<i128, ()> {
         None => (unsigned, ""),
     };
 
-    let target_scale = scale.max(0) as usize;
-    let mut digits = String::with_capacity(int_part.len() + target_scale);
-    digits.push_str(int_part);
-    if frac_part.len() >= target_scale {
-        digits.push_str(&frac_part[..target_scale]);
-    } else {
-        digits.push_str(frac_part);
-        for _ in 0..(target_scale - frac_part.len()) {
-            digits.push('0');
-        }
+    if (int_part.is_empty() && frac_part.is_empty())
+        || !int_part.bytes().all(|b| b.is_ascii_digit())
+        || !frac_part.bytes().all(|b| b.is_ascii_digit())
+    {
+        return Err(());
     }
 
-    let parsed: i128 = digits.parse().map_err(|_| ())?;
-    Ok(if neg { -parsed } else { parsed })
+    let unscaled = if scale >= 0 {
+        let target_scale = scale as usize;
+        let mut digits = String::with_capacity(int_part.len() + target_scale);
+        digits.push_str(int_part);
+        if frac_part.len() >= target_scale {
+            digits.push_str(&frac_part[..target_scale]);
+        } else {
+            digits.push_str(frac_part);
+            for _ in 0..(target_scale - frac_part.len()) {
+                digits.push('0');
+            }
+        }
+        let normalized = digits.trim_start_matches('0');
+        if normalized.is_empty() {
+            0_i128
+        } else {
+            let mag: i128 = normalized.parse().map_err(|_| ())?;
+            if neg { -mag } else { mag }
+        }
+    } else {
+        let drop_digits = (-(scale as i32)) as usize;
+        if int_part.len() <= drop_digits {
+            0_i128
+        } else {
+            let kept = int_part[..int_part.len() - drop_digits].trim_start_matches('0');
+            if kept.is_empty() {
+                0_i128
+            } else {
+                let mag: i128 = kept.parse().map_err(|_| ())?;
+                if neg { -mag } else { mag }
+            }
+        }
+    };
+
+    validate_decimal128_precision(unscaled, precision)
 }

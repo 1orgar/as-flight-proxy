@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tonic::transport::{Certificate, Identity, Server, ServerTlsConfig};
-use tracing::info;
+use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
 use as_proxy_server::auth::Authenticator;
@@ -70,7 +70,19 @@ fn load_and_apply_config(args: CliArgs) -> Result<AppConfig, Box<dyn std::error:
 
 fn build_client_policy(cfg: &AppConfig) -> ClientPolicy {
     let mut client_policy = ClientPolicy::default();
-    client_policy.auth_mode = AuthMode::None;
+    client_policy.auth_mode = match cfg
+        .aerospike
+        .user
+        .as_deref()
+        .map(str::trim)
+        .filter(|u| !u.is_empty())
+    {
+        Some(user) => AuthMode::Internal(
+            user.to_string(),
+            cfg.aerospike.password.clone().unwrap_or_default(),
+        ),
+        None => AuthMode::None,
+    };
     client_policy.timeout = cfg.aerospike.timeout_ms;
     client_policy.connect_timeout = cfg.aerospike.connect_timeout_ms;
     client_policy.min_conns_per_node = cfg.aerospike.min_conns_per_node;
@@ -78,6 +90,35 @@ fn build_client_policy(cfg: &AppConfig) -> ClientPolicy {
     client_policy.conn_pools_per_node = cfg.aerospike.conn_pools_per_node;
     client_policy.buffer_reclaim_threshold = 262_144;
     client_policy
+}
+
+fn check_security_warnings(cfg: &AppConfig) -> Vec<&'static str> {
+    let mut warnings = Vec::new();
+    if cfg.auth.uses_default_secrets() {
+        warnings.push(
+            "Security warning: auth.enabled = true with default/example password or token_secret; change them before production use!",
+        );
+    }
+    if cfg.auth.enabled && !cfg.tls.enabled {
+        warnings.push(
+            "Security warning: auth.enabled = true while tls.enabled = false; Basic credentials and Bearer tokens are transmitted without TLS encryption.",
+        );
+    }
+    if cfg.raft.enabled
+        && cfg.raft.peers.iter().any(|p| p.node_id != cfg.raft.node_id)
+        && cfg
+            .raft
+            .cluster_secret
+            .as_deref()
+            .unwrap_or("")
+            .trim()
+            .is_empty()
+    {
+        warnings.push(
+            "Security warning: multi-node Raft is enabled without raft.cluster_secret; configure raft.cluster_secret or isolate the Raft port via firewall.",
+        );
+    }
+    warnings
 }
 
 fn build_node_status_meta(
@@ -141,6 +182,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     let cfg = load_and_apply_config(CliArgs::parse())?;
+    for w in check_security_warnings(&cfg) {
+        warn!("{w}");
+    }
 
     info!(
         node_id = cfg.raft.node_id,
@@ -163,7 +207,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let as_client = Arc::new(
         Client::new(&client_policy, &cfg.aerospike.hosts)
             .await
-            .map_err(|e| format!("Failed to connect to Aerospike at {}: {e}", cfg.aerospike.hosts))?,
+            .map_err(|e| {
+                format!(
+                    "Failed to connect to Aerospike at {}: {e}",
+                    cfg.aerospike.hosts
+                )
+            })?,
     );
     info!("Connected to Aerospike cluster successfully");
 
@@ -193,7 +242,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut interval = tokio::time::interval(Duration::from_secs(2));
             loop {
                 interval.tick().await;
-                let meta = build_node_status_meta(&cfg_for_hb, &metrics_for_hb, engine_for_hb.is_connected());
+                let meta = build_node_status_meta(
+                    &cfg_for_hb,
+                    &metrics_for_hb,
+                    engine_for_hb.is_connected(),
+                );
                 let _ = raft_for_hb
                     .propose(MetadataCommand::UpsertNodeStatus(meta))
                     .await;
@@ -211,12 +264,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let raft_for_obs = raft_node.clone();
     let engine_for_health = Arc::clone(&write_engine);
     tokio::spawn(async move {
-        if let Err(e) = serve_observability(
-            &metrics_addr,
-            metrics_clone,
-            raft_for_obs,
-            move || engine_for_health.is_connected(),
-        )
+        if let Err(e) = serve_observability(&metrics_addr, metrics_clone, raft_for_obs, move || {
+            engine_for_health.is_connected()
+        })
         .await
         {
             tracing::error!("Observability server failed: {e}");
@@ -293,9 +343,21 @@ mod tests {
         let cert_file = tempfile::NamedTempFile::new().unwrap();
         let key_file = tempfile::NamedTempFile::new().unwrap();
         let ca_file = tempfile::NamedTempFile::new().unwrap();
-        fs::write(cert_file.path(), b"-----BEGIN CERTIFICATE-----\n-----END CERTIFICATE-----\n").unwrap();
-        fs::write(key_file.path(), b"-----BEGIN PRIVATE KEY-----\n-----END PRIVATE KEY-----\n").unwrap();
-        fs::write(ca_file.path(), b"-----BEGIN CERTIFICATE-----\n-----END CERTIFICATE-----\n").unwrap();
+        fs::write(
+            cert_file.path(),
+            b"-----BEGIN CERTIFICATE-----\n-----END CERTIFICATE-----\n",
+        )
+        .unwrap();
+        fs::write(
+            key_file.path(),
+            b"-----BEGIN PRIVATE KEY-----\n-----END PRIVATE KEY-----\n",
+        )
+        .unwrap();
+        fs::write(
+            ca_file.path(),
+            b"-----BEGIN CERTIFICATE-----\n-----END CERTIFICATE-----\n",
+        )
+        .unwrap();
 
         cfg.tls.cert_path = Some(cert_file.path().to_string_lossy().to_string());
         cfg.tls.key_path = Some(key_file.path().to_string_lossy().to_string());
@@ -304,7 +366,11 @@ mod tests {
 
         // Also test loading from --config file
         let cfg_file = tempfile::NamedTempFile::new().unwrap();
-        fs::write(cfg_file.path(), "[server]\nlisten_addr = \"127.0.0.1:7715\"\n").unwrap();
+        fs::write(
+            cfg_file.path(),
+            "[server]\nlisten_addr = \"127.0.0.1:7715\"\n",
+        )
+        .unwrap();
         let args_from_file = CliArgs::try_parse_from([
             "as_proxy_server",
             "--config",
@@ -313,5 +379,24 @@ mod tests {
         .unwrap();
         let loaded = load_and_apply_config(args_from_file).unwrap();
         assert_eq!(loaded.server.listen_addr, "127.0.0.1:7715");
+
+        // Security warnings & Aerospike AuthMode::Internal coverage
+        let warnings_default = check_security_warnings(&loaded);
+        assert!(warnings_default.len() >= 2);
+
+        let mut hardened = loaded.clone();
+        hardened.tls.enabled = true;
+        hardened.auth.password = "custom_strong_pass_999".to_string();
+        hardened.auth.token_secret = "custom_strong_hmac_secret_999".to_string();
+        hardened.aerospike.user = Some("as_app".to_string());
+        hardened.aerospike.password = Some("as_secret".to_string());
+        assert!(check_security_warnings(&hardened).is_empty());
+
+        let auth_policy = build_client_policy(&hardened);
+        assert!(matches!(auth_policy.auth_mode, AuthMode::Internal(ref u, _) if u == "as_app"));
+        let dbg_str = format!("{hardened:?}");
+        assert!(!dbg_str.contains("custom_strong_pass_999"));
+        assert!(!dbg_str.contains("custom_strong_hmac_secret_999"));
+        assert!(!dbg_str.contains("as_secret"));
     }
 }

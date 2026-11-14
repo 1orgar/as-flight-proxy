@@ -1492,6 +1492,112 @@ class ArrowBatchConverterSpec extends AnyFunSuite {
         .options(disabledCompOpts)
         .mode("append")
         .save()
+
+      // 9. Verify reads & lookups work WITHOUT `connector.jobId`, while writes require it
+      val keylessJobOpts = baseOpts - "connector.jobId" - "aerospike.job_id" - "aerospike.jobId" - "job.id"
+      val readNoJobDf = spark.read
+        .format("com.asproxy.spark.AerospikeFlightDataSource")
+        .options(keylessJobOpts)
+        .load()
+      assert(readNoJobDf.count() == 4L)
+
+      val enrichBinsSchema = new StructType().add("age", IntegerType).add("score", DoubleType)
+      assert(AerospikeFlightLookup.enrich(keysDf, keylessJobOpts, enrichBinsSchema, "left").count() == 3L)
+      assert(AerospikeFlightLookup.enrich(keysDf, keylessJobOpts, enrichBinsSchema).count() == 3L)
+      assert(AerospikeFlightLookup.enrich(keysDf, keylessJobOpts, "age INT, score DOUBLE", "inner").count() == 2L)
+      assert(AerospikeFlightLookup.enrich(keysDf, keylessJobOpts, "age INT, score DOUBLE").count() == 3L)
+      assert(AerospikeFlightLookup.enrich(keysDf, keylessJobOpts.asJava, enrichBinsSchema, "inner").count() == 2L)
+      assert(AerospikeFlightLookup.enrich(keysDf, keylessJobOpts.asJava, enrichBinsSchema).count() == 3L)
+      assert(AerospikeFlightLookup.enrich(keysDf, keylessJobOpts.asJava, "age INT, score DOUBLE", "left").count() == 3L)
+      assert(AerospikeFlightLookup.enrich(keysDf, keylessJobOpts.asJava, "age INT, score DOUBLE").count() == 3L)
+
+      val missingJobWriteErr = intercept[IllegalArgumentException] {
+        writeDf.write
+          .format("com.asproxy.spark.AerospikeFlightDataSource")
+          .options(keylessJobOpts)
+          .mode("append")
+          .save()
+      }
+      assert(missingJobWriteErr.getMessage.contains("connector.jobId"))
+
+      // 10. Verify multi-host failover on write & AerospikeLoadStatus + latestSummaryJson()
+      val failoverWriteOpts = baseOpts + (
+        "connector.jobId" -> "job-write-failover",
+        "flight.hosts" -> fallbackHosts
+      )
+      writeDf.write
+        .format("com.asproxy.spark.AerospikeFlightDataSource")
+        .options(failoverWriteOpts)
+        .mode("append")
+        .save()
+      assert(AerospikeLoadStatus.latestSummaryJson().contains("job-write-failover"))
+      val clusterFailoverJson = AerospikeLoadStatus.fetchClusterStatusJson(
+        fallbackHosts,
+        "spark",
+        "secret",
+        false
+      )
+      assert(clusterFailoverJson.nonEmpty)
+
+      // 11. Verify early termination (.limit(1)) on DoExchange lookup and lookup.sourceView closes cleanly,
+      //     and aerospike.lookup.maxViewRows prevents unbounded Driver collection
+      val manyKeysDf = (1 to 200).map(i => (s"r_$i", if (i % 2 == 0) "u_1" else "u_missing")).toDF("req_id", "pk")
+      val limitedLookup = AerospikeFlightLookup
+        .lookup(manyKeysDf, "age INT, score DOUBLE", keylessJobOpts + ("aerospike.read.batchSize" -> "16"))
+        .limit(1)
+        .collect()
+      assert(limitedLookup.length == 1)
+
+      val limitedViewLookup = viewLookupDf.limit(1).collect()
+      assert(limitedViewLookup.length == 1)
+
+      val maxRowsEx = intercept[Exception] {
+        spark.read
+          .format("com.asproxy.spark.AerospikeFlightDataSource")
+          .schema(enrichBinsSchema)
+          .options(
+            keylessJobOpts + (
+              "aerospike.lookup.sourceView" -> "lookup_keys_view",
+              "aerospike.lookup.maxViewRows" -> "2"
+            )
+          )
+          .load()
+          .collect()
+      }
+      assert(
+        maxRowsEx.getMessage.contains("maxViewRows") ||
+          Option(maxRowsEx.getCause).exists(_.getMessage.contains("maxViewRows"))
+      )
+
+      // 12. Verify AerospikeFlightTable.newScanBuilder merges scanOptions with base table properties
+      val ds = new AerospikeFlightDataSource()
+      val tbl = ds.getTable(
+        explicitSchema,
+        Array.empty,
+        keylessJobOpts.asJava
+      ).asInstanceOf[AerospikeFlightTable]
+      val mergedScan = tbl
+        .newScanBuilder(
+          new org.apache.spark.sql.util.CaseInsensitiveStringMap(
+            Map("aerospike.read.batchSize" -> "512").asJava
+          )
+        )
+        .build()
+        .asInstanceOf[AerospikeFlightScan]
+      assert(mergedScan.options.namespace == "test")
+      assert(mergedScan.options.readBatchSize == 512)
+
+      val standaloneTbl = new AerospikeFlightTable(explicitSchema, AerospikeFlightOptions.fromTableOrReadMap(keylessJobOpts))
+      val standaloneScan = standaloneTbl
+        .newScanBuilder(
+          new org.apache.spark.sql.util.CaseInsensitiveStringMap(
+            Map("aerospike.read.batchSize" -> "256").asJava
+          )
+        )
+        .build()
+        .asInstanceOf[AerospikeFlightScan]
+      assert(standaloneScan.options.namespace == "test")
+      assert(standaloneScan.options.readBatchSize == 256)
     } finally {
       spark.stop()
       server.close()
@@ -1573,8 +1679,81 @@ class ArrowBatchConverterSpec extends AnyFunSuite {
         assert(java.util.Arrays.equals(tinyBytes, tinyOut))
         tinyDecomp.close()
       }
+
+      // 4. Corrupted / truncated / invalid-length buffers must fail cleanly without leaking off-heap memory
+      for (codec <- Seq(zstdCodec1, lz4Codec)) {
+        val negLenBuf = allocator.buffer(16)
+        negLenBuf.writeLong(-5L)
+        negLenBuf.writeLong(0L)
+        intercept[IllegalArgumentException] {
+          try {
+            codec.decompress(allocator, negLenBuf)
+          } finally {
+            if (negLenBuf.refCnt() > 0) negLenBuf.close()
+          }
+        }
+
+        val corruptBuf = allocator.buffer(24)
+        corruptBuf.writeLong(64L)
+        corruptBuf.writeLong(0xdeadbeefcafebabeL)
+        corruptBuf.writeLong(0x1234567890abcdefL)
+        intercept[Exception] {
+          try {
+            codec.decompress(allocator, corruptBuf)
+          } finally {
+            if (corruptBuf.refCnt() > 0) corruptBuf.close()
+          }
+        }
+      }
+      assert(allocator.getAllocatedMemory == 0L)
     } finally {
       allocator.close()
+    }
+  }
+
+  test("AerospikeFlightOptions security & validation guards: password redaction, TTL bounds, ports, and endpointFor overflow") {
+    val validBase = Map(
+      "connector.jobId" -> "sec-job-1",
+      "flight.hosts" -> "127.0.0.1:8815,127.0.0.1:8816",
+      "flight.username" -> "admin",
+      "flight.password" -> "SuperSecretPassword!123",
+      "aerospike.namespace" -> "test",
+      "aerospike.set" -> "users",
+      "aerospike.keyColumn" -> "pk"
+    )
+    val opts = AerospikeFlightOptions.fromMap(validBase)
+    assert(!opts.toString.contains("SuperSecretPassword!123"))
+    assert(opts.toString.contains("password=***"))
+
+    // endpointFor must never throw IndexOutOfBoundsException on Int.MaxValue overflow
+    val ep = opts.endpointFor(Int.MaxValue, 5)
+    assert(opts.hosts.contains(ep))
+
+    // Valid Aerospike special TTLs (-2, -1, 0, max u32)
+    for (validTtl <- Seq("-2", "-1", "0", "4294967295")) {
+      assert(AerospikeFlightOptions.fromMap(validBase + ("aerospike.ttl" -> validTtl)).ttlSeconds.contains(validTtl.toLong))
+    }
+
+    // Invalid TTLs (-3, > u32::MAX)
+    for (badTtl <- Seq("-3", "4294967296")) {
+      intercept[IllegalArgumentException] {
+        AerospikeFlightOptions.fromMap(validBase + ("aerospike.ttl" -> badTtl))
+      }
+    }
+
+    // Invalid host ports
+    for (badHost <- Seq("127.0.0.1:0", "127.0.0.1:65536", "127.0.0.1:abc", ":8815", "127.0.0.1:")) {
+      intercept[IllegalArgumentException] {
+        AerospikeFlightOptions.fromMap(validBase + ("flight.hosts" -> badHost))
+      }
+    }
+
+    // Invalid timeoutMs & maxViewRows
+    intercept[IllegalArgumentException] {
+      AerospikeFlightOptions.fromMap(validBase + ("flight.timeoutMs" -> "-10"))
+    }
+    intercept[IllegalArgumentException] {
+      AerospikeFlightOptions.fromMap(validBase + ("aerospike.lookup.maxViewRows" -> "0"))
     }
   }
 }

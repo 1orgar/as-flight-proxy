@@ -11,7 +11,6 @@ use arrow_ipc::writer::IpcWriteOptions;
 use arrow_schema::{Field, Schema};
 use bytes::Bytes;
 use futures::stream::{self, BoxStream, StreamExt, TryStreamExt};
-use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -27,9 +26,9 @@ use crate::config::{
     ReadTicket, ServerConfig, WriteParameters,
 };
 use crate::converter::{
-    ScannedRecord, build_lookup_record_batch, decode_arrow_schema_ipc_base64,
-    encode_arrow_schema_to_result, extract_keys_from_batch, infer_arrow_schema_from_records,
-    records_to_record_batch,
+    ScannedRecord, batch_outcomes_to_record_batch, build_lookup_record_batch,
+    decode_arrow_schema_ipc_base64, encode_arrow_schema_to_result, extract_keys_from_batch,
+    infer_arrow_schema_from_records, records_to_record_batch,
 };
 use crate::error::ProxyError;
 use crate::metrics::ProxyMetrics;
@@ -276,9 +275,7 @@ impl FlightService for ProxyFlightService {
             let mut batch_index: usize = 0;
             let mut total_stream_rows: usize = 0;
             let mut pending_raft_commands: Vec<MetadataCommand> = Vec::new();
-            let coalesce_raft_batches = raft_node
-                .as_ref()
-                .is_some_and(|r| r.has_remote_peers());
+            let coalesce_raft_batches = raft_node.as_ref().is_some_and(|r| r.has_remote_peers());
 
             while let Some(decoded_res) = decoder.next().await {
                 let decoded = match decoded_res {
@@ -561,12 +558,17 @@ impl FlightService for ProxyFlightService {
 
     async fn list_actions(
         &self,
-        _request: Request<Empty>,
+        request: Request<Empty>,
     ) -> Result<Response<Self::ListActionsStream>, Status> {
+        self.authenticator
+            .verify_metadata(request.metadata())
+            .map_err(Status::from)?;
+
         let actions = vec![
             Ok(ActionType {
                 r#type: "init_job".to_string(),
-                description: "Initialize or reset Raft-replicated metadata for a Spark job_id".to_string(),
+                description: "Initialize or reset Raft-replicated metadata for a Spark job_id"
+                    .to_string(),
             }),
             Ok(ActionType {
                 r#type: "get_job_status".to_string(),
@@ -689,8 +691,8 @@ impl FlightService for ProxyFlightService {
             &headers,
         )?;
 
-        let target_schema = decode_arrow_schema_ipc_base64(&read_ticket.schema_ipc_base64)
-            .map_err(Status::from)?;
+        let target_schema =
+            decode_arrow_schema_ipc_base64(&read_ticket.schema_ipc_base64).map_err(Status::from)?;
 
         let requested_bins: Vec<String> = if !read_ticket.bins.is_empty() {
             read_ticket.bins.clone()
@@ -839,16 +841,10 @@ impl FlightService for ProxyFlightService {
                         }
                     }
 
-                    let mut key_iter = as_keys.into_iter();
-                    loop {
-                        let chunk: Vec<aerospike::Key> =
-                            key_iter.by_ref().take(batch_size).collect();
-                        if chunk.is_empty() {
-                            break;
-                        }
-                        let chunk_len = chunk.len();
+                    let shared_bins: Option<Arc<[String]>> = Some(Arc::from(requested_bins));
+                    for chunk in as_keys.chunks(batch_size) {
                         let outcomes = match write_engine
-                            .read_keys(chunk.clone(), Some(requested_bins.clone()))
+                            .read_keys_slice(chunk, shared_bins.clone())
                             .await
                         {
                             Ok(o) => o,
@@ -860,43 +856,29 @@ impl FlightService for ProxyFlightService {
                             }
                         };
 
-                        let mut found_records = Vec::with_capacity(chunk_len);
-                        for (key, outcome) in chunk.into_iter().zip(outcomes.into_iter()) {
-                            if let RecordReadOutcome::Found(map) = outcome {
-                                let mut bins = IndexMap::with_capacity(map.len());
-                                for (k, v) in map {
-                                    bins.insert(k, v);
-                                }
-                                found_records.push(ScannedRecord {
-                                    key: Some(key),
-                                    bins,
-                                });
-                            }
-                        }
-
-                        if !found_records.is_empty() {
-                            match records_to_record_batch(
-                                &schema_for_task,
-                                &read_ticket.key_column,
-                                &found_records,
-                                read_ticket.type_mismatch_mode,
-                            ) {
-                                Ok(rb) => {
-                                    let rows = rb.num_rows();
-                                    total_rows_emitted += rows;
-                                    total_batches_emitted += 1;
-                                    metrics.inc_records_read(rows as u64);
-                                    metrics.inc_read_batches();
-                                    if batch_tx.send(Ok(rb)).await.is_err() {
-                                        return;
-                                    }
-                                }
-                                Err(e) => {
-                                    let _ = batch_tx
-                                        .send(Err(FlightError::Tonic(Box::new(Status::from(e)))))
-                                        .await;
+                        match batch_outcomes_to_record_batch(
+                            &schema_for_task,
+                            &read_ticket.key_column,
+                            chunk,
+                            &outcomes,
+                            read_ticket.type_mismatch_mode,
+                        ) {
+                            Ok(Some(rb)) => {
+                                let rows = rb.num_rows();
+                                total_rows_emitted += rows;
+                                total_batches_emitted += 1;
+                                metrics.inc_records_read(rows as u64);
+                                metrics.inc_read_batches();
+                                if batch_tx.send(Ok(rb)).await.is_err() {
                                     return;
                                 }
+                            }
+                            Ok(None) => {}
+                            Err(e) => {
+                                let _ = batch_tx
+                                    .send(Err(FlightError::Tonic(Box::new(Status::from(e)))))
+                                    .await;
+                                return;
                             }
                         }
                     }
@@ -955,7 +937,7 @@ impl FlightService for ProxyFlightService {
             let stream_start = std::time::Instant::now();
             let mut lookup_params: Option<LookupExchangeParams> = None;
             let mut bins_schema: Option<Arc<Schema>> = None;
-            let mut requested_bins: Vec<String> = Vec::new();
+            let mut requested_bins: Option<Arc<[String]>> = None;
             let mut out_schema_opt: Option<Arc<Schema>> = None;
             let mut sent_any_batch = false;
             let mut total_keys_req: usize = 0;
@@ -963,8 +945,9 @@ impl FlightService for ProxyFlightService {
             let mut total_rows_out: usize = 0;
             let mut total_batches_out: usize = 0;
 
-            let mut batch_tx_opt: Option<mpsc::Sender<std::result::Result<RecordBatch, FlightError>>> =
-                None;
+            let mut batch_tx_opt: Option<
+                mpsc::Sender<std::result::Result<RecordBatch, FlightError>>,
+            > = None;
             let mut encoder_handle: Option<tokio::task::JoinHandle<()>> = None;
 
             let init_encoder = |params_opt: &Option<LookupExchangeParams>,
@@ -990,8 +973,7 @@ impl FlightService for ProxyFlightService {
                 let ipc_opts = effective_comp
                     .to_ipc_write_options_with_level(effective_level)
                     .unwrap_or_default();
-                let (btx, brx) =
-                    mpsc::channel::<std::result::Result<RecordBatch, FlightError>>(8);
+                let (btx, brx) = mpsc::channel::<std::result::Result<RecordBatch, FlightError>>(8);
                 let handle = tokio::spawn(async move {
                     let mut enc_stream = FlightDataEncoderBuilder::new()
                         .with_options(ipc_opts)
@@ -1028,12 +1010,13 @@ impl FlightService for ProxyFlightService {
                                 }
                                 match decode_arrow_schema_ipc_base64(&p.bins_schema_ipc_base64) {
                                     Ok(bs) => {
-                                        requested_bins = bs
+                                        let bin_list: Vec<String> = bs
                                             .fields()
                                             .iter()
                                             .filter(|f| f.name() != &p.key_column)
                                             .map(|f| f.name().clone())
                                             .collect();
+                                        requested_bins = Some(Arc::from(bin_list));
                                         bins_schema = Some(bs);
                                         lookup_params = Some(p);
                                     }
@@ -1110,7 +1093,7 @@ impl FlightService for ProxyFlightService {
                         metrics.inc_lookup_keys_requested(num_keys as u64);
 
                         let outcomes = match write_engine
-                            .read_keys(keys, Some(requested_bins.clone()))
+                            .read_keys_slice(&keys, requested_bins.clone())
                             .await
                         {
                             Ok(o) => o,

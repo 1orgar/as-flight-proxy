@@ -98,6 +98,11 @@ object AerospikeLoadStatus extends Logging {
     lastSummary.map(_.toJson).getOrElse("{}")
 
   /**
+   * Alias for `getLastSummaryJson()` matching Scala/PySpark documentation examples.
+   */
+  def latestSummaryJson(): String = getLastSummaryJson()
+
+  /**
    * Returns the summary for a specific `connector.jobId`.
    */
   def getSummary(jobId: String): Option[LoadJobSummary] =
@@ -227,22 +232,41 @@ object AerospikeLoadStatus extends Logging {
       body: Array[Byte]
   ): String = {
     val allocator = new RootAllocator(Long.MaxValue)
-    var client: FlightClient = null
+    var lastErr: Throwable = null
     try {
-      val endpoint = options.hosts.head
-      client = createFlightClient(allocator, endpoint, options)
-      val callOpts = buildCallOptions(client, options)
-      val results = client.doAction(new Action(actionType, body), callOpts: _*)
-      if (results.hasNext) {
-        val res = results.next()
-        new String(res.getBody, StandardCharsets.UTF_8)
-      } else {
-        "{}"
+      var idx = 0
+      while (idx < options.hosts.size) {
+        val endpoint = options.hosts(idx)
+        var client: FlightClient = null
+        try {
+          client = createFlightClient(allocator, endpoint, options)
+          val callOpts = buildCallOptions(client, options)
+          val results = client.doAction(new Action(actionType, body), callOpts: _*)
+          return if (results.hasNext) {
+            val res = results.next()
+            new String(res.getBody, StandardCharsets.UTF_8)
+          } else {
+            "{}"
+          }
+        } catch {
+          case t: Throwable =>
+            lastErr = t
+            logWarning(
+              s"[Driver][RaftStatus] Flight action '$actionType' failed on ${endpoint.host}:${endpoint.port} " +
+                s"(attempt ${idx + 1}/${options.hosts.size}): ${t.getMessage}"
+            )
+            idx += 1
+        } finally {
+          if (client != null) {
+            try { client.close() } catch { case _: Throwable => }
+          }
+        }
       }
+      throw new RuntimeException(
+        s"Failed to execute Flight action '$actionType' across endpoints ${options.hosts.mkString(", ")}",
+        lastErr
+      )
     } finally {
-      if (client != null) {
-        try { client.close() } catch { case _: Throwable => }
-      }
       try { allocator.close() } catch { case _: Throwable => }
     }
   }

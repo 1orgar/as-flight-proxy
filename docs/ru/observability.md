@@ -52,15 +52,20 @@
 
 ## 3. Метрики Prometheus прокси-сервера (`:9090/metrics`)
 
-Каждая нода `as_proxy_server` отдаёт **21 метрику Prometheus** по адресу `GET http://<proxy-host>:9090/metrics`:
+Каждая нода `as_proxy_server` отдаёт **26 метрик Prometheus** по адресу `GET http://<proxy-host>:9090/metrics`:
 
-### Метрики записи (`DoPut`)
+### Метрики записи и адаптивного батчевания (`DoPut` / `AdaptiveBatchTuner`)
 | Имя метрики | Тип | Описание |
 | :--- | :---: | :--- |
 | `as_proxy_records_written_total` | `counter` | Общее количество успешно записанных в Aerospike записей |
 | `as_proxy_batches_processed_total` | `counter` | Общее количество обработанных на запись Arrow `RecordBatch` |
 | `as_proxy_write_duration_seconds_sum` | `counter` | Суммарное время выполнения под-батчей записи в Aerospike (в секундах) |
 | `as_proxy_write_duration_seconds_count` | `counter` | Общее количество выполненных под-батчей записи в Aerospike |
+| `as_proxy_adaptive_batch_size` | `gauge` | Текущий динамически подобранный размер под-батча `BatchWrite` (в записях) |
+| `as_proxy_adaptive_concurrency` | `gauge` | Текущий динамически подобранный параллелизм под-батчей на один стрим `DoPut` |
+| `as_proxy_adaptive_pacing_micros` | `gauge` | Текущая задержка micro-pacing (в микросекундах) для предотвращения `wait` кластера Aerospike |
+| `as_proxy_adaptive_queue_inflation_permille` | `gauge` | Текущий индекс раздувания очередей Aerospike относительно базового RTT в промилле (`1000` = `1.0x`, `> 1550` = рост очередей / `wait`) |
+| `as_proxy_cluster_wait_events_total` | `counter` | Количество срабатываний упреждающего торможения (`wait` avoidance) или откатов при перегрузке кластера |
 
 ### Метрики чтения и Lookup (`DoGet` / `DoExchange` / `GetSchema`)
 | Имя метрики | Тип | Описание |

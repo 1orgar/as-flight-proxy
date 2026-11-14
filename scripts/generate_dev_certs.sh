@@ -3,6 +3,7 @@ set -euo pipefail
 
 CERT_DIR="${1:-./certs}"
 mkdir -p "$CERT_DIR"
+umask 077
 
 echo "Generating self-signed CA and server TLS certificates in $CERT_DIR ..."
 
@@ -30,4 +31,6 @@ openssl x509 -req -in "$CERT_DIR/server.csr" \
   -extfile "$CERT_DIR/server_ext.cnf"
 
 rm -f "$CERT_DIR/server.csr" "$CERT_DIR/server_ext.cnf" "$CERT_DIR/ca.srl"
+chmod 600 "$CERT_DIR/ca.key" "$CERT_DIR/server.key"
+chmod 644 "$CERT_DIR/ca.crt" "$CERT_DIR/server.crt"
 echo "Done! Generated: $CERT_DIR/ca.crt, $CERT_DIR/server.crt, $CERT_DIR/server.key"
